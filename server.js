@@ -6548,6 +6548,11 @@ app.get(
   async (req, res) => {
     try {
       const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
+
+      if (!response.ok) {
+        throw new Error(`SRS API responded with ${response.status}`);
+      }
+
       const data = await response.json();
 
       const allowedResult = await pool.query(
@@ -6583,15 +6588,18 @@ app.get(
 
       res.json({
         ok: true,
+        srs_available: true,
         streams,
       });
     } catch (error) {
-      console.error("SRS API Error:", error);
+      console.warn("SRS unavailable:", error.message);
 
-      res.status(500).json({
-        ok: false,
-        message: "Unable to connect to SRS API",
-        error: error.message,
+      res.json({
+        ok: true,
+        srs_available: false,
+        streams: [],
+        message:
+          "SRS server is not reachable from this backend environment yet.",
       });
     }
   },
