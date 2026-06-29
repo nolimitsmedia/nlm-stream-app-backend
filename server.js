@@ -4802,7 +4802,7 @@ app.post(
   "/api/schedules",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin", "admin"),
+  requireRole("super_admin", "admin", "operator"),
   async (req, res) => {
     try {
       const {
@@ -4874,7 +4874,7 @@ app.put(
   "/api/schedules/:id",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin", "admin"),
+  requireRole("super_admin", "admin", "operator"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -4953,7 +4953,7 @@ app.delete(
   "/api/schedules/:id",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin"),
+  requireRole("super_admin", "admin"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -6060,7 +6060,7 @@ app.post(
   "/api/cta-links",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin", "admin"),
+  requireRole("super_admin", "admin", "operator"),
   async (req, res) => {
     try {
       const payload = normalizeCtaPayload(req.body);
@@ -6132,7 +6132,7 @@ app.put(
   "/api/cta-links/:id",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin", "admin"),
+  requireRole("super_admin", "admin", "operator"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -6211,7 +6211,7 @@ app.delete(
   "/api/cta-links/:id",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireRole("super_admin"),
+  requireRole("super_admin", "admin", "operator"),
   async (req, res) => {
     try {
       const { id } = req.params;
