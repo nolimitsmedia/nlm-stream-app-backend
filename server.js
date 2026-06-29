@@ -2475,7 +2475,7 @@ app.get(
 app.put(
   "/api/organizations/:id/settings",
   authenticateAdmin,
-  requireRole("super_admin", "admin"),
+  // ← REMOVED: requireRole("super_admin", "admin")
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -2487,9 +2487,8 @@ app.put(
           FROM organization_users
           WHERE organization_id = $1
             AND admin_id = $2
-            AND role IN ('owner', 'admin')
-          LIMIT 1
-          `,
+            AND role IN ('owner', 'admin', 'operator')
+          `, // ← CHANGED: added 'operator' to the role list
           [id, req.admin.id],
         );
 
@@ -2501,6 +2500,7 @@ app.put(
         }
       }
 
+      // ↓ Everything below is UNCHANGED — copy from your existing file ↓
       const result = await pool.query(
         `
         INSERT INTO organization_settings (
@@ -2541,7 +2541,6 @@ app.put(
       });
     } catch (error) {
       console.error("Update organization settings error:", error);
-
       res.status(500).json({
         ok: false,
         message: "Failed to update organization settings",
@@ -3081,6 +3080,76 @@ app.post(
     }
   },
 );
+
+app.put("/api/admins/me/profile", authenticateAdmin, async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    const adminId = req.admin.id;
+
+    if (!name || !email) {
+      return res.status(400).json({
+        ok: false,
+        message: "Name and email are required",
+      });
+    }
+
+    let result;
+
+    if (password) {
+      if (password.length < 6) {
+        return res.status(400).json({
+          ok: false,
+          message: "Password must be at least 6 characters",
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10);
+
+      result = await pool.query(
+        `
+          UPDATE admins
+          SET name = $1,
+              email = $2,
+              password_hash = $3
+          WHERE id = $4
+          RETURNING id, name, email, role, created_at
+          `,
+        [name.trim(), email.trim().toLowerCase(), passwordHash, adminId],
+      );
+    } else {
+      result = await pool.query(
+        `
+          UPDATE admins
+          SET name = $1,
+              email = $2
+          WHERE id = $3
+          RETURNING id, name, email, role, created_at
+          `,
+        [name.trim(), email.trim().toLowerCase(), adminId],
+      );
+    }
+
+    res.json({
+      ok: true,
+      admin: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Self-update profile error:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        ok: false,
+        message: "An admin with this email already exists",
+      });
+    }
+
+    res.status(500).json({
+      ok: false,
+      message: "Failed to update profile",
+      error: error.message,
+    });
+  }
+});
 
 app.put(
   "/api/admins/:id",

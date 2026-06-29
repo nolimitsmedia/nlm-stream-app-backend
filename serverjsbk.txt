@@ -6548,6 +6548,11 @@ app.get(
   async (req, res) => {
     try {
       const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
+
+      if (!response.ok) {
+        throw new Error(`SRS API responded with ${response.status}`);
+      }
+
       const data = await response.json();
 
       const allowedResult = await pool.query(
@@ -6583,15 +6588,18 @@ app.get(
 
       res.json({
         ok: true,
+        srs_available: true,
         streams,
       });
     } catch (error) {
-      console.error("SRS API Error:", error);
+      console.warn("SRS unavailable:", error.message);
 
-      res.status(500).json({
-        ok: false,
-        message: "Unable to connect to SRS API",
-        error: error.message,
+      res.json({
+        ok: true,
+        srs_available: false,
+        streams: [],
+        message:
+          "SRS server is not reachable from this backend environment yet.",
       });
     }
   },
@@ -10125,31 +10133,99 @@ app.get(
         365,
       );
 
+      await closeStaleReplaySessions();
+
       const result = await pool.query(
         `
+        WITH replay_scope AS (
+          SELECT
+            r.id,
+            r.public_slug,
+            COALESCE(r.public_title, c.name, r.stream_key, r.filename) AS title,
+            r.stream_key,
+            r.duration_seconds,
+            r.published_at,
+            r.organization_id
+          FROM recordings r
+          LEFT JOIN channels c ON c.id = r.channel_id
+          WHERE r.organization_id = $1
+            AND r.is_public = TRUE
+            AND r.mp4_filename IS NOT NULL
+        ),
+        session_stats AS (
+          SELECT
+            rs.recording_id,
+            COUNT(rs.id)::int AS total_views,
+            COUNT(DISTINCT rs.viewer_id)::int AS unique_viewers,
+            COUNT(DISTINCT rs.member_id)::int AS member_viewers,
+            COALESCE(SUM(rs.watched_seconds), 0)::int AS total_watch_seconds,
+            COALESCE(AVG(NULLIF(rs.watched_seconds, 0)), 0)::int AS avg_watch_seconds,
+            COUNT(*) FILTER (WHERE rs.completed)::int AS completed_views,
+            COALESCE(AVG(CASE WHEN rs.completed THEN 1 ELSE 0 END), 0)::float AS completion_rate,
+            COALESCE(MAX(rs.max_position_seconds), 0)::int AS furthest_position_seconds,
+            MAX(rs.started_at) AS last_viewed_at
+          FROM replay_sessions rs
+          JOIN replay_scope r ON r.id = rs.recording_id
+          WHERE rs.organization_id = $1
+            AND rs.started_at >= NOW() - ($2::text || ' days')::interval
+          GROUP BY rs.recording_id
+        ),
+        event_stats AS (
+          SELECT
+            rse.recording_id,
+            COUNT(*) FILTER (WHERE rse.event_type IN ('share', 'copy_link', 'copy-link'))::int AS shares,
+            COUNT(*) FILTER (WHERE rse.event_type IN ('like', 'reaction'))::int AS reactions,
+            COUNT(*) FILTER (WHERE rse.event_type IN ('play', 'start'))::int AS plays,
+            COUNT(*) FILTER (WHERE rse.event_type IN ('complete', 'ended', 'end'))::int AS end_events
+          FROM replay_session_events rse
+          JOIN replay_scope r ON r.id = rse.recording_id
+          WHERE rse.organization_id = $1
+            AND rse.created_at >= NOW() - ($2::text || ' days')::interval
+          GROUP BY rse.recording_id
+        ),
+        save_stats AS (
+          SELECT
+            s.recording_id,
+            COUNT(*)::int AS saves
+          FROM replay_saved_replays s
+          JOIN replay_viewer_members m ON m.id = s.member_id
+          WHERE m.organization_id = $1
+            AND s.created_at >= NOW() - ($2::text || ' days')::interval
+          GROUP BY s.recording_id
+        )
         SELECT
           r.id,
           r.public_slug,
-          COALESCE(r.public_title, c.name, r.stream_key, r.filename) AS title,
+          r.title,
           r.stream_key,
           r.duration_seconds,
           r.published_at,
-          COUNT(rs.id)::int AS total_views,
-          COUNT(DISTINCT rs.viewer_id)::int AS unique_viewers,
-          COALESCE(SUM(rs.watched_seconds), 0)::int AS total_watch_seconds,
-          COALESCE(AVG(NULLIF(rs.watched_seconds, 0)), 0)::int AS avg_watch_seconds,
-          COALESCE(AVG(CASE WHEN rs.completed THEN 1 ELSE 0 END), 0)::float AS completion_rate,
-          MAX(rs.started_at) AS last_viewed_at
-        FROM recordings r
-        LEFT JOIN channels c ON c.id = r.channel_id
-        LEFT JOIN replay_sessions rs
-          ON rs.recording_id = r.id
-         AND rs.started_at >= NOW() - ($2::text || ' days')::interval
-        WHERE r.organization_id = $1
-          AND r.is_public = TRUE
-          AND r.mp4_filename IS NOT NULL
-        GROUP BY r.id, c.name
-        ORDER BY total_views DESC, last_viewed_at DESC NULLS LAST, r.published_at DESC NULLS LAST
+          COALESCE(ss.total_views, 0)::int AS total_views,
+          COALESCE(ss.unique_viewers, 0)::int AS unique_viewers,
+          COALESCE(ss.member_viewers, 0)::int AS member_viewers,
+          COALESCE(ss.total_watch_seconds, 0)::int AS total_watch_seconds,
+          COALESCE(ss.avg_watch_seconds, 0)::int AS avg_watch_seconds,
+          COALESCE(ss.completed_views, 0)::int AS completed_views,
+          COALESCE(ss.completion_rate, 0)::float AS completion_rate,
+          COALESCE(ss.furthest_position_seconds, 0)::int AS furthest_position_seconds,
+          COALESCE(es.shares, 0)::int AS shares,
+          COALESCE(es.reactions, 0)::int AS reactions,
+          COALESCE(es.plays, 0)::int AS plays,
+          COALESCE(es.end_events, 0)::int AS end_events,
+          COALESCE(sv.saves, 0)::int AS saves,
+          (
+            COALESCE(ss.total_views, 0)
+            + (COALESCE(ss.completed_views, 0) * 3)
+            + (COALESCE(sv.saves, 0) * 4)
+            + (COALESCE(es.shares, 0) * 5)
+            + (COALESCE(es.reactions, 0) * 2)
+          )::int AS engagement_score,
+          ss.last_viewed_at
+        FROM replay_scope r
+        LEFT JOIN session_stats ss ON ss.recording_id = r.id
+        LEFT JOIN event_stats es ON es.recording_id = r.id
+        LEFT JOIN save_stats sv ON sv.recording_id = r.id
+        ORDER BY total_views DESC, engagement_score DESC, last_viewed_at DESC NULLS LAST, r.published_at DESC NULLS LAST
         LIMIT 50
         `,
         [req.organization.id, days],
@@ -10159,18 +10235,326 @@ app.get(
         (acc, row) => {
           acc.total_views += Number(row.total_views || 0);
           acc.unique_viewers += Number(row.unique_viewers || 0);
+          acc.member_viewers += Number(row.member_viewers || 0);
           acc.total_watch_seconds += Number(row.total_watch_seconds || 0);
+          acc.completed_views += Number(row.completed_views || 0);
+          acc.saves += Number(row.saves || 0);
+          acc.shares += Number(row.shares || 0);
+          acc.reactions += Number(row.reactions || 0);
+          acc.engagement_score += Number(row.engagement_score || 0);
           return acc;
         },
-        { total_views: 0, unique_viewers: 0, total_watch_seconds: 0 },
+        {
+          total_views: 0,
+          unique_viewers: 0,
+          member_viewers: 0,
+          total_watch_seconds: 0,
+          completed_views: 0,
+          saves: 0,
+          shares: 0,
+          reactions: 0,
+          engagement_score: 0,
+        },
       );
 
-      res.json({ ok: true, summary, replays: result.rows });
+      summary.avg_watch_seconds = summary.total_views
+        ? Math.round(summary.total_watch_seconds / summary.total_views)
+        : 0;
+      summary.completion_rate = summary.total_views
+        ? summary.completed_views / summary.total_views
+        : 0;
+
+      res.json({ ok: true, days, summary, replays: result.rows });
     } catch (error) {
       console.error("Replay analytics error:", error);
       res
         .status(500)
         .json({ ok: false, message: "Failed to load replay analytics" });
+    }
+  },
+);
+
+app.get(
+  "/api/analytics/replays/retention",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      if (!requireAnalyticsTenant(req, res)) return;
+
+      const days = Math.min(
+        Math.max(Number.parseInt(req.query.days || "7", 10) || 7, 1),
+        365,
+      );
+      const recordingId = Number(req.query.recording_id || 0) || null;
+      const params = recordingId
+        ? [req.organization.id, days, recordingId]
+        : [req.organization.id, days];
+      const recordingFilter = recordingId ? "AND rs.recording_id = $3" : "";
+
+      const result = await pool.query(
+        `
+        WITH scoped AS (
+          SELECT
+            rs.recording_id,
+            COALESCE(r.public_title, r.stream_key, r.filename) AS title,
+            GREATEST(
+              COALESCE(rs.max_position_seconds, 0),
+              COALESCE(rs.current_time_seconds, 0),
+              COALESCE(rs.watched_seconds, 0)
+            )::int AS reached_seconds,
+            COALESCE(r.duration_seconds, 0)::int AS duration_seconds
+          FROM replay_sessions rs
+          JOIN recordings r ON r.id = rs.recording_id
+          WHERE rs.organization_id = $1
+            AND r.organization_id = $1
+            AND rs.started_at >= NOW() - ($2::text || ' days')::interval
+            ${recordingFilter}
+        ),
+        checkpoints AS (
+          SELECT * FROM (VALUES
+            (0, 'Start'),
+            (60, '1m'),
+            (300, '5m'),
+            (600, '10m'),
+            (900, '15m'),
+            (1800, '30m'),
+            (2700, '45m'),
+            (3600, '60m'),
+            (5400, '90m'),
+            (7200, '120m')
+          ) AS c(second_mark, label)
+        ),
+        totals AS (
+          SELECT COUNT(*)::int AS total_sessions FROM scoped
+        )
+        SELECT
+          c.second_mark,
+          c.label,
+          COALESCE(COUNT(s.*), 0)::int AS viewers,
+          COALESCE(t.total_sessions, 0)::int AS total_sessions,
+          CASE
+            WHEN COALESCE(t.total_sessions, 0) > 0
+            THEN (COUNT(s.*)::float / t.total_sessions)
+            ELSE 0
+          END AS retention_rate
+        FROM checkpoints c
+        CROSS JOIN totals t
+        LEFT JOIN scoped s
+          ON s.reached_seconds >= c.second_mark
+         AND (s.duration_seconds = 0 OR c.second_mark <= s.duration_seconds)
+        GROUP BY c.second_mark, c.label, t.total_sessions
+        ORDER BY c.second_mark ASC
+        `,
+        params,
+      );
+
+      res.json({
+        ok: true,
+        days,
+        recording_id: recordingId,
+        retention: result.rows,
+      });
+    } catch (error) {
+      console.error("Replay retention analytics error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load replay retention analytics",
+        error: error.message,
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/analytics/members",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      if (!requireAnalyticsTenant(req, res)) return;
+
+      const days = Math.min(
+        Math.max(Number.parseInt(req.query.days || "7", 10) || 7, 1),
+        365,
+      );
+
+      const result = await pool.query(
+        `
+        WITH member_sessions AS (
+          SELECT
+            m.id,
+            m.name,
+            m.email,
+            m.status,
+            m.created_at,
+            COUNT(rs.id)::int AS replay_views,
+            COUNT(DISTINCT rs.recording_id)::int AS replays_watched,
+            COALESCE(SUM(rs.watched_seconds), 0)::int AS total_watch_seconds,
+            COALESCE(AVG(NULLIF(rs.watched_seconds, 0)), 0)::int AS avg_watch_seconds,
+            COUNT(*) FILTER (WHERE rs.completed)::int AS completed_replays,
+            MAX(rs.last_seen_at) AS last_active_at
+          FROM replay_viewer_members m
+          LEFT JOIN replay_sessions rs
+            ON rs.member_id = m.id
+           AND rs.organization_id = m.organization_id
+           AND rs.started_at >= NOW() - ($2::text || ' days')::interval
+          WHERE m.organization_id = $1
+          GROUP BY m.id
+        )
+        SELECT
+          *,
+          CASE
+            WHEN replay_views > 0 THEN completed_replays::float / replay_views
+            ELSE 0
+          END AS completion_rate
+        FROM member_sessions
+        ORDER BY total_watch_seconds DESC, replay_views DESC, last_active_at DESC NULLS LAST
+        LIMIT 50
+        `,
+        [req.organization.id, days],
+      );
+
+      const summary = result.rows.reduce(
+        (acc, row) => {
+          acc.total_members += 1;
+          if (row.status === "active") acc.active_members += 1;
+          if (Number(row.replay_views || 0) > 0) acc.watching_members += 1;
+          acc.total_replay_views += Number(row.replay_views || 0);
+          acc.total_watch_seconds += Number(row.total_watch_seconds || 0);
+          acc.completed_replays += Number(row.completed_replays || 0);
+          return acc;
+        },
+        {
+          total_members: 0,
+          active_members: 0,
+          watching_members: 0,
+          total_replay_views: 0,
+          total_watch_seconds: 0,
+          completed_replays: 0,
+        },
+      );
+
+      summary.avg_watch_seconds = summary.total_replay_views
+        ? Math.round(summary.total_watch_seconds / summary.total_replay_views)
+        : 0;
+
+      res.json({ ok: true, days, summary, members: result.rows });
+    } catch (error) {
+      console.error("Member analytics error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load member analytics",
+        error: error.message,
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/analytics/replays/export.csv",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      if (!requireAnalyticsTenant(req, res)) return;
+
+      const days = Math.min(
+        Math.max(Number.parseInt(req.query.days || "7", 10) || 7, 1),
+        365,
+      );
+
+      const result = await pool.query(
+        `
+        SELECT
+          COALESCE(r.public_title, r.stream_key, r.filename) AS replay_title,
+          r.public_slug,
+          rs.viewer_id,
+          m.email AS member_email,
+          m.name AS member_name,
+          rs.started_at,
+          rs.last_seen_at,
+          rs.ended_at,
+          rs.current_time_seconds,
+          rs.max_position_seconds,
+          rs.watched_seconds,
+          rs.completed,
+          rs.device_type,
+          rs.browser_name,
+          rs.os_name,
+          rs.country_code,
+          rs.country_name,
+          rs.referrer
+        FROM replay_sessions rs
+        JOIN recordings r ON r.id = rs.recording_id
+        LEFT JOIN replay_viewer_members m ON m.id = rs.member_id
+        WHERE rs.organization_id = $1
+          AND r.organization_id = $1
+          AND rs.started_at >= NOW() - ($2::text || ' days')::interval
+        ORDER BY rs.started_at DESC
+        `,
+        [req.organization.id, days],
+      );
+
+      const rows = [
+        [
+          "replay_title",
+          "public_slug",
+          "viewer_id",
+          "member_email",
+          "member_name",
+          "started_at",
+          "last_seen_at",
+          "ended_at",
+          "current_time_seconds",
+          "max_position_seconds",
+          "watched_seconds",
+          "completed",
+          "device_type",
+          "browser_name",
+          "os_name",
+          "country_code",
+          "country_name",
+          "referrer",
+        ],
+        ...result.rows.map((row) => [
+          row.replay_title || "",
+          row.public_slug || "",
+          row.viewer_id || "",
+          row.member_email || "",
+          row.member_name || "",
+          row.started_at ? new Date(row.started_at).toISOString() : "",
+          row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "",
+          row.ended_at ? new Date(row.ended_at).toISOString() : "",
+          row.current_time_seconds || 0,
+          row.max_position_seconds || 0,
+          row.watched_seconds || 0,
+          row.completed ? "true" : "false",
+          row.device_type || "",
+          row.browser_name || "",
+          row.os_name || "",
+          row.country_code || "",
+          row.country_name || "",
+          row.referrer || "",
+        ]),
+      ];
+
+      const csv = rows
+        .map((row) => row.map(escapeCsvValue).join(","))
+        .join("\n");
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="replay-analytics-${days}d.csv"`,
+      );
+      res.send(csv);
+    } catch (error) {
+      console.error("Replay analytics CSV export error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to export replay analytics CSV",
+        error: error.message,
+      });
     }
   },
 );
