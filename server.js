@@ -8486,6 +8486,51 @@ const mapPublicReplayDto = (row) => {
   };
 };
 
+// Public organizations list — used by member login gate
+// Returns active organizations that have at least one public replay
+app.get("/api/public/organizations", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT DISTINCT
+        o.id,
+        o.name,
+        o.slug,
+        o.logo_url,
+        o.primary_color,
+        os.watch_page_title,
+        os.secondary_color
+      FROM organizations o
+      INNER JOIN recordings r ON r.organization_id = o.id
+        AND r.is_public = TRUE
+        AND r.mp4_filename IS NOT NULL
+      LEFT JOIN organization_settings os ON os.organization_id = o.id
+      WHERE o.is_active = TRUE
+      ORDER BY o.name ASC
+      `,
+    );
+
+    res.json({
+      ok: true,
+      organizations: result.rows.map((org) => ({
+        id: org.id,
+        name: org.watch_page_title || org.name,
+        slug: org.slug,
+        logo_url: org.logo_url || null,
+        primary_color: org.primary_color || "#0d6efd",
+        secondary_color: org.secondary_color || "#fd9d00",
+      })),
+    });
+  } catch (error) {
+    console.error("Public organizations error:", error);
+    res.status(500).json({
+      ok: false,
+      message: "Failed to load organizations.",
+      error: error.message,
+    });
+  }
+});
+
 app.get("/api/public/replays", async (req, res) => {
   try {
     const viewerMember = await authenticateViewerMemberOptional(req);
