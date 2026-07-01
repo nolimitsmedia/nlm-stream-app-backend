@@ -8531,159 +8531,44 @@ app.get("/api/public/organizations", async (req, res) => {
   }
 });
 
-app.get("/api/public/replays", async (req, res) => {
+app.get("/api/public/organizations", async (req, res) => {
   try {
-    const viewerMember = await authenticateViewerMemberOptional(req);
-    const search = cleanOrgText(req.query.search || "", 255).toLowerCase();
-    const rawOrganization = cleanOrgText(
-      req.query.organization || req.query.org || "",
-      255,
-    );
-    const organizationSlug = rawOrganization
-      ? slugifyOrganization(rawOrganization)
-      : "";
-    const viewerId = cleanOrgText(req.query.viewer_id || "", 255);
-    const category = cleanOrgText(req.query.category || "", 120).toLowerCase();
-    const limit = Math.min(
-      Math.max(Number.parseInt(req.query.limit || "60", 10) || 60, 1),
-      100,
-    );
-
-    const values = [];
-    const where = [
-      "r.is_public = TRUE",
-      "COALESCE(r.replay_visibility, 'public') = 'public'",
-      "r.mp4_filename IS NOT NULL",
-      "(o.id IS NULL OR o.is_active = TRUE)",
-    ];
-
-    if (organizationSlug) {
-      values.push(organizationSlug);
-      where.push(`o.slug = $${values.length}`);
-    }
-
-    if (category) {
-      values.push(category);
-      where.push(`LOWER(COALESCE(r.replay_category, '')) = $${values.length}`);
-    }
-
-    if (search) {
-      values.push(`%${search}%`);
-      where.push(`(
-        LOWER(COALESCE(r.public_title, '')) LIKE $${values.length}
-        OR LOWER(COALESCE(r.public_description, '')) LIKE $${values.length}
-        OR LOWER(COALESCE(c.name, '')) LIKE $${values.length}
-        OR LOWER(COALESCE(r.stream_key, '')) LIKE $${values.length}
-        OR LOWER(COALESCE(o.name, '')) LIKE $${values.length}
-      )`);
-    }
-
-    values.push(limit);
-
-    const result = await pool.query(
-      `
-      SELECT
-        r.*,
-        c.name AS channel_name,
-        o.name AS organization_name,
-        o.slug AS organization_slug,
-        o.logo_url AS organization_logo_url,
-        o.primary_color AS organization_primary_color,
-        os.watch_page_title,
-        os.donation_url,
+    const result = await pool.query(`
+      SELECT DISTINCT
+        o.id,
+        o.name,
+        o.slug,
+        o.logo_url,
+        o.primary_color,
+        COALESCE(os.watch_page_title, o.name) AS display_name,
         os.secondary_color
-      FROM recordings r
-      LEFT JOIN channels c ON c.id = r.channel_id
-      LEFT JOIN organizations o ON o.id = r.organization_id
-      LEFT JOIN organization_settings os ON os.organization_id = r.organization_id
-      WHERE ${where.join(" AND ")}
-      ORDER BY r.published_at DESC NULLS LAST, r.created_at DESC NULLS LAST
-      LIMIT $${values.length}
-      `,
-      values,
-    );
-
-    const rows = result.rows || [];
-    const featuredRow = rows[0] || null;
-    const organizationsMap = new Map();
-    const categoriesMap = new Map();
-    const savedReplayIds = await getSavedReplayIdsForMember(
-      viewerMember?.id,
-      rows.map((row) => row.id),
-    );
-
-    const replays = rows.map((row) => {
-      organizationsMap.set(row.organization_slug || "", {
-        name: row.organization_name || "NLM Streaming",
-        slug: row.organization_slug || "",
-        logo_url: row.organization_logo_url || null,
-        primary_color: row.organization_primary_color || "#0d6efd",
-        secondary_color: row.secondary_color || "#fd9d00",
-        donation_url: row.donation_url || null,
-      });
-
-      if (row.replay_category) {
-        const categoryName = String(row.replay_category).trim();
-        const categoryKey = categoryName.toLowerCase();
-        categoriesMap.set(categoryKey, {
-          name: categoryName,
-          value: categoryKey,
-        });
-      }
-
-      return {
-        ...mapReplayLibraryItem(row),
-        is_saved: savedReplayIds.has(Number(row.id)),
-      };
-    });
-
-    const featured = featuredRow
-      ? {
-          id: featuredRow.id,
-          slug: featuredRow.public_slug,
-          title:
-            featuredRow.public_title ||
-            featuredRow.channel_name ||
-            featuredRow.stream_key ||
-            "Featured Replay",
-          description: featuredRow.public_description || "",
-          replay_category: featuredRow.replay_category || "",
-          replay_tags: featuredRow.replay_tags || "",
-          replay_visibility: featuredRow.replay_visibility || "public",
-          organization_name: featuredRow.organization_name || "NLM Streaming",
-          organization_slug: featuredRow.organization_slug || "",
-          duration_seconds: featuredRow.duration_seconds,
-          published_at: featuredRow.published_at,
-          url: `${CLIENT_URL.replace(/\/$/, "")}/replay/${featuredRow.public_slug}`,
-          thumbnail_url: featuredRow.thumbnail_filename
-            ? `${API_PUBLIC_URL.replace(/\/$/, "")}/api/public/replays/${featuredRow.public_slug}/thumbnail`
-            : null,
-          is_saved: savedReplayIds.has(Number(featuredRow.id)),
-        }
-      : null;
-
-    const continueWatching = await getContinueWatchingForViewer({
-      viewerId,
-      search,
-      organizationSlug,
-      limit: 12,
-    });
+      FROM organizations o
+      INNER JOIN recordings r ON r.organization_id = o.id
+        AND r.is_public = TRUE
+        AND r.mp4_filename IS NOT NULL
+      LEFT JOIN organization_settings os ON os.organization_id = o.id
+      WHERE o.is_active = TRUE
+      ORDER BY o.name ASC
+    `);
 
     res.json({
       ok: true,
-      featured,
-      replays,
-      continue_watching: continueWatching,
-      categories: Array.from(categoriesMap.values()).sort((a, b) =>
-        a.name.localeCompare(b.name),
-      ),
-      organizations: Array.from(organizationsMap.values()),
+      organizations: result.rows.map((org) => ({
+        id: org.id,
+        name: org.display_name || org.name,
+        slug: org.slug,
+        logo_url: org.logo_url || null,
+        primary_color: org.primary_color || "#0d6efd",
+        secondary_color: org.secondary_color || "#fd9d00",
+      })),
     });
   } catch (error) {
-    console.error("Public replay library error:", error);
-    res
-      .status(500)
-      .json({ ok: false, message: "Failed to load replay library" });
+    console.error("Public organizations error:", error);
+    res.status(500).json({
+      ok: false,
+      message: "Failed to load organizations.",
+      error: error.message,
+    });
   }
 });
 
@@ -10833,7 +10718,7 @@ app.get(
   "/api/members",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireOrganizationRole("owner", "admin"),
+  requireOrganizationRole("owner", "admin", "operator"),
   async (req, res) => {
     try {
       const search = cleanOrgText(req.query.search || "", 255).toLowerCase();
@@ -10931,7 +10816,7 @@ app.get(
   "/api/members/:memberId/history",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireOrganizationRole("owner", "admin"),
+  requireOrganizationRole("owner", "admin", "operator"),
   async (req, res) => {
     try {
       const memberId = Number(req.params.memberId);
@@ -11049,7 +10934,7 @@ app.patch(
   "/api/members/:memberId/status",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireOrganizationRole("owner", "admin"),
+  requireOrganizationRole("owner", "admin", "operator"),
   async (req, res) => {
     try {
       const memberId = Number(req.params.memberId);
@@ -11096,7 +10981,7 @@ app.delete(
   "/api/members/:memberId",
   authenticateAdmin,
   resolveOrganizationForRequest,
-  requireOrganizationRole("owner", "admin"),
+  requireOrganizationRole("owner", "admin", "operator"),
   async (req, res) => {
     try {
       const memberId = Number(req.params.memberId);
