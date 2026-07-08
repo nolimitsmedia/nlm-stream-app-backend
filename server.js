@@ -774,6 +774,17 @@ const ensureOrganizationTables = async () => {
     ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id)
   `);
 
+  // \u2500\u2500 SRS webhook columns \u2014 track live status per channel \u2500\u2500
+  await pool.query(`
+    ALTER TABLE channels
+    ADD COLUMN IF NOT EXISTS is_live BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE channels
+    ADD COLUMN IF NOT EXISTS live_started_at TIMESTAMPTZ
+  `);
+
   await pool.query(`
     ALTER TABLE recordings
     ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id)
@@ -6670,6 +6681,265 @@ app.get(
         message:
           "SRS server is not reachable from this backend environment yet.",
       });
+    }
+  },
+);
+
+// ── Helper: get plan limits for an org ────────────────────────────
+async function getOrgStreamingPlan(organizationId) {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        sub.plan_key,
+        sp.transcoding_enabled,
+        sp.max_channels,
+        COALESCE(sp.max_concurrent_streams, 999) AS max_concurrent_streams
+      FROM subscriptions sub
+      JOIN subscription_plans sp ON sp.plan_key = sub.plan_key
+      WHERE sub.organization_id = $1
+        AND sub.status IN ('active', 'trialing')
+      ORDER BY sub.created_at DESC
+      LIMIT 1
+      `,
+      [organizationId],
+    );
+    return (
+      result.rows[0] || {
+        transcoding_enabled: false,
+        max_concurrent_streams: 1,
+      }
+    );
+  } catch {
+    return { transcoding_enabled: false, max_concurrent_streams: 1 };
+  }
+}
+
+// ── Helper: count currently live streams for an org ───────────────
+async function getActiveLiveCount(organizationId) {
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM channels
+     WHERE organization_id = $1 AND is_live = TRUE`,
+    [organizationId],
+  );
+  return result.rows[0]?.count || 0;
+}
+
+// ── Helper: auto-transcode using FFmpeg ───────────────────────────
+function autoTranscodeStream(streamKey) {
+  const input = `rtmp://localhost/live/${streamKey}`;
+  const out720 = `rtmp://localhost/live/${streamKey}_720p`;
+  const out480 = `rtmp://localhost/live/${streamKey}_480p`;
+
+  console.log(`[Transcode] Starting 720p + 480p for: ${streamKey}`);
+
+  const cmd720 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 2500k -s 1280x720 -c:a aac -b:a 128k -f flv "${out720}"`;
+  const cmd480 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 1200k -s 854x480 -c:a aac -b:a 96k -f flv "${out480}"`;
+
+  exec(cmd720, (err) => {
+    if (err)
+      console.error(`[Transcode] 720p error for ${streamKey}:`, err.message);
+  });
+  exec(cmd480, (err) => {
+    if (err)
+      console.error(`[Transcode] 480p error for ${streamKey}:`, err.message);
+  });
+}
+
+// ── Helper: auto-sync recordings after stream ends ────────────────
+async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
+  setTimeout(async () => {
+    try {
+      console.log(`[DVR] Auto-syncing recordings for org: ${organizationId}`);
+      await scanRecordingFilesForOrganization(organizationId, {
+        processReady: true,
+      });
+      // Notify dashboard via socket
+      if (io)
+        io.emit("recordings:updated", { organization_id: organizationId });
+    } catch (err) {
+      console.error("[DVR] Auto-sync error:", err.message);
+    }
+  }, delayMs);
+}
+
+// ══════════════════════════════════════════
+// POST /api/srs/on_publish
+// SRS fires this when a broadcaster connects
+// Return code 0 = allow, code 403 = reject
+// ══════════════════════════════════════════
+app.post("/api/srs/on_publish", async (req, res) => {
+  const streamKey = req.body?.stream || req.body?.name || "";
+  console.log(`[SRS] on_publish — stream key: ${streamKey}`);
+
+  // Skip transcoded variant streams (they re-publish to SRS too)
+  if (streamKey.endsWith("_720p") || streamKey.endsWith("_480p")) {
+    return res.json({ code: 0 });
+  }
+
+  try {
+    // 1. Validate stream key exists and is active in our DB
+    const channelResult = await pool.query(
+      `
+      SELECT c.*, o.id AS org_id, o.name AS org_name, o.is_active AS org_active
+      FROM channels c
+      JOIN organizations o ON o.id = c.organization_id
+      WHERE c.stream_key = $1
+        AND c.is_active = TRUE
+        AND o.is_active = TRUE
+      LIMIT 1
+      `,
+      [streamKey],
+    );
+
+    if (!channelResult.rows[0]) {
+      console.warn(
+        `[SRS] REJECTED — Unknown or inactive stream key: ${streamKey}`,
+      );
+      return res.json({ code: 403 }); // SRS will kick the connection
+    }
+
+    const channel = channelResult.rows[0];
+
+    // 2. Check concurrent stream limit for this org's plan
+    const plan = await getOrgStreamingPlan(channel.org_id);
+    const liveCount = await getActiveLiveCount(channel.org_id);
+
+    if (liveCount >= plan.max_concurrent_streams) {
+      console.warn(
+        `[SRS] REJECTED — Org ${channel.org_name} exceeded max concurrent streams (${plan.max_concurrent_streams})`,
+      );
+      return res.json({ code: 403 });
+    }
+
+    // 3. Mark channel as live in DB
+    await pool.query(
+      `UPDATE channels SET is_live = TRUE, live_started_at = NOW() WHERE stream_key = $1`,
+      [streamKey],
+    );
+
+    // 4. Auto-transcode if plan allows
+    if (plan.transcoding_enabled) {
+      // Small delay so SRS stream is stable before FFmpeg connects
+      setTimeout(() => autoTranscodeStream(streamKey), 3000);
+    }
+
+    // 5. Notify all connected dashboard clients via socket
+    if (io) {
+      io.emit("stream:live", {
+        stream_key: streamKey,
+        channel_id: channel.id,
+        organization_id: channel.org_id,
+        organization_name: channel.org_name,
+      });
+    }
+
+    console.log(`[SRS] ALLOWED — ${streamKey} (org: ${channel.org_name})`);
+    res.json({ code: 0 });
+  } catch (err) {
+    console.error("[SRS] on_publish error:", err.message);
+    // Allow even on DB error so a server glitch doesn't cut a live broadcast
+    res.json({ code: 0 });
+  }
+});
+
+// ══════════════════════════════════════════
+// POST /api/srs/on_unpublish
+// SRS fires this when a broadcaster disconnects
+// ══════════════════════════════════════════
+app.post("/api/srs/on_unpublish", async (req, res) => {
+  const streamKey = req.body?.stream || req.body?.name || "";
+  console.log(`[SRS] on_unpublish — stream key: ${streamKey}`);
+
+  if (streamKey.endsWith("_720p") || streamKey.endsWith("_480p")) {
+    return res.json({ code: 0 });
+  }
+
+  try {
+    // Mark channel offline
+    const channelResult = await pool.query(
+      `UPDATE channels SET is_live = FALSE, live_started_at = NULL
+       WHERE stream_key = $1
+       RETURNING id, organization_id`,
+      [streamKey],
+    );
+
+    const orgId = channelResult.rows[0]?.organization_id;
+
+    // Notify dashboard
+    if (io) {
+      io.emit("stream:offline", {
+        stream_key: streamKey,
+        organization_id: orgId,
+      });
+    }
+
+    // Auto-sync recordings after stream ends (wait for SRS to write files)
+    if (orgId) {
+      autoSyncRecordingsDelayed(orgId, 8000);
+    }
+
+    console.log(`[SRS] Stream offline: ${streamKey}`);
+    res.json({ code: 0 });
+  } catch (err) {
+    console.error("[SRS] on_unpublish error:", err.message);
+    res.json({ code: 0 });
+  }
+});
+
+// ══════════════════════════════════════════
+// POST /api/srs/on_play
+// SRS fires this when a viewer starts watching
+// ══════════════════════════════════════════
+app.post("/api/srs/on_play", async (req, res) => {
+  const streamKey = req.body?.stream || req.body?.name || "";
+  const clientId = req.body?.client_id || "";
+  const ip = req.body?.ip || req.ip || "";
+
+  // Optional: log viewer for analytics
+  console.log(`[SRS] on_play — stream: ${streamKey}, client: ${clientId}`);
+
+  res.json({ code: 0 }); // Always allow (HLS token auth can add restriction here later)
+});
+
+// ══════════════════════════════════════════
+// POST /api/srs/on_stop
+// SRS fires this when a viewer stops watching
+// ══════════════════════════════════════════
+app.post("/api/srs/on_stop", async (req, res) => {
+  const streamKey = req.body?.stream || req.body?.name || "";
+  console.log(`[SRS] on_stop — stream: ${streamKey}`);
+  res.json({ code: 0 });
+});
+
+// ══════════════════════════════════════════
+// GET /api/srs/live-status
+// Quick endpoint for dashboard to poll without
+// hitting the SRS API directly
+// ══════════════════════════════════════════
+app.get(
+  "/api/srs/live-status",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT stream_key, name, is_live, live_started_at,
+              EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
+       FROM channels
+       WHERE organization_id = $1 AND is_live = TRUE`,
+        [req.organization.id],
+      );
+
+      res.json({
+        ok: true,
+        live_channels: result.rows,
+        count: result.rows.length,
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to get live status." });
     }
   },
 );
