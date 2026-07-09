@@ -6807,6 +6807,21 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
 // HLS PROXY - forwards viewer HLS requests to local SRS via public URL
 const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
 
+// Segments are immutable once SRS finishes writing them. Without this,
+// N concurrent viewers means N separate round trips to the home-network
+// SRS origin (through ngrok) for the exact same .ts file, which is the
+// main cause of stalling/buffer errors as viewer count grows. Cache each
+// segment briefly so only the first request per segment hits the origin.
+const segmentCache = new Map(); // segment filename -> { buffer, contentType, cachedAt }
+const SEGMENT_CACHE_TTL_MS = 15000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of segmentCache) {
+    if (now - val.cachedAt > SEGMENT_CACHE_TTL_MS) segmentCache.delete(key);
+  }
+}, 30000).unref();
+
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
   // SRS ties HLS playback sessions together with a query param (e.g.
@@ -6870,17 +6885,34 @@ app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
   const qs = req.originalUrl.includes("?")
     ? "?" + req.originalUrl.split("?")[1]
     : "";
+
+  const cached = segmentCache.get(segment);
+  if (cached) {
+    res.setHeader("Content-Type", cached.contentType);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=30");
+    res.setHeader("X-Segment-Cache", "HIT");
+    return res.send(cached.buffer);
+  }
+
   try {
     const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${segment}${qs}`, {
       signal: AbortSignal.timeout(10000),
     });
     if (!upstream.ok)
       return res.status(upstream.status).send("Segment unavailable");
-    res.setHeader("Content-Type", "video/mp2t");
+    const contentType = "video/mp2t";
+    res.setHeader("Content-Type", contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "public, max-age=30");
-    const buffer = await upstream.arrayBuffer();
-    res.send(Buffer.from(buffer));
+    res.setHeader("X-Segment-Cache", "MISS");
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    segmentCache.set(segment, {
+      buffer,
+      contentType,
+      cachedAt: Date.now(),
+    });
+    res.send(buffer);
   } catch (err) {
     res
       .status(503)
