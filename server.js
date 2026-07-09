@@ -6815,10 +6815,23 @@ const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
 const segmentCache = new Map(); // segment filename -> { buffer, contentType, cachedAt }
 const SEGMENT_CACHE_TTL_MS = 15000;
 
+// Same idea for the manifest itself: if N viewers are each polling the
+// playlist every ~1-2s, that's N separate ngrok round trips per interval.
+// We cache the RAW upstream text (not the per-viewer rewritten output,
+// since SRS tags each viewer's lines with their own hls_ctx — caching
+// the rewritten version would leak one viewer's session id into
+// another's player). Each request still re-applies its own query string
+// on top of the cached raw text.
+const manifestCache = new Map(); // streamKey -> { text, cachedAt }
+const MANIFEST_CACHE_TTL_MS = 1000;
+
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of segmentCache) {
     if (now - val.cachedAt > SEGMENT_CACHE_TTL_MS) segmentCache.delete(key);
+  }
+  for (const [key, val] of manifestCache) {
+    if (now - val.cachedAt > MANIFEST_CACHE_TTL_MS) manifestCache.delete(key);
   }
 }, 30000).unref();
 
@@ -6832,18 +6845,26 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
     ? "?" + req.originalUrl.split("?")[1]
     : "";
   try {
-    const upstream = await fetch(
-      `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`,
-      {
-        signal: AbortSignal.timeout(5000),
-      },
-    );
-    if (!upstream.ok)
-      return res.status(upstream.status).send("HLS unavailable");
+    let text;
+    const cached = manifestCache.get(streamKey);
+    if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
+      text = cached.text;
+    } else {
+      const upstream = await fetch(
+        `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`,
+        {
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      if (!upstream.ok)
+        return res.status(upstream.status).send("HLS unavailable");
+      text = await upstream.text();
+      manifestCache.set(streamKey, { text, cachedAt: Date.now() });
+    }
+
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-cache");
-    const text = await upstream.text();
     const rewritten = text
       .split("\n")
       .map((line) => {
