@@ -6809,10 +6809,20 @@ const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
 
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
+  // SRS ties HLS playback sessions together with a query param (e.g.
+  // hls_ctx). Drop it and SRS treats every request as a brand-new
+  // client, which produces exactly the on_play/on_stop flood + 404
+  // loop we were seeing. Forward it through untouched.
+  const qs = req.originalUrl.includes("?")
+    ? "?" + req.originalUrl.split("?")[1]
+    : "";
   try {
-    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8`, {
-      signal: AbortSignal.timeout(5000),
-    });
+    const upstream = await fetch(
+      `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`,
+      {
+        signal: AbortSignal.timeout(5000),
+      },
+    );
     if (!upstream.ok)
       return res.status(upstream.status).send("HLS unavailable");
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -6825,18 +6835,23 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         const t = line.trim();
         if (!t || t.startsWith("#")) return line;
 
-        if (t.endsWith(".ts")) {
-          return `/api/hls/seg/${streamKey}/${t.split("/").pop()}`;
+        // Split off any query string SRS appended (e.g. ?hls_ctx=...)
+        // so we don't lose it when rewriting the path.
+        const [pathPart, query] = t.split("?");
+        const suffix = query ? `?${query}` : "";
+
+        if (pathPart.endsWith(".ts")) {
+          return `/api/hls/seg/${streamKey}/${pathPart.split("/").pop()}${suffix}`;
         }
 
         // Some SRS configs emit nested/self-referencing .m3u8 lines
         // (absolute or relative). Route these back through our own
         // proxy too, or hls.js will resolve them against the page's
         // origin and 404.
-        if (t.endsWith(".m3u8")) {
-          const fileName = t.split("/").pop();
+        if (pathPart.endsWith(".m3u8")) {
+          const fileName = pathPart.split("/").pop();
           const variantKey = fileName.replace(/\.m3u8$/, "");
-          return `/api/hls/${variantKey}.m3u8`;
+          return `/api/hls/${variantKey}.m3u8${suffix}`;
         }
 
         return line;
@@ -6852,8 +6867,11 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
 app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
   const { segment } = req.params;
+  const qs = req.originalUrl.includes("?")
+    ? "?" + req.originalUrl.split("?")[1]
+    : "";
   try {
-    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${segment}`, {
+    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${segment}${qs}`, {
       signal: AbortSignal.timeout(10000),
     });
     if (!upstream.ok)
