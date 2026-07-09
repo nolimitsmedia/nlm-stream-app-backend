@@ -4703,15 +4703,12 @@ const getPublicWatchStatus = async (streamKey) => {
   const organizationId = await getOrganizationIdForStreamKey(streamKey);
 
   // PRIMARY: Check DB is_live flag set by SRS on_publish webhook
-  // Works even when SRS is local and backend is on Render cloud
   try {
     const channelResult = await pool.query(
       `SELECT stream_key, name, is_live, live_started_at,
               EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
        FROM channels
-       WHERE stream_key = $1
-         AND organization_id = $2
-         AND is_live = TRUE
+       WHERE stream_key = $1 AND organization_id = $2 AND is_live = TRUE
        LIMIT 1`,
       [streamKey, organizationId],
     );
@@ -4728,7 +4725,7 @@ const getPublicWatchStatus = async (streamKey) => {
     console.error("DB is_live check error:", dbErr.message);
   }
 
-  // FALLBACK: Try polling SRS directly (works when both are co-located)
+  // FALLBACK: Try polling SRS directly
   if (!activeStream) {
     try {
       const response = await fetch(`${SRS_API_URL}/api/v1/streams`, {
@@ -4739,7 +4736,7 @@ const getPublicWatchStatus = async (streamKey) => {
         (s) => s.name === streamKey && s.publish?.active,
       );
     } catch {
-      /* silent - expected when SRS is local */
+      /* silent - SRS not reachable from cloud */
     }
   }
 
@@ -6691,13 +6688,12 @@ app.get(
         streams,
       });
     } catch (error) {
-      // SRS not reachable - fall back to DB is_live (set by webhook)
+      // SRS not reachable - fall back to DB is_live
       try {
         const liveResult = await pool.query(
-          `SELECT stream_key, name, is_live, live_started_at,
+          `SELECT stream_key, name,
                   EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
-           FROM channels
-           WHERE organization_id = $1 AND is_live = TRUE`,
+           FROM channels WHERE organization_id = $1 AND is_live = TRUE`,
           [req.organization.id],
         );
         const dbStreams = liveResult.rows.map((ch) => ({
@@ -6713,8 +6709,7 @@ app.get(
           ok: true,
           srs_available: false,
           streams: dbStreams,
-          message:
-            "Stream status from DB webhook (SRS not directly reachable).",
+          message: "Stream status from DB webhook.",
         });
       } catch (dbErr) {
         console.warn("SRS and DB fallback both failed:", dbErr.message);
@@ -6808,7 +6803,8 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
 }
 
 // ══════════════════════════════════════════
-// HLS PROXY - forwards viewer HLS requests to local SRS via ngrok/public URL
+
+// HLS PROXY - forwards viewer HLS requests to local SRS via public URL
 const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
 
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
@@ -6859,7 +6855,6 @@ app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
       .json({ ok: false, message: "Segment unavailable: " + err.message });
   }
 });
-
 // POST /api/srs/on_publish
 // SRS fires this when a broadcaster connects
 // Return code 0 = allow, code 403 = reject
@@ -6874,6 +6869,13 @@ app.post("/api/srs/on_publish", async (req, res) => {
   }
 
   try {
+    // 0. Auto-reset stale is_live flags older than 2 hours (cleanup)
+    await pool.query(
+      `UPDATE channels SET is_live = FALSE, live_started_at = NULL
+       WHERE is_live = TRUE
+         AND live_started_at < NOW() - INTERVAL '2 hours'`,
+    );
+
     // 1. Validate stream key exists and is active in our DB
     const channelResult = await pool.query(
       `
