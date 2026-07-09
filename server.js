@@ -6823,8 +6823,22 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       .split("\n")
       .map((line) => {
         const t = line.trim();
-        if (t.endsWith(".ts"))
+        if (!t || t.startsWith("#")) return line;
+
+        if (t.endsWith(".ts")) {
           return `/api/hls/seg/${streamKey}/${t.split("/").pop()}`;
+        }
+
+        // Some SRS configs emit nested/self-referencing .m3u8 lines
+        // (absolute or relative). Route these back through our own
+        // proxy too, or hls.js will resolve them against the page's
+        // origin and 404.
+        if (t.endsWith(".m3u8")) {
+          const fileName = t.split("/").pop();
+          const variantKey = fileName.replace(/\.m3u8$/, "");
+          return `/api/hls/${variantKey}.m3u8`;
+        }
+
         return line;
       })
       .join("\n");
