@@ -4702,15 +4702,45 @@ const getPublicWatchStatus = async (streamKey) => {
   let activeStream = null;
   const organizationId = await getOrganizationIdForStreamKey(streamKey);
 
+  // PRIMARY: Check DB is_live flag set by SRS on_publish webhook
+  // Works even when SRS is local and backend is on Render cloud
   try {
-    const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
-    const data = await response.json();
+    const channelResult = await pool.query(
+      `SELECT stream_key, name, is_live, live_started_at,
+              EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
+       FROM channels
+       WHERE stream_key = $1
+         AND organization_id = $2
+         AND is_live = TRUE
+       LIMIT 1`,
+      [streamKey, organizationId],
+    );
+    if (channelResult.rows[0]) {
+      const ch = channelResult.rows[0];
+      activeStream = {
+        name: ch.stream_key,
+        publish: { active: true, active_age: ch.uptime_seconds || 0 },
+        clients: 0,
+        kbps: { recv_30s: 0 },
+      };
+    }
+  } catch (dbErr) {
+    console.error("DB is_live check error:", dbErr.message);
+  }
 
-    activeStream = (data.streams || []).find((stream) => {
-      return stream.name === streamKey && stream.publish?.active;
-    });
-  } catch (error) {
-    console.error("Public watch SRS status error:", error.message);
+  // FALLBACK: Try polling SRS directly (works when both are co-located)
+  if (!activeStream) {
+    try {
+      const response = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      const data = await response.json();
+      activeStream = (data.streams || []).find(
+        (s) => s.name === streamKey && s.publish?.active,
+      );
+    } catch {
+      /* silent - expected when SRS is local */
+    }
   }
 
   const scheduleResult = await pool.query(
@@ -6661,14 +6691,39 @@ app.get(
         streams,
       });
     } catch (error) {
-      console.warn("SRS unavailable:", error.message);
-
+      // SRS not reachable - fall back to DB is_live (set by webhook)
+      try {
+        const liveResult = await pool.query(
+          `SELECT stream_key, name, is_live, live_started_at,
+                  EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
+           FROM channels
+           WHERE organization_id = $1 AND is_live = TRUE`,
+          [req.organization.id],
+        );
+        const dbStreams = liveResult.rows.map((ch) => ({
+          id: ch.stream_key,
+          name: ch.stream_key,
+          publish: { active: true, active_age: ch.uptime_seconds || 0 },
+          clients: 0,
+          kbps: { recv_30s: 0 },
+          frames: 0,
+          source: "db_webhook",
+        }));
+        return res.json({
+          ok: true,
+          srs_available: false,
+          streams: dbStreams,
+          message:
+            "Stream status from DB webhook (SRS not directly reachable).",
+        });
+      } catch (dbErr) {
+        console.warn("SRS and DB fallback both failed:", dbErr.message);
+      }
       res.json({
         ok: true,
         srs_available: false,
         streams: [],
-        message:
-          "SRS server is not reachable from this backend environment yet.",
+        message: "SRS not reachable.",
       });
     }
   },
@@ -6753,6 +6808,58 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
 }
 
 // ══════════════════════════════════════════
+// HLS PROXY - forwards viewer HLS requests to local SRS via ngrok/public URL
+const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
+
+app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
+  const { streamKey } = req.params;
+  try {
+    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!upstream.ok)
+      return res.status(upstream.status).send("HLS unavailable");
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-cache");
+    const text = await upstream.text();
+    const rewritten = text
+      .split("\n")
+      .map((line) => {
+        const t = line.trim();
+        if (t.endsWith(".ts"))
+          return `/api/hls/seg/${streamKey}/${t.split("/").pop()}`;
+        return line;
+      })
+      .join("\n");
+    res.send(rewritten);
+  } catch (err) {
+    res
+      .status(503)
+      .json({ ok: false, message: "HLS unavailable: " + err.message });
+  }
+});
+
+app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
+  const { segment } = req.params;
+  try {
+    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${segment}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!upstream.ok)
+      return res.status(upstream.status).send("Segment unavailable");
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=30");
+    const buffer = await upstream.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    res
+      .status(503)
+      .json({ ok: false, message: "Segment unavailable: " + err.message });
+  }
+});
+
 // POST /api/srs/on_publish
 // SRS fires this when a broadcaster connects
 // Return code 0 = allow, code 403 = reject
@@ -8456,63 +8563,6 @@ const mapReplayLibraryItem = (row) => ({
   thumbnail_url: row.thumbnail_filename
     ? `${API_PUBLIC_URL.replace(/\/$/, "")}/api/public/replays/${row.public_slug}/thumbnail`
     : null,
-});
-
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// HLS PROXY \u2014 forwards HLS requests from Render to local SRS
-// Solves the local SRS + cloud backend architecture mismatch.
-// Viewers hit https://your-backend.onrender.com/api/hls/...
-// Backend fetches from http://SRS_HLS_ORIGIN/live/... and pipes it back.
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
-
-app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
-  const { streamKey } = req.params;
-  const hlsUrl = `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8`;
-  try {
-    const upstream = await fetch(hlsUrl, { signal: AbortSignal.timeout(5000) });
-    if (!upstream.ok) {
-      return res.status(upstream.status).send("HLS stream not available");
-    }
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "no-cache");
-    const text = await upstream.text();
-    // Rewrite .ts segment URLs to go through this proxy too
-    const rewritten = text
-      .split("\n")
-      .map((line) => {
-        if (line.endsWith(".ts")) {
-          const seg = line.trim().split("/").pop();
-          return `/api/hls/seg/${streamKey}/${seg}`;
-        }
-        return line;
-      })
-      .join("\n");
-    res.send(rewritten);
-  } catch (err) {
-    res.status(503).send("HLS stream unavailable: " + err.message);
-  }
-});
-
-app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
-  const { streamKey, segment } = req.params;
-  const segUrl = `${SRS_HLS_ORIGIN}/live/${segment}`;
-  try {
-    const upstream = await fetch(segUrl, {
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!upstream.ok) {
-      return res.status(upstream.status).send("Segment not available");
-    }
-    res.setHeader("Content-Type", "video/mp2t");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=30");
-    const buffer = await upstream.arrayBuffer();
-    res.send(Buffer.from(buffer));
-  } catch (err) {
-    res.status(503).send("Segment unavailable: " + err.message);
-  }
 });
 
 const getSavedReplayIdsForMember = async (memberId, recordingIds = []) => {
