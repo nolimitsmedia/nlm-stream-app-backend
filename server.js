@@ -6838,8 +6838,6 @@ setInterval(() => {
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
 
-  // Forward SRS query params (example: hls_ctx)
-  // SRS uses these to maintain playback sessions.
   const qs = req.originalUrl.includes("?")
     ? "?" + req.originalUrl.split("?")[1]
     : "";
@@ -6858,14 +6856,18 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       const upstream = await fetch(upstreamUrl, {
         signal: AbortSignal.timeout(20000),
+        redirect: "follow",
         headers: {
-          "ngrok-skip-browser-warning": "true",
+          "ngrok-skip-browser-warning": "1",
+          "User-Agent": "NLM-Streaming-Backend/1.0",
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
         },
       });
 
       console.log("[HLS RESPONSE]", {
         status: upstream.status,
         contentType: upstream.headers.get("content-type"),
+        finalUrl: upstream.url,
       });
 
       if (!upstream.ok) {
@@ -6874,7 +6876,8 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         console.error("[HLS UPSTREAM ERROR]", {
           status: upstream.status,
           url: upstreamUrl,
-          response: errorText.substring(0, 300),
+          finalUrl: upstream.url,
+          response: errorText.substring(0, 500),
         });
 
         return res.status(502).send("HLS unavailable");
@@ -6882,10 +6885,8 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       text = await upstream.text();
 
-      // Prevent caching invalid responses
-      // (example: ngrok error page, HTML response, etc.)
-      if (!text.startsWith("#EXTM3U")) {
-        console.error("[INVALID HLS RESPONSE]", text.substring(0, 300));
+      if (!text.trimStart().startsWith("#EXTM3U")) {
+        console.error("[INVALID HLS RESPONSE]", text.substring(0, 500));
 
         return res.status(502).send("Invalid HLS playlist received");
       }
@@ -6897,9 +6898,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-
     res.setHeader("Access-Control-Allow-Origin", "*");
-
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
     const rewritten = text
@@ -6911,39 +6910,43 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
           return line;
         }
 
-        // Preserve SRS query strings
-        const [pathPart, query] = t.split("?");
+        const questionIndex = t.indexOf("?");
 
-        const suffix = query ? `?${query}` : "";
+        const pathPart = questionIndex >= 0 ? t.slice(0, questionIndex) : t;
 
-        // Rewrite TS segments through our backend proxy
+        const suffix = questionIndex >= 0 ? t.slice(questionIndex) : "";
+
         if (pathPart.endsWith(".ts")) {
-          return `/api/hls/seg/${streamKey}/${pathPart.split("/").pop()}${suffix}`;
+          const segmentName = pathPart.split("/").pop();
+
+          return `/api/hls/seg/${encodeURIComponent(
+            streamKey,
+          )}/${encodeURIComponent(segmentName)}${suffix}`;
         }
 
-        // Rewrite variant playlists
         if (pathPart.endsWith(".m3u8")) {
           const fileName = pathPart.split("/").pop();
 
-          const variantKey = fileName.replace(/\.m3u8$/, "");
+          const variantKey = fileName.replace(/\.m3u8$/i, "");
 
-          return `/api/hls/${variantKey}.m3u8${suffix}`;
+          return `/api/hls/${encodeURIComponent(variantKey)}.m3u8${suffix}`;
         }
 
         return line;
       })
       .join("\n");
 
-    res.send(rewritten);
+    return res.send(rewritten);
   } catch (err) {
     console.error("[HLS PROXY FAILED]", {
+      name: err.name,
       message: err.message,
-      stack: err.stack,
+      cause: err.cause,
       origin: SRS_HLS_ORIGIN,
       streamKey,
     });
 
-    res.status(503).json({
+    return res.status(503).json({
       ok: false,
       message: "HLS unavailable: " + err.message,
     });
