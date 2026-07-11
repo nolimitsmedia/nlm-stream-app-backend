@@ -6837,67 +6837,115 @@ setInterval(() => {
 
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
-  // SRS ties HLS playback sessions together with a query param (e.g.
-  // hls_ctx). Drop it and SRS treats every request as a brand-new
-  // client, which produces exactly the on_play/on_stop flood + 404
-  // loop we were seeing. Forward it through untouched.
+
+  // Forward SRS query params (example: hls_ctx)
+  // SRS uses these to maintain playback sessions.
   const qs = req.originalUrl.includes("?")
     ? "?" + req.originalUrl.split("?")[1]
     : "";
+
   try {
     let text;
+
     const cached = manifestCache.get(streamKey);
+
     if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
     } else {
-      const upstream = await fetch(
-        `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`,
-        {
-          signal: AbortSignal.timeout(5000),
-        },
-      );
-      if (!upstream.ok)
-        return res.status(upstream.status).send("HLS unavailable");
+      const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`;
+
+      console.log("[HLS REQUEST]", upstreamUrl);
+
+      const upstream = await fetch(upstreamUrl, {
+        // Increased because Render -> ngrok -> local SRS
+        // can sometimes exceed 5 seconds.
+        signal: AbortSignal.timeout(20000),
+      });
+
+      console.log("[HLS RESPONSE]", {
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type"),
+      });
+
+      if (!upstream.ok) {
+        const errorText = await upstream.text();
+
+        console.error("[HLS UPSTREAM ERROR]", {
+          status: upstream.status,
+          url: upstreamUrl,
+          response: errorText.substring(0, 300),
+        });
+
+        return res.status(502).send("HLS unavailable");
+      }
+
       text = await upstream.text();
-      manifestCache.set(streamKey, { text, cachedAt: Date.now() });
+
+      // Prevent caching invalid responses
+      // (example: ngrok error page, HTML response, etc.)
+      if (!text.startsWith("#EXTM3U")) {
+        console.error("[INVALID HLS RESPONSE]", text.substring(0, 300));
+
+        return res.status(502).send("Invalid HLS playlist received");
+      }
+
+      manifestCache.set(streamKey, {
+        text,
+        cachedAt: Date.now(),
+      });
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "no-cache");
+
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+
     const rewritten = text
       .split("\n")
       .map((line) => {
         const t = line.trim();
-        if (!t || t.startsWith("#")) return line;
 
-        // Split off any query string SRS appended (e.g. ?hls_ctx=...)
-        // so we don't lose it when rewriting the path.
+        if (!t || t.startsWith("#")) {
+          return line;
+        }
+
+        // Preserve SRS query strings
         const [pathPart, query] = t.split("?");
+
         const suffix = query ? `?${query}` : "";
 
+        // Rewrite TS segments through our backend proxy
         if (pathPart.endsWith(".ts")) {
           return `/api/hls/seg/${streamKey}/${pathPart.split("/").pop()}${suffix}`;
         }
 
-        // Some SRS configs emit nested/self-referencing .m3u8 lines
-        // (absolute or relative). Route these back through our own
-        // proxy too, or hls.js will resolve them against the page's
-        // origin and 404.
+        // Rewrite variant playlists
         if (pathPart.endsWith(".m3u8")) {
           const fileName = pathPart.split("/").pop();
+
           const variantKey = fileName.replace(/\.m3u8$/, "");
+
           return `/api/hls/${variantKey}.m3u8${suffix}`;
         }
 
         return line;
       })
       .join("\n");
+
     res.send(rewritten);
   } catch (err) {
-    res
-      .status(503)
-      .json({ ok: false, message: "HLS unavailable: " + err.message });
+    console.error("[HLS PROXY FAILED]", {
+      message: err.message,
+      stack: err.stack,
+      origin: SRS_HLS_ORIGIN,
+      streamKey,
+    });
+
+    res.status(503).json({
+      ok: false,
+      message: "HLS unavailable: " + err.message,
+    });
   }
 });
 
