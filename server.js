@@ -6857,9 +6857,10 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       console.log("[HLS REQUEST]", upstreamUrl);
 
       const upstream = await fetch(upstreamUrl, {
-        // Increased because Render -> ngrok -> local SRS
-        // can sometimes exceed 5 seconds.
         signal: AbortSignal.timeout(20000),
+        headers: {
+          "ngrok-skip-browser-warning": "true",
+        },
       });
 
       console.log("[HLS RESPONSE]", {
