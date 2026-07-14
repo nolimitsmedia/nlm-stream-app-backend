@@ -6845,8 +6845,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   try {
     let text;
 
-    const cacheKey = `${streamKey}${qs}`;
-    const cached = manifestCache.get(cacheKey);
+    const cached = manifestCache.get(streamKey);
 
     if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
@@ -6892,7 +6891,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         return res.status(502).send("Invalid HLS playlist received");
       }
 
-      manifestCache.set(cacheKey, {
+      manifestCache.set(streamKey, {
         text,
         cachedAt: Date.now(),
       });
