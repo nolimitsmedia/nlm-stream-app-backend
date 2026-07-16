@@ -6850,11 +6850,9 @@ const archiveRecordingRow = async (recording) => {
       `SELECT slug FROM organizations WHERE id = $1`,
       [recording.organization_id],
     );
-    const orgSlug =
-      orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
+    const orgSlug = orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
 
-    const dateSource =
-      recording.started_at || recording.created_at || new Date();
+    const dateSource = recording.started_at || recording.created_at || new Date();
     const date = new Date(dateSource);
     const yyyy = date.getFullYear();
     const mm = String(date.getMonth() + 1).padStart(2, "0");
@@ -6867,7 +6865,8 @@ const archiveRecordingRow = async (recording) => {
       throw new Error("Local file not found for archival");
     }
 
-    const remotePath = `${orgSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
+    const channelSlug = recording.stream_key || "unknown-channel";
+    const remotePath = `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
 
     await uploadFileToBunnyStorage(fileToArchive, remotePath);
 
@@ -6893,10 +6892,7 @@ const archiveRecordingRow = async (recording) => {
 
     console.log(`[BUNNY] Archived recording #${recording.id} -> ${remotePath}`);
   } catch (err) {
-    console.error(
-      `[BUNNY] Failed to archive recording #${recording.id}:`,
-      err.message,
-    );
+    console.error(`[BUNNY] Failed to archive recording #${recording.id}:`, err.message);
     await pool
       .query(`UPDATE recordings SET archive_status = 'failed' WHERE id = $1`, [
         recording.id,
@@ -7635,10 +7631,12 @@ app.post(
       }
 
       if (socialProcesses.has(destination.id)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Already simulcasting to this platform",
-        });
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message: "Already simulcasting to this platform",
+          });
       }
 
       const live = await isSrsStreamLive(channel.stream_key);
@@ -8442,6 +8440,27 @@ const scanRecordingFilesForOrganization = async (
     }
   }
 
+  // Include already-archived recordings too. Their local files were
+  // deleted after a successful Bunny upload, so they no longer show up
+  // in the filesystem scan above — pull them straight from the database
+  // instead so they don't disappear from the library.
+  const archivedResult = await pool.query(
+    `
+    SELECT r.*, c.name AS channel_name
+    FROM recordings r
+    LEFT JOIN channels c ON c.id = r.channel_id
+    WHERE r.organization_id = $1
+      AND r.archive_status = 'archived'
+    `,
+    [organizationId],
+  );
+
+  for (const archivedRow of archivedResult.rows) {
+    recordings.push(
+      mapRecordingRowToDto(archivedRow, archivedRow.channel_name),
+    );
+  }
+
   recordings.sort((a, b) => new Date(b.created) - new Date(a.created));
   return recordings;
 };
@@ -9036,10 +9055,7 @@ app.delete(
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       }
 
-      if (
-        recording.archive_status === "archived" &&
-        recording.bunny_storage_path
-      ) {
+      if (recording.archive_status === "archived" && recording.bunny_storage_path) {
         await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
@@ -10865,10 +10881,7 @@ app.delete(
         if (fs.existsSync(deletePath)) fs.unlinkSync(deletePath);
       }
 
-      if (
-        recording?.archive_status === "archived" &&
-        recording?.bunny_storage_path
-      ) {
+      if (recording?.archive_status === "archived" && recording?.bunny_storage_path) {
         await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
