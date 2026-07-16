@@ -4,7 +4,8 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
-const { exec, spawn } = require("child_process");
+const { exec, spawn, execSync } = require("child_process");
+const os = require("os");
 require("dotenv").config();
 
 const fs = require("fs");
@@ -47,6 +48,39 @@ const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// ══════════════════════════════════════════
+// SUPER ADMIN — recent error log (in-memory ring buffer)
+// Captures console.error calls so the super-admin dashboard can show
+// recent server-side errors without needing external log tooling.
+// Resets on server restart — this is a lightweight recent-activity
+// view, not a durable audit log.
+// ══════════════════════════════════════════
+const RECENT_ERROR_LOG_LIMIT = 100;
+const recentErrorLog = [];
+const originalConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  try {
+    const message = args
+      .map((a) =>
+        a instanceof Error
+          ? a.message
+          : typeof a === "string"
+            ? a
+            : JSON.stringify(a),
+      )
+      .join(" ")
+      .slice(0, 2000);
+
+    recentErrorLog.push({ message, at: new Date().toISOString() });
+    if (recentErrorLog.length > RECENT_ERROR_LOG_LIMIT) {
+      recentErrorLog.shift();
+    }
+  } catch {
+    // never let logging itself crash the app
+  }
+  originalConsoleError(...args);
+};
 
 const corsOptions = {
   origin(origin, callback) {
@@ -2997,6 +3031,217 @@ const getSuperAdminCount = async () => {
 
   return result.rows[0]?.count || 0;
 };
+
+// ══════════════════════════════════════════
+// SUPER ADMIN DASHBOARD — cross-organization overview
+// super_admin only. Not scoped to a single organization on purpose.
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/overview",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const [orgCounts, channelCount, adminsByRole, recordingsTotals] =
+        await Promise.all([
+          pool.query(
+            `SELECT COUNT(*)::int AS total,
+                    COUNT(*) FILTER (WHERE is_active)::int AS active
+             FROM organizations`,
+          ),
+          pool.query(`SELECT COUNT(*)::int AS total FROM channels`),
+          pool.query(
+            `SELECT role, COUNT(*)::int AS count FROM admins GROUP BY role`,
+          ),
+          pool.query(
+            `SELECT COUNT(*)::int AS total_recordings,
+                    COALESCE(SUM(file_size_bytes), 0)::bigint AS total_bytes
+             FROM recordings`,
+          ),
+        ]);
+
+      const channelsResult = await pool.query(
+        `SELECT c.stream_key, c.name AS channel_name, c.live_started_at,
+                o.id AS organization_id, o.name AS organization_name
+         FROM channels c
+         JOIN organizations o ON o.id = c.organization_id`,
+      );
+
+      const channelByStreamKey = new Map(
+        channelsResult.rows.map((row) => [String(row.stream_key), row]),
+      );
+
+      let liveStreams = [];
+      let srsAvailable = true;
+
+      try {
+        const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`);
+        if (!srsResponse.ok)
+          throw new Error(`SRS responded ${srsResponse.status}`);
+        const srsData = await srsResponse.json();
+
+        liveStreams = await Promise.all(
+          (srsData.streams || [])
+            .filter((stream) => channelByStreamKey.has(stream.name))
+            .map(async (stream) => {
+              const channel = channelByStreamKey.get(stream.name);
+              const viewerMetrics = await getViewerMetricsForStream(
+                stream.name,
+                null,
+              );
+              const uptimeSeconds =
+                stream.publish?.active && channel.live_started_at
+                  ? Math.max(
+                      0,
+                      Math.floor(
+                        (Date.now() -
+                          new Date(channel.live_started_at).getTime()) /
+                          1000,
+                      ),
+                    )
+                  : 0;
+
+              return {
+                stream_key: stream.name,
+                channel_name: channel.channel_name,
+                organization_id: channel.organization_id,
+                organization_name: channel.organization_name,
+                active: Boolean(stream.publish?.active),
+                viewers: viewerMetrics.active_viewers,
+                kbps: Number(stream.kbps?.recv_30s || 0),
+                uptime_seconds: uptimeSeconds,
+              };
+            }),
+        );
+      } catch (srsError) {
+        console.error(
+          "Super admin overview: SRS unavailable:",
+          srsError.message,
+        );
+        srsAvailable = false;
+      }
+
+      const activeLiveStreams = liveStreams.filter((s) => s.active);
+      const recentRecordings = await pool.query(
+        `SELECT r.id, r.filename, r.mp4_filename, r.created_at,
+                r.file_size_bytes, c.name AS channel_name,
+                o.name AS organization_name
+         FROM recordings r
+         LEFT JOIN channels c ON c.id = r.channel_id
+         LEFT JOIN organizations o ON o.id = r.organization_id
+         ORDER BY r.created_at DESC
+         LIMIT 10`,
+      );
+
+      res.json({
+        ok: true,
+        srs_available: srsAvailable,
+        organizations: orgCounts.rows[0],
+        channels: { total: channelCount.rows[0].total },
+        admins_by_role: adminsByRole.rows,
+        storage: {
+          total_recordings: recordingsTotals.rows[0].total_recordings,
+          total_bytes: Number(recordingsTotals.rows[0].total_bytes),
+        },
+        live_streams: activeLiveStreams,
+        totals: {
+          active_streams: activeLiveStreams.length,
+          live_viewers: activeLiveStreams.reduce(
+            (sum, s) => sum + Number(s.viewers || 0),
+            0,
+          ),
+          incoming_kbps: activeLiveStreams.reduce(
+            (sum, s) => sum + Number(s.kbps || 0),
+            0,
+          ),
+        },
+        recent_recordings: recentRecordings.rows,
+      });
+    } catch (error) {
+      console.error("Get admin overview error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load admin overview",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// SUPER ADMIN DASHBOARD — recent server error log
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/error-log",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  (req, res) => {
+    res.json({
+      ok: true,
+      errors: [...recentErrorLog].reverse(),
+    });
+  },
+);
+
+// ══════════════════════════════════════════
+// SUPER ADMIN DASHBOARD — server health
+// Real data from Node's os module + a disk usage check.
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/server-status",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  (req, res) => {
+    try {
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      const loadAvg = os.loadavg();
+      const cpuCount = os.cpus().length;
+
+      let disk = null;
+      try {
+        const dfOutput = execSync("df -k / | tail -1").toString().trim();
+        const parts = dfOutput.split(/\s+/);
+        const totalKb = Number(parts[1] || 0);
+        const usedKb = Number(parts[2] || 0);
+        const availKb = Number(parts[3] || 0);
+        disk = {
+          total_bytes: totalKb * 1024,
+          used_bytes: usedKb * 1024,
+          available_bytes: availKb * 1024,
+          used_percent: totalKb ? Math.round((usedKb / totalKb) * 100) : null,
+        };
+      } catch (diskError) {
+        console.error("Server status: disk check failed:", diskError.message);
+      }
+
+      res.json({
+        ok: true,
+        uptime_seconds: Math.floor(os.uptime()),
+        process_uptime_seconds: Math.floor(process.uptime()),
+        cpu_count: cpuCount,
+        load_avg: { "1m": loadAvg[0], "5m": loadAvg[1], "15m": loadAvg[2] },
+        memory: {
+          total_bytes: totalMem,
+          used_bytes: usedMem,
+          free_bytes: freeMem,
+          used_percent: Math.round((usedMem / totalMem) * 100),
+        },
+        disk,
+      });
+    } catch (error) {
+      console.error("Get server status error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load server status",
+        error: error.message,
+      });
+    }
+  },
+);
 
 app.get(
   "/api/admins",
