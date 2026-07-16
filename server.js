@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 require("dotenv").config();
 
 const fs = require("fs");
@@ -39,6 +39,10 @@ const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
 const RECORDINGS_ROOT = process.env.RECORDINGS_ROOT || "C:/nlm-srs/recordings";
 const RECORDINGS_LIVE_ROOT = path.join(RECORDINGS_ROOT, "live");
+const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
+const BUNNY_STORAGE_HOSTNAME = process.env.BUNNY_STORAGE_HOSTNAME || "";
+const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
+const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
@@ -6786,6 +6790,135 @@ function autoTranscodeStream(streamKey) {
 }
 
 // ── Helper: auto-sync recordings after stream ends ────────────────
+// ══════════════════════════════════════════
+// BUNNY STORAGE ARCHIVAL
+// Uploads finished recordings to Bunny Storage, organized by
+// organization slug and date, then removes the local copy to
+// save server disk space.
+// ══════════════════════════════════════════
+const uploadFileToBunnyStorage = async (localFilePath, remotePath) => {
+  const stats = fs.statSync(localFilePath);
+  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: {
+      AccessKey: BUNNY_STORAGE_API_KEY,
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(stats.size),
+    },
+    body: fs.createReadStream(localFilePath),
+    duplex: "half",
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Bunny upload failed: ${response.status} ${text}`);
+  }
+
+  return true;
+};
+
+const deleteFileFromBunnyStorage = async (remotePath) => {
+  if (!remotePath || !BUNNY_STORAGE_API_KEY) return;
+
+  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: { AccessKey: BUNNY_STORAGE_API_KEY },
+    });
+
+    if (!response.ok && response.status !== 404) {
+      const text = await response.text().catch(() => "");
+      console.error(`[BUNNY] Delete failed: ${response.status} ${text}`);
+    }
+  } catch (err) {
+    console.error("[BUNNY] Delete request error:", err.message);
+  }
+};
+
+const archiveRecordingRow = async (recording) => {
+  try {
+    await pool.query(
+      `UPDATE recordings SET archive_status = 'archiving' WHERE id = $1`,
+      [recording.id],
+    );
+
+    const orgResult = await pool.query(
+      `SELECT slug FROM organizations WHERE id = $1`,
+      [recording.organization_id],
+    );
+    const orgSlug = orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
+
+    const dateSource = recording.started_at || recording.created_at || new Date();
+    const date = new Date(dateSource);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    const dd = String(date.getDate()).padStart(2, "0");
+
+    const fileToArchive = recording.mp4_filepath || recording.filepath;
+    const fileNameToArchive = recording.mp4_filename || recording.filename;
+
+    if (!fileToArchive || !fs.existsSync(fileToArchive)) {
+      throw new Error("Local file not found for archival");
+    }
+
+    const channelSlug = recording.stream_key || "unknown-channel";
+    const remotePath = `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
+
+    await uploadFileToBunnyStorage(fileToArchive, remotePath);
+
+    // Delete local files now that upload succeeded
+    const filesToRemove = [
+      recording.filepath,
+      recording.mp4_filepath,
+      recording.thumbnail_filepath,
+    ].filter(Boolean);
+
+    for (const filePath of filesToRemove) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    await pool.query(
+      `UPDATE recordings
+       SET archive_status = 'archived',
+           bunny_storage_path = $1,
+           bunny_archived_at = NOW()
+       WHERE id = $2`,
+      [remotePath, recording.id],
+    );
+
+    console.log(`[BUNNY] Archived recording #${recording.id} -> ${remotePath}`);
+  } catch (err) {
+    console.error(`[BUNNY] Failed to archive recording #${recording.id}:`, err.message);
+    await pool
+      .query(`UPDATE recordings SET archive_status = 'failed' WHERE id = $1`, [
+        recording.id,
+      ])
+      .catch(() => {});
+  }
+};
+
+const archiveReadyRecordingsForOrganization = async (organizationId) => {
+  if (!BUNNY_STORAGE_API_KEY) return; // Bunny not configured, skip silently
+
+  const result = await pool.query(
+    `SELECT * FROM recordings
+     WHERE organization_id = $1
+       AND archive_status = 'local'
+       AND (file_type = 'mp4' OR mp4_filename IS NOT NULL)
+       AND processing_status = 'ready'
+    `,
+    [organizationId],
+  );
+
+  for (const recording of result.rows) {
+    await archiveRecordingRow(recording);
+  }
+};
+
 async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
   setTimeout(async () => {
     try {
@@ -6793,6 +6926,10 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
       await scanRecordingFilesForOrganization(organizationId, {
         processReady: true,
       });
+
+      // Archive newly-ready recordings to Bunny Storage (if configured)
+      await archiveReadyRecordingsForOrganization(organizationId);
+
       // Notify dashboard via socket
       if (io)
         io.emit("recordings:updated", { organization_id: organizationId });
@@ -6845,7 +6982,8 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   try {
     let text;
 
-    const cached = manifestCache.get(streamKey);
+    const cacheKey = `${streamKey}${qs}`;
+    const cached = manifestCache.get(cacheKey);
 
     if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
@@ -6891,7 +7029,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         return res.status(502).send("Invalid HLS playlist received");
       }
 
-      manifestCache.set(streamKey, {
+      manifestCache.set(cacheKey, {
         text,
         cachedAt: Date.now(),
       });
@@ -7300,6 +7438,313 @@ app.delete(
 
 /*
 |--------------------------------------------------------------------------
+| SOCIAL DESTINATIONS (Facebook / YouTube simulcasting)
+|--------------------------------------------------------------------------
+*/
+const socialProcesses = new Map(); // destinationId -> ChildProcess
+
+const SOCIAL_PLATFORMS = {
+  facebook: {
+    label: "Facebook",
+    rtmpBase: "rtmps://live-api-s.facebook.com:443/rtmp",
+  },
+  youtube: {
+    label: "YouTube",
+    rtmpBase: "rtmp://a.rtmp.youtube.com/live2",
+  },
+};
+
+async function isSrsStreamLive(streamKey) {
+  try {
+    const res = await fetch("http://127.0.0.1:1985/api/v1/streams/", {
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await res.json();
+    const streams = data.streams || [];
+    return streams.some(
+      (s) => s.name === streamKey && s.publish && s.publish.active,
+    );
+  } catch (err) {
+    console.error("[SOCIAL] SRS stream check failed:", err.message);
+    return false;
+  }
+}
+
+async function getOwnedChannel(channelId, organizationId) {
+  const result = await pool.query(
+    `SELECT * FROM channels WHERE id = $1 AND organization_id = $2`,
+    [channelId, organizationId],
+  );
+  return result.rows[0] || null;
+}
+
+app.get(
+  "/api/channels/:channelId/social-destinations",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const result = await pool.query(
+        `SELECT * FROM social_destinations WHERE channel_id = $1 ORDER BY platform`,
+        [channel.id],
+      );
+
+      res.json({ ok: true, destinations: result.rows });
+    } catch (error) {
+      console.error("Get Social Destinations Error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to fetch social destinations" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/social-destinations",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const { platform, stream_key } = req.body;
+
+      if (!platform || !SOCIAL_PLATFORMS[platform]) {
+        return res.status(400).json({
+          ok: false,
+          message: "platform must be 'facebook' or 'youtube'",
+        });
+      }
+      if (!stream_key) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "stream_key is required" });
+      }
+
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const result = await pool.query(
+        `
+        INSERT INTO social_destinations (channel_id, platform, stream_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (channel_id, platform)
+        DO UPDATE SET stream_key = EXCLUDED.stream_key, updated_at = now()
+        RETURNING *
+        `,
+        [channel.id, platform, stream_key],
+      );
+
+      res.json({ ok: true, destination: result.rows[0] });
+    } catch (error) {
+      console.error("Save Social Destination Error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to save social destination" });
+    }
+  },
+);
+
+app.delete(
+  "/api/channels/:channelId/social-destinations/:id",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const existingProc = socialProcesses.get(Number(req.params.id));
+      if (existingProc) {
+        existingProc.kill("SIGTERM");
+        socialProcesses.delete(Number(req.params.id));
+      }
+
+      await pool.query(
+        `DELETE FROM social_destinations WHERE id = $1 AND channel_id = $2`,
+        [req.params.id, channel.id],
+      );
+
+      res.json({ ok: true, message: "Social destination removed" });
+    } catch (error) {
+      console.error("Delete Social Destination Error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to delete social destination" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/social-destinations/:id/start",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const destResult = await pool.query(
+        `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
+        [req.params.id, channel.id],
+      );
+      const destination = destResult.rows[0];
+      if (!destination) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Social destination not found" });
+      }
+
+      if (socialProcesses.has(destination.id)) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message: "Already simulcasting to this platform",
+          });
+      }
+
+      const live = await isSrsStreamLive(channel.stream_key);
+      if (!live) {
+        return res.status(400).json({
+          ok: false,
+          message: "Main stream is not live yet. Start streaming first.",
+        });
+      }
+
+      const platformConfig = SOCIAL_PLATFORMS[destination.platform];
+      const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
+      const sourceUrl = `rtmp://127.0.0.1/live/${channel.stream_key}`;
+
+      const proc = spawn("ffmpeg", [
+        "-i",
+        sourceUrl,
+        "-c",
+        "copy",
+        "-f",
+        "flv",
+        destinationUrl,
+      ]);
+
+      proc.stderr.on("data", (data) => {
+        console.log(
+          `[SOCIAL ${destination.platform} #${destination.id}]`,
+          data.toString().slice(0, 300),
+        );
+      });
+
+      proc.on("exit", (code) => {
+        console.log(
+          `[SOCIAL ${destination.platform} #${destination.id}] exited with code ${code}`,
+        );
+        socialProcesses.delete(destination.id);
+        pool
+          .query(
+            `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
+            [destination.id],
+          )
+          .catch((err) =>
+            console.error(
+              "[SOCIAL] Failed to update state on exit:",
+              err.message,
+            ),
+          );
+      });
+
+      socialProcesses.set(destination.id, proc);
+
+      await pool.query(
+        `UPDATE social_destinations SET is_running = true, ffmpeg_pid = $1, started_at = now() WHERE id = $2`,
+        [proc.pid, destination.id],
+      );
+
+      res.json({
+        ok: true,
+        message: `Simulcasting to ${platformConfig.label} started`,
+      });
+    } catch (error) {
+      console.error("Start Social Destination Error:", error);
+      res.status(500).json({ ok: false, message: "Failed to start simulcast" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/social-destinations/:id/stop",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const destId = Number(req.params.id);
+      const proc = socialProcesses.get(destId);
+
+      if (proc) {
+        proc.kill("SIGTERM");
+        socialProcesses.delete(destId);
+      }
+
+      await pool.query(
+        `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1 AND channel_id = $2`,
+        [destId, channel.id],
+      );
+
+      res.json({ ok: true, message: "Simulcast stopped" });
+    } catch (error) {
+      console.error("Stop Social Destination Error:", error);
+      res.status(500).json({ ok: false, message: "Failed to stop simulcast" });
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
 | RECORDINGS DATABASE + ARCHIVE LIBRARY + PROCESSING PIPELINE
 |--------------------------------------------------------------------------
 */
@@ -7342,6 +7787,10 @@ const formatRecordingThumbnailUrl = (streamKey, fileName) => {
 
 const formatRecordingPlaybackUrl = (streamKey, fileName) => {
   return `${API_PUBLIC_URL}/api/public/recordings/media?stream=${encodeURIComponent(streamKey)}&file=${encodeURIComponent(fileName)}`;
+};
+
+const formatBunnyRecordingUrl = (storagePath) => {
+  return `${BUNNY_RECORDINGS_CDN_URL.replace(/\/$/, "")}/${storagePath}`;
 };
 
 const getRecordingAbsolutePath = (streamKey, fileName) => {
@@ -7699,11 +8148,23 @@ const mapRecordingRowToDto = (row, channelName = null) => {
       )
         ? `${CLIENT_URL.replace(/\/$/, "")}/replay/${row.public_slug}`
         : null,
-    url: playable
-      ? formatRecordingPlaybackUrl(streamKey, mp4File)
-      : formatRecordingUrl(streamKey, file),
-    download_url: formatRecordingUrl(streamKey, playable ? mp4File : file),
-    source_download_url: formatRecordingUrl(streamKey, file),
+    archive_status: row.archive_status || "local",
+    bunny_storage_path: row.bunny_storage_path || null,
+    archived_at: row.bunny_archived_at || null,
+    url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : playable
+          ? formatRecordingPlaybackUrl(streamKey, mp4File)
+          : formatRecordingUrl(streamKey, file),
+    download_url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : formatRecordingUrl(streamKey, playable ? mp4File : file),
+    source_download_url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : formatRecordingUrl(streamKey, file),
   };
 };
 
@@ -7977,6 +8438,27 @@ const scanRecordingFilesForOrganization = async (
         mapRecordingRowToDto(refreshed.rows[0] || row, channel?.name),
       );
     }
+  }
+
+  // Include already-archived recordings too. Their local files were
+  // deleted after a successful Bunny upload, so they no longer show up
+  // in the filesystem scan above — pull them straight from the database
+  // instead so they don't disappear from the library.
+  const archivedResult = await pool.query(
+    `
+    SELECT r.*, c.name AS channel_name
+    FROM recordings r
+    LEFT JOIN channels c ON c.id = r.channel_id
+    WHERE r.organization_id = $1
+      AND r.archive_status = 'archived'
+    `,
+    [organizationId],
+  );
+
+  for (const archivedRow of archivedResult.rows) {
+    recordings.push(
+      mapRecordingRowToDto(archivedRow, archivedRow.channel_name),
+    );
   }
 
   recordings.sort((a, b) => new Date(b.created) - new Date(a.created));
@@ -8571,6 +9053,10 @@ app.delete(
 
       for (const filePath of filesToDelete) {
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
+
+      if (recording.archive_status === "archived" && recording.bunny_storage_path) {
+        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
       await pool.query(
@@ -10393,6 +10879,10 @@ app.delete(
 
       for (const deletePath of filesToDelete) {
         if (fs.existsSync(deletePath)) fs.unlinkSync(deletePath);
+      }
+
+      if (recording?.archive_status === "archived" && recording?.bunny_storage_path) {
+        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
       await pool.query(
