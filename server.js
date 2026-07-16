@@ -6656,12 +6656,19 @@ app.get(
       const data = await response.json();
 
       const allowedResult = await pool.query(
-        "SELECT stream_key FROM channels WHERE organization_id = $1",
+        "SELECT stream_key, live_started_at FROM channels WHERE organization_id = $1",
         [req.organization.id],
       );
 
       const allowedStreamKeys = new Set(
         allowedResult.rows.map((row) => String(row.stream_key)),
+      );
+
+      const liveStartedAtByKey = new Map(
+        allowedResult.rows.map((row) => [
+          String(row.stream_key),
+          row.live_started_at,
+        ]),
       );
 
       const filteredStreams = (data.streams || []).filter((stream) => {
@@ -6677,11 +6684,23 @@ app.get(
             req.organization.id,
           );
 
+          const liveStartedAt = liveStartedAtByKey.get(String(stream.name));
+          const uptimeSeconds =
+            stream.publish?.active && liveStartedAt
+              ? Math.max(
+                  0,
+                  Math.floor(
+                    (Date.now() - new Date(liveStartedAt).getTime()) / 1000,
+                  ),
+                )
+              : 0;
+
           return {
             ...stream,
             srs_clients: Number(stream.clients || 0),
             clients: viewerMetrics.active_viewers,
             viewerMetrics,
+            uptime_seconds: uptimeSeconds,
           };
         }),
       );
