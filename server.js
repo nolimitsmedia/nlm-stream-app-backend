@@ -95,6 +95,18 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Any CDN or proxy sitting in front of this API (e.g. a Bunny CDN pull
+// zone used as an SSL front door) must never cache these responses —
+// most of them are per-user/per-organization and caching one response
+// could leak it to a different logged-in user. This header tells any
+// CDN in the chain not to store or reuse responses.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store, private");
+  }
+  next();
+});
+
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
