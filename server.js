@@ -4995,7 +4995,7 @@ app.delete(
         WHERE id = $1
           AND organization_id = $2
         `,
-        [id],
+        [id, req.organization.id],
       );
 
       res.json({
@@ -6850,9 +6850,11 @@ const archiveRecordingRow = async (recording) => {
       `SELECT slug FROM organizations WHERE id = $1`,
       [recording.organization_id],
     );
-    const orgSlug = orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
+    const orgSlug =
+      orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
 
-    const dateSource = recording.started_at || recording.created_at || new Date();
+    const dateSource =
+      recording.started_at || recording.created_at || new Date();
     const date = new Date(dateSource);
     const yyyy = date.getFullYear();
     const mm = String(date.getMonth() + 1).padStart(2, "0");
@@ -6892,7 +6894,10 @@ const archiveRecordingRow = async (recording) => {
 
     console.log(`[BUNNY] Archived recording #${recording.id} -> ${remotePath}`);
   } catch (err) {
-    console.error(`[BUNNY] Failed to archive recording #${recording.id}:`, err.message);
+    console.error(
+      `[BUNNY] Failed to archive recording #${recording.id}:`,
+      err.message,
+    );
     await pool
       .query(`UPDATE recordings SET archive_status = 'failed' WHERE id = $1`, [
         recording.id,
@@ -7631,12 +7636,10 @@ app.post(
       }
 
       if (socialProcesses.has(destination.id)) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message: "Already simulcasting to this platform",
-          });
+        return res.status(400).json({
+          ok: false,
+          message: "Already simulcasting to this platform",
+        });
       }
 
       const live = await isSrsStreamLive(channel.stream_key);
@@ -9055,7 +9058,10 @@ app.delete(
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       }
 
-      if (recording.archive_status === "archived" && recording.bunny_storage_path) {
+      if (
+        recording.archive_status === "archived" &&
+        recording.bunny_storage_path
+      ) {
         await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
@@ -10881,7 +10887,10 @@ app.delete(
         if (fs.existsSync(deletePath)) fs.unlinkSync(deletePath);
       }
 
-      if (recording?.archive_status === "archived" && recording?.bunny_storage_path) {
+      if (
+        recording?.archive_status === "archived" &&
+        recording?.bunny_storage_path
+      ) {
         await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
