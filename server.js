@@ -39,6 +39,10 @@ const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
 const RECORDINGS_ROOT = process.env.RECORDINGS_ROOT || "C:/nlm-srs/recordings";
 const RECORDINGS_LIVE_ROOT = path.join(RECORDINGS_ROOT, "live");
+const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
+const BUNNY_STORAGE_HOSTNAME = process.env.BUNNY_STORAGE_HOSTNAME || "";
+const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
+const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
@@ -6786,6 +6790,139 @@ function autoTranscodeStream(streamKey) {
 }
 
 // ── Helper: auto-sync recordings after stream ends ────────────────
+// ══════════════════════════════════════════
+// BUNNY STORAGE ARCHIVAL
+// Uploads finished recordings to Bunny Storage, organized by
+// organization slug and date, then removes the local copy to
+// save server disk space.
+// ══════════════════════════════════════════
+const uploadFileToBunnyStorage = async (localFilePath, remotePath) => {
+  const stats = fs.statSync(localFilePath);
+  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: {
+      AccessKey: BUNNY_STORAGE_API_KEY,
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(stats.size),
+    },
+    body: fs.createReadStream(localFilePath),
+    duplex: "half",
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Bunny upload failed: ${response.status} ${text}`);
+  }
+
+  return true;
+};
+
+const deleteFileFromBunnyStorage = async (remotePath) => {
+  if (!remotePath || !BUNNY_STORAGE_API_KEY) return;
+
+  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: { AccessKey: BUNNY_STORAGE_API_KEY },
+    });
+
+    if (!response.ok && response.status !== 404) {
+      const text = await response.text().catch(() => "");
+      console.error(`[BUNNY] Delete failed: ${response.status} ${text}`);
+    }
+  } catch (err) {
+    console.error("[BUNNY] Delete request error:", err.message);
+  }
+};
+
+const archiveRecordingRow = async (recording) => {
+  try {
+    await pool.query(
+      `UPDATE recordings SET archive_status = 'archiving' WHERE id = $1`,
+      [recording.id],
+    );
+
+    const orgResult = await pool.query(
+      `SELECT slug FROM organizations WHERE id = $1`,
+      [recording.organization_id],
+    );
+    const orgSlug =
+      orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
+
+    const dateSource =
+      recording.started_at || recording.created_at || new Date();
+    const date = new Date(dateSource);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    const dd = String(date.getDate()).padStart(2, "0");
+
+    const fileToArchive = recording.mp4_filepath || recording.filepath;
+    const fileNameToArchive = recording.mp4_filename || recording.filename;
+
+    if (!fileToArchive || !fs.existsSync(fileToArchive)) {
+      throw new Error("Local file not found for archival");
+    }
+
+    const remotePath = `${orgSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
+
+    await uploadFileToBunnyStorage(fileToArchive, remotePath);
+
+    // Delete local files now that upload succeeded
+    const filesToRemove = [
+      recording.filepath,
+      recording.mp4_filepath,
+      recording.thumbnail_filepath,
+    ].filter(Boolean);
+
+    for (const filePath of filesToRemove) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    await pool.query(
+      `UPDATE recordings
+       SET archive_status = 'archived',
+           bunny_storage_path = $1,
+           bunny_archived_at = NOW()
+       WHERE id = $2`,
+      [remotePath, recording.id],
+    );
+
+    console.log(`[BUNNY] Archived recording #${recording.id} -> ${remotePath}`);
+  } catch (err) {
+    console.error(
+      `[BUNNY] Failed to archive recording #${recording.id}:`,
+      err.message,
+    );
+    await pool
+      .query(`UPDATE recordings SET archive_status = 'failed' WHERE id = $1`, [
+        recording.id,
+      ])
+      .catch(() => {});
+  }
+};
+
+const archiveReadyRecordingsForOrganization = async (organizationId) => {
+  if (!BUNNY_STORAGE_API_KEY) return; // Bunny not configured, skip silently
+
+  const result = await pool.query(
+    `SELECT * FROM recordings
+     WHERE organization_id = $1
+       AND archive_status = 'local'
+       AND (file_type = 'mp4' OR mp4_filename IS NOT NULL)
+       AND processing_status = 'ready'
+    `,
+    [organizationId],
+  );
+
+  for (const recording of result.rows) {
+    await archiveRecordingRow(recording);
+  }
+};
+
 async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
   setTimeout(async () => {
     try {
@@ -6793,6 +6930,10 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
       await scanRecordingFilesForOrganization(organizationId, {
         processReady: true,
       });
+
+      // Archive newly-ready recordings to Bunny Storage (if configured)
+      await archiveReadyRecordingsForOrganization(organizationId);
+
       // Notify dashboard via socket
       if (io)
         io.emit("recordings:updated", { organization_id: organizationId });
@@ -7494,12 +7635,10 @@ app.post(
       }
 
       if (socialProcesses.has(destination.id)) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message: "Already simulcasting to this platform",
-          });
+        return res.status(400).json({
+          ok: false,
+          message: "Already simulcasting to this platform",
+        });
       }
 
       const live = await isSrsStreamLive(channel.stream_key);
@@ -7650,6 +7789,10 @@ const formatRecordingThumbnailUrl = (streamKey, fileName) => {
 
 const formatRecordingPlaybackUrl = (streamKey, fileName) => {
   return `${API_PUBLIC_URL}/api/public/recordings/media?stream=${encodeURIComponent(streamKey)}&file=${encodeURIComponent(fileName)}`;
+};
+
+const formatBunnyRecordingUrl = (storagePath) => {
+  return `${BUNNY_RECORDINGS_CDN_URL.replace(/\/$/, "")}/${storagePath}`;
 };
 
 const getRecordingAbsolutePath = (streamKey, fileName) => {
@@ -8007,11 +8150,23 @@ const mapRecordingRowToDto = (row, channelName = null) => {
       )
         ? `${CLIENT_URL.replace(/\/$/, "")}/replay/${row.public_slug}`
         : null,
-    url: playable
-      ? formatRecordingPlaybackUrl(streamKey, mp4File)
-      : formatRecordingUrl(streamKey, file),
-    download_url: formatRecordingUrl(streamKey, playable ? mp4File : file),
-    source_download_url: formatRecordingUrl(streamKey, file),
+    archive_status: row.archive_status || "local",
+    bunny_storage_path: row.bunny_storage_path || null,
+    archived_at: row.bunny_archived_at || null,
+    url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : playable
+          ? formatRecordingPlaybackUrl(streamKey, mp4File)
+          : formatRecordingUrl(streamKey, file),
+    download_url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : formatRecordingUrl(streamKey, playable ? mp4File : file),
+    source_download_url:
+      row.archive_status === "archived" && row.bunny_storage_path
+        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        : formatRecordingUrl(streamKey, file),
   };
 };
 
@@ -8879,6 +9034,13 @@ app.delete(
 
       for (const filePath of filesToDelete) {
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
+
+      if (
+        recording.archive_status === "archived" &&
+        recording.bunny_storage_path
+      ) {
+        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
       await pool.query(
@@ -10701,6 +10863,13 @@ app.delete(
 
       for (const deletePath of filesToDelete) {
         if (fs.existsSync(deletePath)) fs.unlinkSync(deletePath);
+      }
+
+      if (
+        recording?.archive_status === "archived" &&
+        recording?.bunny_storage_path
+      ) {
+        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
       }
 
       await pool.query(
