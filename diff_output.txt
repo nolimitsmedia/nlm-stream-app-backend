@@ -1,0 +1,81 @@
+﻿commit 3c68c46ceec137763b90b59175a90d95348e9ac3
+Author: Robin <websupport@nolimitsmedia.com>
+Date:   Tue Jul 14 16:14:01 2026 -0400
+
+    Fix HLS manifest cache key to include query string (hls_ctx collision bug)
+
+diff --git a/nginx-nlm-streaming.conf b/nginx-nlm-streaming.conf
+index b5b5da8..3999ce7 100644
+--- a/nginx-nlm-streaming.conf
++++ b/nginx-nlm-streaming.conf
+@@ -1,28 +1,22 @@
+-# NGINX example for NLM Streaming Manager
+-# Replace domains and paths before using.
+-
+ server {
+     listen 80;
+-    server_name stream.yourdomain.com api.yourdomain.com;
+-    return 301 https://$host$request_uri;
+-}
+-
+-server {
+-    listen 443 ssl http2;
+-    server_name stream.yourdomain.com;
+-
+-    ssl_certificate /etc/letsencrypt/live/stream.yourdomain.com/fullchain.pem;
+-    ssl_certificate_key /etc/letsencrypt/live/stream.yourdomain.com/privkey.pem;
++    server_name _;
+ 
+-    root /var/www/nlm-streaming/client/dist;
+-    index index.html;
+-
+-    # React Router support
++    # Node/Express API
+     location / {
+-        try_files $uri /index.html;
++        proxy_pass http://127.0.0.1:5000;
++        proxy_http_version 1.1;
++        proxy_set_header Host $host;
++        proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++        proxy_set_header X-Forwarded-Proto $scheme;
++
++        # Socket.IO/WebSocket support
++        proxy_set_header Upgrade $http_upgrade;
++        proxy_set_header Connection "upgrade";
+     }
+ 
+-    # HLS proxy from SRS
++    # HLS proxy from SRS (once SRS container is running)
+     location /hls/ {
+         proxy_pass http://127.0.0.1:8080/live/;
+         proxy_http_version 1.1;
+@@ -34,26 +28,4 @@ server {
+             video/mp2t ts;
+         }
+     }
+-}
+-
+-server {
+-    listen 443 ssl http2;
+-    server_name api.yourdomain.com;
+-
+-    ssl_certificate /etc/letsencrypt/live/api.yourdomain.com/fullchain.pem;
+-    ssl_certificate_key /etc/letsencrypt/live/api.yourdomain.com/privkey.pem;
+-
+-    location / {
+-        proxy_pass http://127.0.0.1:5000;
+-        proxy_http_version 1.1;
+-
+-        proxy_set_header Host $host;
+-        proxy_set_header X-Real-IP $remote_addr;
+-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+-        proxy_set_header X-Forwarded-Proto $scheme;
+-
+-        # Socket.IO/WebSocket support
+-        proxy_set_header Upgrade $http_upgrade;
+-        proxy_set_header Connection "upgrade";
+-    }
+-}
++}
+\ No newline at end of file
