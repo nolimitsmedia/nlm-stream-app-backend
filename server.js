@@ -7781,6 +7781,57 @@ app.delete(
   },
 );
 
+// ══════════════════════════════════════════
+// SUPPORT TOOL — clear a stuck "live" flag
+// If SRS crashes or the on_unpublish webhook never fires (e.g. the
+// server restarted mid-stream), a channel's is_live/live_started_at
+// can stay stuck "on" in the database even though nothing is actually
+// streaming. super_admin only — this is a recovery action, not a
+// routine client one.
+// ══════════════════════════════════════════
+app.post(
+  "/api/channels/:id/force-offline",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const result = await pool.query(
+        `
+        UPDATE channels
+        SET is_live = FALSE,
+            live_started_at = NULL
+        WHERE id = $1
+        RETURNING id, name, stream_key
+        `,
+        [id],
+      );
+
+      if (!result.rows[0]) {
+        return res.status(404).json({
+          ok: false,
+          message: "Channel not found",
+        });
+      }
+
+      res.json({
+        ok: true,
+        message: `Cleared stuck live status for ${result.rows[0].name}`,
+        channel: result.rows[0],
+      });
+    } catch (error) {
+      console.error("Force channel offline error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to clear live status",
+        error: error.message,
+      });
+    }
+  },
+);
+
 /*
 |--------------------------------------------------------------------------
 | SOCIAL DESTINATIONS (Facebook / YouTube simulcasting)
@@ -9353,6 +9404,65 @@ app.put(
       res.status(500).json({
         ok: false,
         message: "Failed to update replay metadata",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// SUPPORT TOOL — retry a failed Bunny archive
+// If the Bunny upload failed (network blip, disk issue, etc.), the
+// recording is stuck with archive_status = 'failed' and its local
+// file was never cleaned up. This lets a super_admin re-attempt the
+// archive without needing shell access to the server.
+// ══════════════════════════════════════════
+app.post(
+  "/api/recordings/:id/retry-archive",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const result = await pool.query(
+        `SELECT * FROM recordings WHERE id = $1`,
+        [id],
+      );
+      const recording = result.rows[0];
+
+      if (!recording) {
+        return res.status(404).json({
+          ok: false,
+          message: "Recording not found",
+        });
+      }
+
+      if (!BUNNY_STORAGE_API_KEY) {
+        return res.status(501).json({
+          ok: false,
+          message: "Bunny Storage is not configured on this server",
+        });
+      }
+
+      await archiveRecordingRow(recording);
+
+      const refreshed = await pool.query(
+        `SELECT archive_status, bunny_storage_path FROM recordings WHERE id = $1`,
+        [id],
+      );
+
+      res.json({
+        ok: true,
+        message: "Archive retry attempted",
+        archive_status: refreshed.rows[0]?.archive_status,
+        bunny_storage_path: refreshed.rows[0]?.bunny_storage_path,
+      });
+    } catch (error) {
+      console.error("Retry archive error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to retry archive",
         error: error.message,
       });
     }
