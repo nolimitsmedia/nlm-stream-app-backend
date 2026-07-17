@@ -6,6 +6,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { exec, spawn, execSync } = require("child_process");
 const os = require("os");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const fs = require("fs");
@@ -711,6 +712,31 @@ const slugifyOrganization = (value) => {
     .replace(/^-+|-+$/g, "");
 
   return base || "organization";
+};
+
+// Generates a random, guaranteed-unique stream key based on a human
+// readable base (org name or channel name), so clients never have to
+// pick one themselves or risk a collision with another tenant's key.
+const generateUniqueStreamKey = async (baseText) => {
+  const base = slugifyOrganization(baseText);
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const suffix = crypto.randomBytes(3).toString("hex"); // 6 hex chars
+    const candidate = `${base}-${suffix}`;
+
+    const existing = await pool.query(
+      `SELECT id FROM channels WHERE stream_key = $1 LIMIT 1`,
+      [candidate],
+    );
+
+    if (!existing.rows[0]) {
+      return candidate;
+    }
+  }
+
+  // Astronomically unlikely to be reached, but fall back to a longer
+  // random suffix rather than ever returning a colliding key.
+  return `${base}-${crypto.randomBytes(6).toString("hex")}`;
 };
 
 const slugifyRecording = (value) => {
@@ -2240,21 +2266,7 @@ app.post("/api/public/signup", async (req, res) => {
     }
 
     const slugPreview = slugifyOrganization(organizationName);
-    const requestedStreamKey = cleanOrgText(req.body.stream_key, 255);
-    const streamKey = requestedStreamKey || `${slugPreview}-main`;
-
-    const existingChannel = await pool.query(
-      `SELECT id FROM channels WHERE stream_key = $1 LIMIT 1`,
-      [streamKey],
-    );
-
-    if (existingChannel.rows[0]) {
-      return res.status(409).json({
-        ok: false,
-        message:
-          "This stream key is already in use. Please choose another stream key.",
-      });
-    }
+    const streamKey = await generateUniqueStreamKey(organizationName);
 
     const passwordHash = await bcrypt.hash(clientPassword, 10);
 
@@ -2950,17 +2962,16 @@ app.post(
         : "operator";
 
       const channelName = cleanOrgText(req.body.channel_name, 255);
-      const streamKey = cleanOrgText(req.body.stream_key, 255);
       const channelDescription = cleanOrgText(
         req.body.channel_description,
         1000,
       );
 
-      if (!organizationName || !clientName || !clientEmail || !streamKey) {
+      if (!organizationName || !clientName || !clientEmail) {
         return res.status(400).json({
           ok: false,
           message:
-            "Organization name, client name, client email, and stream key are required",
+            "Organization name, client name, and client email are required",
         });
       }
 
@@ -3105,6 +3116,10 @@ app.post(
         RETURNING *
         `,
         [organization.id, req.admin.id],
+      );
+
+      const streamKey = await generateUniqueStreamKey(
+        channelName || organizationName,
       );
 
       const channelResult = await client.query(
@@ -8057,14 +8072,16 @@ app.post(
   enforceChannelLimit,
   async (req, res) => {
     try {
-      const { name, stream_key, description } = req.body;
+      const { name, description } = req.body;
 
-      if (!name || !stream_key) {
+      if (!name) {
         return res.status(400).json({
           ok: false,
-          message: "Name and stream_key are required",
+          message: "Channel name is required",
         });
       }
+
+      const streamKey = await generateUniqueStreamKey(name);
 
       const result = await pool.query(
         `
@@ -8077,7 +8094,7 @@ app.post(
         VALUES ($1, $2, $3, $4)
         RETURNING *
         `,
-        [req.organization.id, name, stream_key, description || null],
+        [req.organization.id, name, streamKey, description || null],
       );
 
       res.json({
