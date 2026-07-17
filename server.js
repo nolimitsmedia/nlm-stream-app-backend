@@ -946,6 +946,30 @@ const resolveOrganizationForRequest = async (req, res, next) => {
       return next();
     }
 
+    // super_admin can step into any organization's view for support
+    // purposes — they aren't a real member of every client org, so the
+    // membership join below would otherwise 403 them out of every
+    // per-org page (Channels, Recordings, Live Monitor, etc.).
+    if (req.admin?.role === "super_admin") {
+      const orgResult = await pool.query(
+        `SELECT o.*, 'owner' AS membership_role
+         FROM organizations o
+         WHERE o.id = $1 AND o.is_active = TRUE
+         LIMIT 1`,
+        [requestedId],
+      );
+
+      if (!orgResult.rows[0]) {
+        return res.status(404).json({
+          ok: false,
+          message: "Organization not found",
+        });
+      }
+
+      req.organization = orgResult.rows[0];
+      return next();
+    }
+
     const result = await pool.query(
       `
       SELECT o.*, ou.role AS membership_role
