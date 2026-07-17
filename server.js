@@ -23,7 +23,13 @@ try {
   UAParser = null;
 }
 
+const { AsyncLocalStorage } = require("async_hooks");
 const pool = require("./db");
+
+// Tracks which organization (if any) the current request is scoped to,
+// so errors logged deep inside async route handlers can still be tagged
+// with the right organization_id for support-mode filtering.
+const requestContext = new AsyncLocalStorage();
 
 const app = express();
 const server = http.createServer(app);
@@ -72,7 +78,14 @@ console.error = (...args) => {
       .join(" ")
       .slice(0, 2000);
 
-    recentErrorLog.push({ message, at: new Date().toISOString() });
+    const store = requestContext.getStore();
+
+    recentErrorLog.push({
+      message,
+      at: new Date().toISOString(),
+      organization_id: store?.organization_id ?? null,
+      organization_name: store?.organization_name ?? null,
+    });
     if (recentErrorLog.length > RECENT_ERROR_LOG_LIMIT) {
       recentErrorLog.shift();
     }
@@ -943,7 +956,13 @@ const resolveOrganizationForRequest = async (req, res, next) => {
     if (!requestedId) {
       const defaultOrg = await getDefaultOrganization();
       req.organization = defaultOrg || null;
-      return next();
+      return requestContext.run(
+        {
+          organization_id: req.organization?.id ?? null,
+          organization_name: req.organization?.name ?? null,
+        },
+        next,
+      );
     }
 
     // super_admin can step into any organization's view for support
@@ -967,7 +986,13 @@ const resolveOrganizationForRequest = async (req, res, next) => {
       }
 
       req.organization = orgResult.rows[0];
-      return next();
+      return requestContext.run(
+        {
+          organization_id: req.organization?.id ?? null,
+          organization_name: req.organization?.name ?? null,
+        },
+        next,
+      );
     }
 
     const result = await pool.query(
@@ -991,7 +1016,13 @@ const resolveOrganizationForRequest = async (req, res, next) => {
     }
 
     req.organization = result.rows[0];
-    next();
+    requestContext.run(
+      {
+        organization_id: req.organization?.id ?? null,
+        organization_name: req.organization?.name ?? null,
+      },
+      next,
+    );
   } catch (error) {
     console.error("Resolve organization error:", error);
     res.status(500).json({
@@ -3213,9 +3244,18 @@ app.get(
   authenticateAdmin,
   requireRole("super_admin"),
   (req, res) => {
+    const filterOrgId = req.query.organization_id
+      ? String(req.query.organization_id)
+      : null;
+
+    const filtered = filterOrgId
+      ? recentErrorLog.filter((e) => String(e.organization_id) === filterOrgId)
+      : recentErrorLog;
+
     res.json({
       ok: true,
-      errors: [...recentErrorLog].reverse(),
+      errors: [...filtered].reverse(),
+      total_unfiltered: recentErrorLog.length,
     });
   },
 );
