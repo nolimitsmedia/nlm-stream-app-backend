@@ -1,6 +1,7 @@
 // server/server.js
 
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -119,6 +120,45 @@ app.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store, private");
   }
   next();
+});
+
+// ══════════════════════════════════════════
+// RATE LIMITING — protects the endpoints most exposed to abuse.
+// Keyed by IP by default (express-rate-limit's default), which is
+// fine here since these all sit behind Bunny/nginx and the real
+// client IP is what matters for throttling abuse.
+// ══════════════════════════════════════════
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: {
+    ok: false,
+    message: "Too many login attempts. Please try again in a few minutes.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: {
+    ok: false,
+    message: "Too many signup attempts. Please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const publicEngagementLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,
+  message: {
+    ok: false,
+    message: "Too many requests. Please slow down.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 app.post(
@@ -307,7 +347,7 @@ app.post(
   },
 );
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -2198,7 +2238,7 @@ app.put(
   },
 );
 
-app.post("/api/public/signup", async (req, res) => {
+app.post("/api/public/signup", signupLimiter, async (req, res) => {
   try {
     const planKey = cleanOrgText(req.body.plan_key || "starter", 80);
     const organizationName = cleanOrgText(req.body.organization_name, 255);
@@ -7172,53 +7212,57 @@ app.get("/api/public/reactions/:streamKey", async (req, res) => {
   }
 });
 
-app.post("/api/public/reactions/:streamKey", async (req, res) => {
-  try {
-    const { streamKey } = req.params;
-    const reactionType = normalizeReactionType(req.body.reaction_type);
+app.post(
+  "/api/public/reactions/:streamKey",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const { streamKey } = req.params;
+      const reactionType = normalizeReactionType(req.body.reaction_type);
 
-    if (!reactionType) {
-      return res.status(400).json({
-        ok: false,
-        message: "Invalid reaction type",
-      });
-    }
+      if (!reactionType) {
+        return res.status(400).json({
+          ok: false,
+          message: "Invalid reaction type",
+        });
+      }
 
-    const organizationId = await getOrganizationIdForStreamKey(streamKey);
+      const organizationId = await getOrganizationIdForStreamKey(streamKey);
 
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       INSERT INTO viewer_reactions (organization_id, stream_key, reaction_type)
       VALUES ($1, $2, $3)
       RETURNING id, organization_id, stream_key, reaction_type, created_at
       `,
-      [organizationId, streamKey, reactionType],
-    );
+        [organizationId, streamKey, reactionType],
+      );
 
-    const summary = await getReactionSummary(streamKey, organizationId);
+      const summary = await getReactionSummary(streamKey, organizationId);
 
-    io.to(`reactions:${streamKey}`).emit("reaction:new", {
-      reaction: result.rows[0],
-      summary,
-    });
+      io.to(`reactions:${streamKey}`).emit("reaction:new", {
+        reaction: result.rows[0],
+        summary,
+      });
 
-    io.to("admins:reactions").emit("reaction:summary", summary);
+      io.to("admins:reactions").emit("reaction:summary", summary);
 
-    res.json({
-      ok: true,
-      reaction: result.rows[0],
-      summary,
-    });
-  } catch (error) {
-    console.error("Create public reaction error:", error);
+      res.json({
+        ok: true,
+        reaction: result.rows[0],
+        summary,
+      });
+    } catch (error) {
+      console.error("Create public reaction error:", error);
 
-    res.status(500).json({
-      ok: false,
-      message: "Failed to send reaction",
-      error: error.message,
-    });
-  }
-});
+      res.status(500).json({
+        ok: false,
+        message: "Failed to send reaction",
+        error: error.message,
+      });
+    }
+  },
+);
 
 app.get(
   "/api/reactions/streams",
@@ -12433,6 +12477,17 @@ io.on("connection", (socket) => {
 
   socket.on("chat:send", async (payload = {}) => {
     try {
+      // Simple per-socket throttle — one message per 1.5 seconds.
+      // Prevents a single connection from flooding a stream's chat.
+      const now = Date.now();
+      if (socket._lastChatSentAt && now - socket._lastChatSentAt < 1500) {
+        socket.emit("chat:error", {
+          message: "You're sending messages too quickly. Please slow down.",
+        });
+        return;
+      }
+      socket._lastChatSentAt = now;
+
       const streamKey = cleanChatText(payload.streamKey, 255);
       const displayName = cleanChatText(payload.displayName || "Guest", 120);
       const message = cleanChatText(payload.message, 500);
