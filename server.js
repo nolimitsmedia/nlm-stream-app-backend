@@ -1293,6 +1293,55 @@ const ensurePendingSignupsTable = async () => {
   `);
 };
 
+// Known feature flags and their defaults. Any flag not yet in the DB
+// falls back to this default, so existing hardcoded behavior is
+// preserved until a super_admin explicitly changes it.
+const FEATURE_FLAG_DEFAULTS = {
+  members_page: {
+    enabled: false,
+    description: "Show the Members page in the sidebar nav.",
+  },
+  public_replay_features: {
+    enabled: false,
+    description:
+      "Public replay watch page, library access, and Publish/Unpublish/Edit Metadata on recordings.",
+  },
+};
+
+const ensureFeatureFlagsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feature_flags (
+      key VARCHAR(80) PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      description TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+};
+
+const ensureNotificationPreferencesTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notification_preferences (
+      admin_id INTEGER PRIMARY KEY REFERENCES admins(id) ON DELETE CASCADE,
+      stream_live BOOLEAN NOT NULL DEFAULT TRUE,
+      chat_needs_moderation BOOLEAN NOT NULL DEFAULT FALSE,
+      recording_processed BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+};
+
+const getFeatureFlags = async () => {
+  const result = await pool.query(`SELECT key, enabled FROM feature_flags`);
+  const stored = new Map(result.rows.map((r) => [r.key, r.enabled]));
+
+  const flags = {};
+  for (const [key, def] of Object.entries(FEATURE_FLAG_DEFAULTS)) {
+    flags[key] = stored.has(key) ? stored.get(key) : def.enabled;
+  }
+  return flags;
+};
+
 const completePendingSignupFromCheckoutSession = async (
   session,
   stripeSubscription,
@@ -2655,16 +2704,25 @@ app.put(
   },
 );
 
-app.get(
-  "/api/organizations/:id/users",
-  authenticateAdmin,
-  requireRole("super_admin", "admin"),
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+app.get("/api/organizations/:id/users", authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      const result = await pool.query(
-        `
+    if (req.admin.role !== "super_admin") {
+      const callerMembership = await pool.query(
+        `SELECT role FROM organization_users WHERE organization_id = $1 AND admin_id = $2`,
+        [id, req.admin.id],
+      );
+      if (!callerMembership.rows[0]) {
+        return res.status(403).json({
+          ok: false,
+          message: "You do not have access to this organization's team",
+        });
+      }
+    }
+
+    const result = await pool.query(
+      `
         SELECT
           ou.id,
           ou.organization_id,
@@ -2679,33 +2737,32 @@ app.get(
         WHERE ou.organization_id = $1
         ORDER BY ou.created_at DESC
         `,
-        [id],
-      );
+      [id],
+    );
 
-      res.json({
-        ok: true,
-        users: result.rows,
-      });
-    } catch (error) {
-      console.error("Get organization users error:", error);
+    res.json({
+      ok: true,
+      users: result.rows,
+    });
+  } catch (error) {
+    console.error("Get organization users error:", error);
 
-      res.status(500).json({
-        ok: false,
-        message: "Failed to fetch organization users",
-        error: error.message,
-      });
-    }
-  },
-);
+    res.status(500).json({
+      ok: false,
+      message: "Failed to fetch organization users",
+      error: error.message,
+    });
+  }
+});
 
 app.post(
   "/api/organizations/:id/users",
   authenticateAdmin,
-  requireRole("super_admin"),
   async (req, res) => {
     try {
       const { id } = req.params;
       const email = cleanOrgText(req.body.email, 255).toLowerCase();
+      const name = cleanOrgText(req.body.name, 150);
       const role = ["owner", "admin", "operator", "viewer"].includes(
         req.body.role,
       )
@@ -2719,21 +2776,43 @@ app.post(
         });
       }
 
-      const adminResult = await pool.query(
-        `
-        SELECT id
-        FROM admins
-        WHERE email = $1
-        LIMIT 1
-        `,
+      // Only super_admin, or an owner/admin OF THIS SPECIFIC organization,
+      // may invite teammates into it.
+      if (req.admin.role !== "super_admin") {
+        const callerMembership = await pool.query(
+          `SELECT role FROM organization_users WHERE organization_id = $1 AND admin_id = $2`,
+          [id, req.admin.id],
+        );
+        if (!["owner", "admin"].includes(callerMembership.rows[0]?.role)) {
+          return res.status(403).json({
+            ok: false,
+            message: "You do not have permission to manage this team",
+          });
+        }
+      }
+
+      let adminResult = await pool.query(
+        `SELECT id FROM admins WHERE email = $1 LIMIT 1`,
         [email],
       );
 
+      let tempPassword = null;
+
       if (!adminResult.rows[0]) {
-        return res.status(404).json({
-          ok: false,
-          message: "Admin account with this email was not found",
-        });
+        // No account exists yet for this email — create one, since
+        // there's no email-invite flow. Temp password is returned once
+        // so the inviter can share it directly with their teammate.
+        tempPassword = Math.random().toString(36).slice(-10);
+        const passwordHash = await bcrypt.hash(tempPassword, 10);
+
+        adminResult = await pool.query(
+          `
+          INSERT INTO admins (name, email, password_hash, role)
+          VALUES ($1, $2, $3, 'admin')
+          RETURNING id
+          `,
+          [name || email.split("@")[0], email, passwordHash],
+        );
       }
 
       const result = await pool.query(
@@ -2750,6 +2829,7 @@ app.post(
       res.json({
         ok: true,
         membership: result.rows[0],
+        temp_password: tempPassword,
       });
     } catch (error) {
       console.error("Add organization user error:", error);
@@ -2766,10 +2846,29 @@ app.post(
 app.delete(
   "/api/organizations/:organizationId/users/:adminId",
   authenticateAdmin,
-  requireRole("super_admin"),
   async (req, res) => {
     try {
       const { organizationId, adminId } = req.params;
+
+      if (String(adminId) === String(req.admin.id)) {
+        return res.status(400).json({
+          ok: false,
+          message: "You cannot remove yourself from the team",
+        });
+      }
+
+      if (req.admin.role !== "super_admin") {
+        const callerMembership = await pool.query(
+          `SELECT role FROM organization_users WHERE organization_id = $1 AND admin_id = $2`,
+          [organizationId, req.admin.id],
+        );
+        if (!["owner", "admin"].includes(callerMembership.rows[0]?.role)) {
+          return res.status(403).json({
+            ok: false,
+            message: "You do not have permission to manage this team",
+          });
+        }
+      }
 
       await pool.query(
         `
@@ -3319,6 +3418,184 @@ app.get(
   },
 );
 
+// ══════════════════════════════════════════
+// FEATURE FLAGS
+// Read: any authenticated user, since the app's own UI needs to know
+// current flag states to decide what to render.
+// Write: super_admin only.
+// ══════════════════════════════════════════
+app.get("/api/feature-flags", authenticateAdmin, async (req, res) => {
+  try {
+    const flags = await getFeatureFlags();
+    res.json({ ok: true, flags });
+  } catch (error) {
+    console.error("Get feature flags error:", error);
+    res.status(500).json({
+      ok: false,
+      message: "Failed to load feature flags",
+      error: error.message,
+    });
+  }
+});
+
+app.get(
+  "/api/admin/feature-flags",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const flags = await getFeatureFlags();
+      const withMeta = Object.entries(FEATURE_FLAG_DEFAULTS).map(
+        ([key, def]) => ({
+          key,
+          enabled: flags[key],
+          description: def.description,
+        }),
+      );
+      res.json({ ok: true, flags: withMeta });
+    } catch (error) {
+      console.error("Get admin feature flags error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load feature flags",
+        error: error.message,
+      });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/feature-flags/:key",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const { key } = req.params;
+      const enabled = Boolean(req.body.enabled);
+
+      if (!FEATURE_FLAG_DEFAULTS[key]) {
+        return res.status(404).json({
+          ok: false,
+          message: "Unknown feature flag",
+        });
+      }
+
+      await pool.query(
+        `
+        INSERT INTO feature_flags (key, enabled, description)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (key) DO UPDATE
+        SET enabled = EXCLUDED.enabled, updated_at = NOW()
+        `,
+        [key, enabled, FEATURE_FLAG_DEFAULTS[key].description],
+      );
+
+      res.json({ ok: true, key, enabled });
+    } catch (error) {
+      console.error("Update feature flag error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update feature flag",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// INTEGRATION HEALTH — live checks, not just static config display
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/integration-health",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    const results = {};
+
+    // SRS
+    try {
+      const started = Date.now();
+      const srsRes = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      results.srs = {
+        ok: srsRes.ok,
+        status: srsRes.ok ? "Online" : `HTTP ${srsRes.status}`,
+        latency_ms: Date.now() - started,
+      };
+    } catch (err) {
+      results.srs = { ok: false, status: err.message, latency_ms: null };
+    }
+
+    // Bunny Storage
+    if (!BUNNY_STORAGE_API_KEY || !BUNNY_STORAGE_HOSTNAME) {
+      results.bunny = { ok: false, status: "Not configured", latency_ms: null };
+    } else {
+      try {
+        const started = Date.now();
+        const bunnyRes = await fetch(
+          `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/`,
+          {
+            method: "GET",
+            headers: { AccessKey: BUNNY_STORAGE_API_KEY },
+            signal: AbortSignal.timeout(5000),
+          },
+        );
+        // Bunny returns 200/401/404 depending on zone contents — any
+        // response (not a network failure) means the credentials and
+        // hostname are at least reachable.
+        results.bunny = {
+          ok: bunnyRes.status !== 401 && bunnyRes.status !== 403,
+          status:
+            bunnyRes.status === 401 || bunnyRes.status === 403
+              ? "Auth failed — check API key"
+              : "Online",
+          latency_ms: Date.now() - started,
+        };
+      } catch (err) {
+        results.bunny = { ok: false, status: err.message, latency_ms: null };
+      }
+    }
+
+    // Stripe
+    if (!stripe) {
+      results.stripe = {
+        ok: false,
+        status: "Not configured",
+        latency_ms: null,
+      };
+    } else {
+      try {
+        const started = Date.now();
+        await stripe.balance.retrieve();
+        results.stripe = {
+          ok: true,
+          status: "Online",
+          latency_ms: Date.now() - started,
+        };
+      } catch (err) {
+        results.stripe = { ok: false, status: err.message, latency_ms: null };
+      }
+    }
+
+    // Database (if we got this far, pool is working, but confirm with a
+    // trivial query so this stays consistent with the others)
+    try {
+      const started = Date.now();
+      await pool.query("SELECT 1");
+      results.database = {
+        ok: true,
+        status: "Online",
+        latency_ms: Date.now() - started,
+      };
+    } catch (err) {
+      results.database = { ok: false, status: err.message, latency_ms: null };
+    }
+
+    res.json({ ok: true, integrations: results });
+  },
+);
+
 app.get(
   "/api/admins",
   authenticateAdmin,
@@ -3475,6 +3752,78 @@ app.put("/api/admins/me/profile", authenticateAdmin, async (req, res) => {
     });
   }
 });
+
+// ══════════════════════════════════════════
+// NOTIFICATION PREFERENCES
+// Self-scoped — every admin manages their own. NOTE: this stores the
+// preference only. There is no email-sending integration wired up yet
+// (no SMTP/SendGrid/etc. configured on this server), so toggling these
+// on does not currently trigger any emails — it just records intent
+// for when that integration is added.
+// ══════════════════════════════════════════
+app.get(
+  "/api/admins/me/notification-preferences",
+  authenticateAdmin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT * FROM notification_preferences WHERE admin_id = $1`,
+        [req.admin.id],
+      );
+
+      const prefs = result.rows[0] || {
+        stream_live: true,
+        chat_needs_moderation: false,
+        recording_processed: false,
+      };
+
+      res.json({ ok: true, preferences: prefs });
+    } catch (error) {
+      console.error("Get notification preferences error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load notification preferences",
+        error: error.message,
+      });
+    }
+  },
+);
+
+app.put(
+  "/api/admins/me/notification-preferences",
+  authenticateAdmin,
+  async (req, res) => {
+    try {
+      const streamLive = Boolean(req.body.stream_live);
+      const chatNeedsModeration = Boolean(req.body.chat_needs_moderation);
+      const recordingProcessed = Boolean(req.body.recording_processed);
+
+      const result = await pool.query(
+        `
+        INSERT INTO notification_preferences
+          (admin_id, stream_live, chat_needs_moderation, recording_processed)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (admin_id) DO UPDATE
+        SET stream_live = EXCLUDED.stream_live,
+            chat_needs_moderation = EXCLUDED.chat_needs_moderation,
+            recording_processed = EXCLUDED.recording_processed,
+            updated_at = NOW()
+        RETURNING *
+        `,
+        [req.admin.id, streamLive, chatNeedsModeration, recordingProcessed],
+      );
+
+      res.json({ ok: true, preferences: result.rows[0] });
+    } catch (error) {
+      console.error("Update notification preferences error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update notification preferences",
+        error: error.message,
+      });
+    }
+  },
+);
 
 app.put(
   "/api/admins/:id",
@@ -12489,6 +12838,8 @@ app.delete(
   await ensureReplayMemberTables();
   await ensureSubscriptionTables();
   await ensurePendingSignupsTable();
+  await ensureFeatureFlagsTable();
+  await ensureNotificationPreferencesTable();
 })()
   .then(() => {
     server.listen(PORT, () => {
