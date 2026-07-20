@@ -8372,6 +8372,236 @@ app.post(
   },
 );
 
+/*
+|--------------------------------------------------------------------------
+| SUPER ADMIN DASHBOARD — gated server / SRS restart
+|--------------------------------------------------------------------------
+| Two distinct actions with very different blast radii, so they are kept
+| separate rather than one "restart server" button:
+|   - restart-backend: restarts the PM2-managed Node process. Drops active
+|     Socket.io connections (chat/reactions/viewer counts) for a few
+|     seconds; does NOT touch RTMP publishing, since SRS runs independently
+|     in its own Docker container.
+|   - restart-srs: restarts the SRS Docker container itself. This DOES drop
+|     every active live stream platform-wide immediately -- every publisher
+|     has to reconnect and every viewer's playback breaks momentarily.
+| Both require typed confirmation when there are active streams (matching
+| the server hostname, so it can't be fat-fingered or scripted blindly),
+| and both are logged to restart_audit_log before the restart is attempted
+| -- logged even if the restart command itself later fails, since the
+| *decision* to restart is the thing worth auditing.
+*/
+
+const SERVER_HOSTNAME_CONFIRM =
+  process.env.SERVER_HOSTNAME_CONFIRM || "bscapi54";
+const SRS_DOCKER_CONTAINER = process.env.SRS_DOCKER_CONTAINER || "";
+
+async function ensureRestartAuditTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS restart_audit_log (
+      id SERIAL PRIMARY KEY,
+      admin_id INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+      admin_email VARCHAR(255),
+      action VARCHAR(20) NOT NULL, -- 'backend' | 'srs'
+      reason TEXT,
+      active_streams_at_time INTEGER NOT NULL DEFAULT 0,
+      affected_organizations TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+}
+
+// Shared by both restart endpoints and usable by anything else that needs
+// to know "how much would this action actually break right now."
+async function getActiveStreamsSnapshot() {
+  const channelsResult = await pool.query(
+    `SELECT c.stream_key, c.name AS channel_name, o.name AS organization_name
+     FROM channels c
+     JOIN organizations o ON o.id = c.organization_id`,
+  );
+  const channelByStreamKey = new Map(
+    channelsResult.rows.map((row) => [String(row.stream_key), row]),
+  );
+
+  try {
+    const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`);
+    if (!srsResponse.ok) throw new Error(`SRS responded ${srsResponse.status}`);
+    const srsData = await srsResponse.json();
+
+    const active = (srsData.streams || [])
+      .filter((s) => s.publish?.active && channelByStreamKey.has(s.name))
+      .map((s) => channelByStreamKey.get(s.name));
+
+    return { srsAvailable: true, count: active.length, activeStreams: active };
+  } catch (srsError) {
+    console.error("Restart snapshot: SRS unavailable:", srsError.message);
+    return { srsAvailable: false, count: 0, activeStreams: [] };
+  }
+}
+
+async function logRestartAudit({ req, action, reason, snapshot }) {
+  await pool.query(
+    `INSERT INTO restart_audit_log
+       (admin_id, admin_email, action, reason, active_streams_at_time, affected_organizations)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      req.admin.id,
+      req.admin.email || null,
+      action,
+      reason || null,
+      snapshot.count,
+      snapshot.activeStreams.map((s) => s.organization_name).join(", ") || null,
+    ],
+  );
+}
+
+app.get(
+  "/api/admin/restart-audit-log",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT id, admin_email, action, reason, active_streams_at_time,
+                affected_organizations, created_at
+         FROM restart_audit_log ORDER BY created_at DESC LIMIT 20`,
+      );
+      res.json({ ok: true, entries: result.rows });
+    } catch (error) {
+      console.error("Restart audit log error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to load restart audit log" });
+    }
+  },
+);
+
+// Snapshot endpoint the frontend calls right before showing the confirm
+// dialog, so the person sees an accurate "this will drop N streams across:
+// Org A, Org B" warning instead of a generic confirm prompt.
+app.get(
+  "/api/admin/active-streams-snapshot",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const snapshot = await getActiveStreamsSnapshot();
+      res.json({ ok: true, ...snapshot });
+    } catch (error) {
+      console.error("Active streams snapshot error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to check active streams" });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/restart-backend",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const { confirm_text, reason } = req.body;
+      const snapshot = await getActiveStreamsSnapshot();
+      const requiredPhrase =
+        snapshot.count > 0 ? SERVER_HOSTNAME_CONFIRM : "RESTART BACKEND";
+
+      if (confirm_text !== requiredPhrase) {
+        return res.status(400).json({
+          ok: false,
+          message: `Confirmation text didn't match. Type "${requiredPhrase}" to proceed.`,
+          required_confirm_text: requiredPhrase,
+          active_streams: snapshot.count,
+          affected_organizations: snapshot.activeStreams.map(
+            (s) => s.organization_name,
+          ),
+        });
+      }
+
+      await logRestartAudit({ req, action: "backend", reason, snapshot });
+
+      res.json({
+        ok: true,
+        message:
+          snapshot.count > 0
+            ? `Restarting backend now. ${snapshot.count} active stream(s) will keep publishing to SRS uninterrupted, but chat/reactions/viewer counts will briefly disconnect and reconnect.`
+            : "Restarting backend now — back online in a few seconds.",
+      });
+
+      // Respond before restarting -- this process is about to be killed and
+      // relaunched by PM2, so the HTTP response must go out first.
+      setTimeout(() => {
+        exec("pm2 restart nlm-stream-backend", (err) => {
+          if (err) console.error("PM2 restart command failed:", err.message);
+        });
+      }, 400);
+    } catch (error) {
+      console.error("Restart backend error:", error);
+      res.status(500).json({ ok: false, message: "Failed to restart backend" });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/restart-srs",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      if (!SRS_DOCKER_CONTAINER) {
+        return res.status(503).json({
+          ok: false,
+          message:
+            "SRS_DOCKER_CONTAINER is not set in .env. Run `docker ps` to find the real container name and set it before this action can be used.",
+        });
+      }
+
+      const { confirm_text, reason } = req.body;
+      const snapshot = await getActiveStreamsSnapshot();
+      const requiredPhrase =
+        snapshot.count > 0 ? SERVER_HOSTNAME_CONFIRM : "RESTART SRS";
+
+      if (confirm_text !== requiredPhrase) {
+        return res.status(400).json({
+          ok: false,
+          message: `Confirmation text didn't match. Type "${requiredPhrase}" to proceed.`,
+          required_confirm_text: requiredPhrase,
+          active_streams: snapshot.count,
+          affected_organizations: snapshot.activeStreams.map(
+            (s) => s.organization_name,
+          ),
+        });
+      }
+
+      await logRestartAudit({ req, action: "srs", reason, snapshot });
+
+      // SRS restarting doesn't kill this Node process, so we can await the
+      // command and report real success/failure back, unlike restart-backend.
+      exec(`docker restart ${SRS_DOCKER_CONTAINER}`, (err, stdout, stderr) => {
+        if (err) {
+          console.error("SRS restart command failed:", err.message, stderr);
+          return res.status(500).json({
+            ok: false,
+            message: "docker restart command failed — check server logs",
+            error: err.message,
+          });
+        }
+        res.json({
+          ok: true,
+          message:
+            snapshot.count > 0
+              ? `SRS restarted. ${snapshot.count} active stream(s) were dropped and will need to republish: ${snapshot.activeStreams.map((s) => s.organization_name).join(", ")}.`
+              : "SRS restarted — no active streams were affected.",
+        });
+      });
+    } catch (error) {
+      console.error("Restart SRS error:", error);
+      res.status(500).json({ ok: false, message: "Failed to restart SRS" });
+    }
+  },
+);
+
 require("./oauth_routes")(app, pool, jwt, {
   authenticateAdmin,
   resolveOrganizationForRequest,
@@ -13328,6 +13558,7 @@ app.delete(
   await ensureFeatureFlagsTable();
   await ensureNotificationPreferencesTable();
   await ensureSocialOAuthTables(pool);
+  await ensureRestartAuditTable();
 })()
   .then(() => {
     server.listen(PORT, () => {
