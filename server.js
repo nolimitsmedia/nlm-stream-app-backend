@@ -3421,49 +3421,52 @@ app.get(
 // SUPER ADMIN DASHBOARD — server health
 // Real data from Node's os module + a disk usage check.
 // ══════════════════════════════════════════
+function getServerStatusSnapshot() {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const loadAvg = os.loadavg();
+  const cpuCount = os.cpus().length;
+
+  let disk = null;
+  try {
+    const dfOutput = execSync("df -k / | tail -1").toString().trim();
+    const parts = dfOutput.split(/\s+/);
+    const totalKb = Number(parts[1] || 0);
+    const usedKb = Number(parts[2] || 0);
+    const availKb = Number(parts[3] || 0);
+    disk = {
+      total_bytes: totalKb * 1024,
+      used_bytes: usedKb * 1024,
+      available_bytes: availKb * 1024,
+      used_percent: totalKb ? Math.round((usedKb / totalKb) * 100) : null,
+    };
+  } catch (diskError) {
+    console.error("Server status: disk check failed:", diskError.message);
+  }
+
+  return {
+    uptime_seconds: Math.floor(os.uptime()),
+    process_uptime_seconds: Math.floor(process.uptime()),
+    cpu_count: cpuCount,
+    load_avg: { "1m": loadAvg[0], "5m": loadAvg[1], "15m": loadAvg[2] },
+    memory: {
+      total_bytes: totalMem,
+      used_bytes: usedMem,
+      free_bytes: freeMem,
+      used_percent: Math.round((usedMem / totalMem) * 100),
+    },
+    disk,
+  };
+}
+
 app.get(
   "/api/admin/server-status",
   authenticateAdmin,
   requireRole("super_admin"),
   (req, res) => {
     try {
-      const totalMem = os.totalmem();
-      const freeMem = os.freemem();
-      const usedMem = totalMem - freeMem;
-      const loadAvg = os.loadavg();
-      const cpuCount = os.cpus().length;
-
-      let disk = null;
-      try {
-        const dfOutput = execSync("df -k / | tail -1").toString().trim();
-        const parts = dfOutput.split(/\s+/);
-        const totalKb = Number(parts[1] || 0);
-        const usedKb = Number(parts[2] || 0);
-        const availKb = Number(parts[3] || 0);
-        disk = {
-          total_bytes: totalKb * 1024,
-          used_bytes: usedKb * 1024,
-          available_bytes: availKb * 1024,
-          used_percent: totalKb ? Math.round((usedKb / totalKb) * 100) : null,
-        };
-      } catch (diskError) {
-        console.error("Server status: disk check failed:", diskError.message);
-      }
-
-      res.json({
-        ok: true,
-        uptime_seconds: Math.floor(os.uptime()),
-        process_uptime_seconds: Math.floor(process.uptime()),
-        cpu_count: cpuCount,
-        load_avg: { "1m": loadAvg[0], "5m": loadAvg[1], "15m": loadAvg[2] },
-        memory: {
-          total_bytes: totalMem,
-          used_bytes: usedMem,
-          free_bytes: freeMem,
-          used_percent: Math.round((usedMem / totalMem) * 100),
-        },
-        disk,
-      });
+      res.json({ ok: true, ...getServerStatusSnapshot() });
     } catch (error) {
       console.error("Get server status error:", error);
 
@@ -3563,93 +3566,98 @@ app.put(
 // ══════════════════════════════════════════
 // INTEGRATION HEALTH — live checks, not just static config display
 // ══════════════════════════════════════════
-app.get(
-  "/api/admin/integration-health",
-  authenticateAdmin,
-  requireRole("super_admin"),
-  async (req, res) => {
-    const results = {};
+async function getIntegrationHealthSnapshot() {
+  const results = {};
 
-    // SRS
+  // SRS
+  try {
+    const started = Date.now();
+    const srsRes = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    results.srs = {
+      ok: srsRes.ok,
+      status: srsRes.ok ? "Online" : `HTTP ${srsRes.status}`,
+      latency_ms: Date.now() - started,
+    };
+  } catch (err) {
+    results.srs = { ok: false, status: err.message, latency_ms: null };
+  }
+
+  // Bunny Storage
+  if (!BUNNY_STORAGE_API_KEY || !BUNNY_STORAGE_HOSTNAME) {
+    results.bunny = { ok: false, status: "Not configured", latency_ms: null };
+  } else {
     try {
       const started = Date.now();
-      const srsRes = await fetch(`${SRS_API_URL}/api/v1/streams`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      results.srs = {
-        ok: srsRes.ok,
-        status: srsRes.ok ? "Online" : `HTTP ${srsRes.status}`,
+      const bunnyRes = await fetch(
+        `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/`,
+        {
+          method: "GET",
+          headers: { AccessKey: BUNNY_STORAGE_API_KEY },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      // Bunny returns 200/401/404 depending on zone contents — any
+      // response (not a network failure) means the credentials and
+      // hostname are at least reachable.
+      results.bunny = {
+        ok: bunnyRes.status !== 401 && bunnyRes.status !== 403,
+        status:
+          bunnyRes.status === 401 || bunnyRes.status === 403
+            ? "Auth failed — check API key"
+            : "Online",
         latency_ms: Date.now() - started,
       };
     } catch (err) {
-      results.srs = { ok: false, status: err.message, latency_ms: null };
+      results.bunny = { ok: false, status: err.message, latency_ms: null };
     }
+  }
 
-    // Bunny Storage
-    if (!BUNNY_STORAGE_API_KEY || !BUNNY_STORAGE_HOSTNAME) {
-      results.bunny = { ok: false, status: "Not configured", latency_ms: null };
-    } else {
-      try {
-        const started = Date.now();
-        const bunnyRes = await fetch(
-          `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/`,
-          {
-            method: "GET",
-            headers: { AccessKey: BUNNY_STORAGE_API_KEY },
-            signal: AbortSignal.timeout(5000),
-          },
-        );
-        // Bunny returns 200/401/404 depending on zone contents — any
-        // response (not a network failure) means the credentials and
-        // hostname are at least reachable.
-        results.bunny = {
-          ok: bunnyRes.status !== 401 && bunnyRes.status !== 403,
-          status:
-            bunnyRes.status === 401 || bunnyRes.status === 403
-              ? "Auth failed — check API key"
-              : "Online",
-          latency_ms: Date.now() - started,
-        };
-      } catch (err) {
-        results.bunny = { ok: false, status: err.message, latency_ms: null };
-      }
-    }
-
-    // Stripe
-    if (!stripe) {
-      results.stripe = {
-        ok: false,
-        status: "Not configured",
-        latency_ms: null,
-      };
-    } else {
-      try {
-        const started = Date.now();
-        await stripe.balance.retrieve();
-        results.stripe = {
-          ok: true,
-          status: "Online",
-          latency_ms: Date.now() - started,
-        };
-      } catch (err) {
-        results.stripe = { ok: false, status: err.message, latency_ms: null };
-      }
-    }
-
-    // Database (if we got this far, pool is working, but confirm with a
-    // trivial query so this stays consistent with the others)
+  // Stripe
+  if (!stripe) {
+    results.stripe = {
+      ok: false,
+      status: "Not configured",
+      latency_ms: null,
+    };
+  } else {
     try {
       const started = Date.now();
-      await pool.query("SELECT 1");
-      results.database = {
+      await stripe.balance.retrieve();
+      results.stripe = {
         ok: true,
         status: "Online",
         latency_ms: Date.now() - started,
       };
     } catch (err) {
-      results.database = { ok: false, status: err.message, latency_ms: null };
+      results.stripe = { ok: false, status: err.message, latency_ms: null };
     }
+  }
 
+  // Database (if we got this far, pool is working, but confirm with a
+  // trivial query so this stays consistent with the others)
+  try {
+    const started = Date.now();
+    await pool.query("SELECT 1");
+    results.database = {
+      ok: true,
+      status: "Online",
+      latency_ms: Date.now() - started,
+    };
+  } catch (err) {
+    results.database = { ok: false, status: err.message, latency_ms: null };
+  }
+
+  return results;
+}
+
+app.get(
+  "/api/admin/integration-health",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    const results = await getIntegrationHealthSnapshot();
     res.json({ ok: true, integrations: results });
   },
 );
@@ -8598,6 +8606,184 @@ app.post(
     } catch (error) {
       console.error("Restart SRS error:", error);
       res.status(500).json({ ok: false, message: "Failed to restart SRS" });
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
+| SUPER ADMIN DASHBOARD — AI Support Assistant
+|--------------------------------------------------------------------------
+| Bundles real diagnostic data (recent errors, integration health, server
+| status, active streams, restart history, and -- if an org is selected in
+| Support Mode -- that org's specific channels/simulcasts/errors) and sends
+| it to the Claude API alongside the admin's plain-English question. This
+| does NOT give Claude any ability to take action -- it's read-only context
+| in, plain-English diagnosis out. Nothing here can restart anything,
+| modify data, or act on the admin's behalf.
+*/
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const SUPPORT_ASSISTANT_MODEL = "claude-sonnet-5";
+
+app.post(
+  "/api/admin/support-assistant",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const { question, organizationId } = req.body;
+      if (!question || typeof question !== "string" || !question.trim()) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "A question is required" });
+      }
+
+      if (!ANTHROPIC_API_KEY) {
+        return res.status(503).json({
+          ok: false,
+          message:
+            "The AI Support Assistant isn't configured yet — set ANTHROPIC_API_KEY in .env (get one at console.anthropic.com).",
+        });
+      }
+
+      // ── Gather context, all read-only ──
+      const [serverStatus, integrationHealth, streamsSnapshot, restartHistory] =
+        await Promise.all([
+          Promise.resolve(getServerStatusSnapshot()),
+          getIntegrationHealthSnapshot(),
+          getActiveStreamsSnapshot(),
+          pool.query(
+            `SELECT admin_email, action, reason, active_streams_at_time, affected_organizations, created_at
+             FROM restart_audit_log ORDER BY created_at DESC LIMIT 5`,
+          ),
+        ]);
+
+      let orgContext = null;
+      let errorEntries;
+
+      if (organizationId) {
+        const orgResult = await pool.query(
+          `SELECT id, name FROM organizations WHERE id = $1`,
+          [organizationId],
+        );
+        const organization = orgResult.rows[0];
+
+        if (organization) {
+          const channelsResult = await pool.query(
+            `SELECT name, stream_key, is_live, live_started_at FROM channels WHERE organization_id = $1`,
+            [organizationId],
+          );
+          const socialResult = await pool.query(
+            `SELECT sd.platform, sd.is_running, c.name AS channel_name
+             FROM social_destinations sd
+             JOIN channels c ON c.id = sd.channel_id
+             WHERE c.organization_id = $1`,
+            [organizationId],
+          );
+          orgContext = {
+            name: organization.name,
+            channels: channelsResult.rows,
+            social_destinations: socialResult.rows,
+          };
+        }
+
+        errorEntries = recentErrorLog
+          .filter((e) => String(e.organization_id) === String(organizationId))
+          .slice(-15)
+          .reverse();
+      } else {
+        errorEntries = [...recentErrorLog].slice(-15).reverse();
+      }
+
+      const contextBlock = `
+PLATFORM SERVER STATUS:
+${JSON.stringify(serverStatus, null, 2)}
+
+INTEGRATION HEALTH:
+${JSON.stringify(integrationHealth, null, 2)}
+
+ACTIVE STREAMS RIGHT NOW:
+SRS reachable: ${streamsSnapshot.srsAvailable}
+Count: ${streamsSnapshot.count}
+${streamsSnapshot.activeStreams.map((s) => `- ${s.organization_name} / ${s.channel_name}`).join("\n") || "(none)"}
+
+RECENT RESTART HISTORY (last 5):
+${restartHistory.rows.map((r) => `- ${r.created_at}: ${r.admin_email} restarted ${r.action}${r.reason ? ` (${r.reason})` : ""}`).join("\n") || "(none)"}
+
+${
+  organizationId
+    ? `SELECTED ORGANIZATION: ${orgContext ? orgContext.name : `(id ${organizationId} — not found)`}
+${
+  orgContext
+    ? `Channels:
+${orgContext.channels.map((c) => `- ${c.name}: is_live=${c.is_live}, started_at=${c.live_started_at || "n/a"}`).join("\n") || "(none)"}
+Social destinations:
+${orgContext.social_destinations.map((s) => `- ${s.channel_name} → ${s.platform}: running=${s.is_running}`).join("\n") || "(none)"}`
+    : ""
+}
+RECENT ERRORS FOR THIS ORGANIZATION (last 15):`
+    : `RECENT PLATFORM-WIDE ERRORS (last 15):`
+}
+${errorEntries.map((e) => `- ${e.timestamp || e.created_at || "?"}: ${e.message || JSON.stringify(e)}`).join("\n") || "(none logged)"}
+`.trim();
+
+      const anthropicRes = await fetch(
+        "https://api.anthropic.com/v1/messages",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: SUPPORT_ASSISTANT_MODEL,
+            max_tokens: 1024,
+            system:
+              "You are a technical support assistant embedded in the NLM Streaming Manager's super-admin dashboard. " +
+              "You are given real, read-only diagnostic data about the platform (server status, integration health, active streams, restart history, and error logs). " +
+              "Answer the admin's question using ONLY the data provided -- never invent facts, stream keys, error details, or org info that isn't in the context. " +
+              "If the data doesn't contain enough to answer confidently, say what's missing and suggest what to check next. " +
+              "Be concise and plain-English -- this is read by a busy operator, not a report. Do not suggest destructive actions (restarts, deletions) unless the data clearly shows they're warranted, and even then, flag it as a suggestion for the admin to do manually, not something you can do.",
+            messages: [
+              {
+                role: "user",
+                content: `${contextBlock}\n\nQUESTION: ${question.trim()}`,
+              },
+            ],
+          }),
+          signal: AbortSignal.timeout(30000),
+        },
+      );
+
+      if (!anthropicRes.ok) {
+        const errBody = await anthropicRes.text().catch(() => "");
+        console.error(
+          "Support assistant: Anthropic API error:",
+          anthropicRes.status,
+          errBody,
+        );
+        return res.status(502).json({
+          ok: false,
+          message:
+            anthropicRes.status === 401
+              ? "AI Support Assistant is misconfigured — check ANTHROPIC_API_KEY"
+              : "The AI Support Assistant couldn't get a response — try again in a moment",
+        });
+      }
+
+      const data = await anthropicRes.json();
+      const answer =
+        data.content?.find((block) => block.type === "text")?.text || "";
+
+      res.json({ ok: true, answer, organization: orgContext?.name || null });
+    } catch (error) {
+      console.error("Support assistant error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to get a response from the assistant",
+      });
     }
   },
 );
