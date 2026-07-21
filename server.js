@@ -8402,7 +8402,7 @@ async function ensureRestartAuditTable() {
       id SERIAL PRIMARY KEY,
       admin_id INTEGER REFERENCES admins(id) ON DELETE SET NULL,
       admin_email VARCHAR(255),
-      action VARCHAR(20) NOT NULL, -- 'backend' | 'srs'
+      action VARCHAR(20) NOT NULL, -- 'backend' | 'srs' | 'srs-auto' (watchdog-triggered)
       reason TEXT,
       active_streams_at_time INTEGER NOT NULL DEFAULT 0,
       affected_organizations TEXT,
@@ -13614,6 +13614,94 @@ app.delete(
       },
       30 * 60 * 1000,
     ); // every 30 minutes
+
+    // ══════════════════════════════════════════
+    // SRS health watchdog — auto-recovery layer
+    // Docker's own restart policy (restart: unless-stopped) only reacts if
+    // the SRS container process actually dies. It does NOT notice if SRS is
+    // still running but unresponsive (hung, deadlocked, network-partitioned)
+    // -- that gap is what this watchdog covers. Requires 2+ CONSECUTIVE
+    // failed health checks before acting (a single blip shouldn't trigger a
+    // restart), and rate-limits itself to one auto-restart attempt per
+    // 10 minutes so a persistently broken SRS can't cause a restart-loop.
+    // ══════════════════════════════════════════
+    let srsConsecutiveFailures = 0;
+    let lastSrsAutoRestartAt = 0;
+    const SRS_AUTO_RESTART_COOLDOWN_MS = 10 * 60 * 1000;
+
+    setInterval(async () => {
+      let healthy = false;
+      try {
+        const res = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        healthy = res.ok;
+      } catch {
+        healthy = false;
+      }
+
+      if (healthy) {
+        srsConsecutiveFailures = 0;
+        return;
+      }
+
+      srsConsecutiveFailures += 1;
+      console.error(
+        `[SRS-WATCHDOG] Health check failed (${srsConsecutiveFailures} consecutive)`,
+      );
+
+      if (srsConsecutiveFailures < 2) return; // one blip isn't enough to act on
+
+      const sinceLastRestart = Date.now() - lastSrsAutoRestartAt;
+      if (sinceLastRestart < SRS_AUTO_RESTART_COOLDOWN_MS) {
+        console.error(
+          `[SRS-WATCHDOG] SRS unhealthy but skipping auto-restart -- last attempt was ${Math.round(sinceLastRestart / 1000)}s ago (cooldown: ${SRS_AUTO_RESTART_COOLDOWN_MS / 1000}s)`,
+        );
+        return;
+      }
+
+      if (!SRS_DOCKER_CONTAINER) {
+        console.error(
+          "[SRS-WATCHDOG] SRS unhealthy but SRS_DOCKER_CONTAINER is not set -- cannot auto-restart. Set it in .env.",
+        );
+        return;
+      }
+
+      lastSrsAutoRestartAt = Date.now();
+      console.error(
+        `[SRS-WATCHDOG] Attempting auto-restart of ${SRS_DOCKER_CONTAINER} after ${srsConsecutiveFailures} consecutive failed health checks`,
+      );
+
+      try {
+        await pool.query(
+          `INSERT INTO restart_audit_log
+             (admin_id, admin_email, action, reason, active_streams_at_time, affected_organizations)
+           VALUES (NULL, 'system (auto-recovery)', 'srs-auto', $1, 0, NULL)`,
+          [
+            `Auto-recovery: SRS failed ${srsConsecutiveFailures} consecutive health checks`,
+          ],
+        );
+      } catch (auditErr) {
+        console.error(
+          "[SRS-WATCHDOG] Failed to write audit log:",
+          auditErr.message,
+        );
+      }
+
+      exec(`docker restart ${SRS_DOCKER_CONTAINER}`, (err) => {
+        if (err) {
+          console.error(
+            "[SRS-WATCHDOG] Auto-restart command failed:",
+            err.message,
+          );
+        } else {
+          console.error(
+            `[SRS-WATCHDOG] Auto-restart of ${SRS_DOCKER_CONTAINER} completed`,
+          );
+          srsConsecutiveFailures = 0;
+        }
+      });
+    }, 30 * 1000); // check every 30 seconds
   })
   .catch((error) => {
     console.error("Failed to initialize database tables:", error);
