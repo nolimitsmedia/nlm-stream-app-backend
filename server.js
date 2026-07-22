@@ -15,7 +15,7 @@ const path = require("path");
 
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const Stripe = require("stripe");
+const whmcs = require("./whmcs_client");
 
 let UAParser = null;
 try {
@@ -56,9 +56,12 @@ const BUNNY_STORAGE_HOSTNAME = process.env.BUNNY_STORAGE_HOSTNAME || "";
 const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
 const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+// Billing now runs through WHMCS (see whmcs_client.js) — WHMCS_* env vars
+// are read directly by that module. Stripe has been fully retired: no
+// Stripe keys, webhook, or SDK client remain in this file.
+const WHMCS_POLL_INTERVAL_MS = Number(
+  process.env.WHMCS_POLL_INTERVAL_MS || 2 * 60 * 1000,
+);
 
 // ══════════════════════════════════════════
 // SUPER ADMIN — recent error log (in-memory ring buffer)
@@ -163,73 +166,6 @@ const publicEngagementLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    if (!stripe || !STRIPE_WEBHOOK_SECRET) {
-      return res.status(501).json({
-        ok: false,
-        message: "Stripe webhook is not configured",
-      });
-    }
-
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers["stripe-signature"],
-        STRIPE_WEBHOOK_SECRET,
-      );
-    } catch (error) {
-      console.error("Stripe webhook signature error:", error.message);
-      return res.status(400).send(`Webhook Error: ${error.message}`);
-    }
-
-    try {
-      if (event.type === "checkout.session.completed") {
-        const session = event.data.object;
-
-        if (session.mode === "subscription" && session.subscription) {
-          const subscription = await stripe.subscriptions.retrieve(
-            session.subscription,
-          );
-
-          const completedSignup =
-            await completePendingSignupFromCheckoutSession(
-              session,
-              subscription,
-            );
-
-          await syncStripeSubscriptionToDatabase(subscription, {
-            organizationId:
-              completedSignup?.organization_id ||
-              session.metadata?.organization_id,
-            planKey: completedSignup?.plan_key || session.metadata?.plan_key,
-            customerId: session.customer,
-          });
-        }
-      }
-
-      if (
-        [
-          "customer.subscription.created",
-          "customer.subscription.updated",
-          "customer.subscription.deleted",
-        ].includes(event.type)
-      ) {
-        await syncStripeSubscriptionToDatabase(event.data.object);
-      }
-
-      res.json({ received: true });
-    } catch (error) {
-      console.error("Stripe webhook processing error:", error);
-      res.status(500).json({ ok: false, message: "Webhook processing failed" });
-    }
-  },
-);
 
 app.use(express.json());
 
@@ -1168,7 +1104,7 @@ const organizationScopedRoom = (prefix, organizationId, streamKey) => {
 const PLAN_DEFINITIONS = [
   {
     key: "starter",
-    name: "Starter",
+    name: "Essential",
     monthly_price_cents: 2900,
     max_channels: 1,
     max_admins: 2,
@@ -1181,7 +1117,7 @@ const PLAN_DEFINITIONS = [
   },
   {
     key: "pro",
-    name: "Pro",
+    name: "Premium",
     monthly_price_cents: 7900,
     max_channels: 5,
     max_admins: 8,
@@ -1259,13 +1195,34 @@ const ensureSubscriptionTables = async () => {
     )
   `);
 
+  // Stripe columns above are kept as-is (harmless, historical) rather than
+  // dropped — this is a "replace going forward" migration, not a data-loss
+  // one. All new writes go to the whmcs_* columns added below.
   await pool.query(`
     ALTER TABLE plans
-    ADD COLUMN IF NOT EXISTS stripe_price_id VARCHAR(255)
+    ADD COLUMN IF NOT EXISTS stripe_price_id VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS whmcs_product_id VARCHAR(40)
+  `);
+
+  await pool.query(`
+    ALTER TABLE subscriptions
+    ADD COLUMN IF NOT EXISTS whmcs_client_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS whmcs_order_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS whmcs_invoice_id VARCHAR(40)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS processed_whmcs_orders (
+      whmcs_order_id VARCHAR(40) PRIMARY KEY,
+      organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+      outcome VARCHAR(40) NOT NULL,
+      processed_at TIMESTAMPTZ DEFAULT NOW()
+    )
   `);
 
   for (const plan of PLAN_DEFINITIONS) {
     const stripePriceId = getStripePriceIdForPlan(plan.key);
+    const whmcsProductId = whmcs.getWhmcsProductIdForPlan(plan.key);
 
     await pool.query(
       `
@@ -1282,9 +1239,10 @@ const ensureSubscriptionTables = async () => {
         custom_domain_enabled,
         priority_support_enabled,
         stripe_price_id,
+        whmcs_product_id,
         is_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE)
       ON CONFLICT (plan_key)
       DO UPDATE SET
         name = EXCLUDED.name,
@@ -1298,6 +1256,7 @@ const ensureSubscriptionTables = async () => {
         custom_domain_enabled = EXCLUDED.custom_domain_enabled,
         priority_support_enabled = EXCLUDED.priority_support_enabled,
         stripe_price_id = EXCLUDED.stripe_price_id,
+        whmcs_product_id = EXCLUDED.whmcs_product_id,
         is_active = TRUE,
         updated_at = NOW()
       `,
@@ -1314,6 +1273,7 @@ const ensureSubscriptionTables = async () => {
         plan.custom_domain_enabled,
         plan.priority_support_enabled,
         stripePriceId || null,
+        whmcsProductId || null,
       ],
     );
   }
@@ -1411,32 +1371,18 @@ const getFeatureFlags = async () => {
   return flags;
 };
 
-const completePendingSignupFromCheckoutSession = async (
-  session,
-  stripeSubscription,
+// Completes a pending_signups row once WHMCS confirms the matching order
+// is active/paid. Unlike the old Stripe flow (keyed off a checkout_session_id
+// baked into the session before payment), WHMCS's hosted order form means
+// the customer never touches our backend before paying — so matching is
+// done by the poller on client_email + plan_key instead (see
+// pollWhmcsBilling below), and this function is called with the already
+// -matched pending row plus the WHMCS identifiers it should be stamped with.
+const completePendingSignupFromWhmcs = async (
+  pending,
+  { whmcsClientId, whmcsOrderId, whmcsInvoiceId, nextDueDate } = {},
 ) => {
-  const checkoutSessionId = session?.id;
-
-  if (!checkoutSessionId) return null;
-
-  const pendingResult = await pool.query(
-    `
-    SELECT *
-    FROM pending_signups
-    WHERE checkout_session_id = $1
-    LIMIT 1
-    `,
-    [checkoutSessionId],
-  );
-
-  const pending = pendingResult.rows[0];
-
-  if (!pending) {
-    console.warn(
-      `No pending signup found for checkout session ${checkoutSessionId}`,
-    );
-    return null;
-  }
+  if (!pending) return null;
 
   if (pending.status === "completed" && pending.organization_id) {
     return pending;
@@ -1550,15 +1496,8 @@ const completePendingSignupFromCheckoutSession = async (
       ],
     );
 
-    const periodStart = stripeSubscription?.current_period_start
-      ? new Date(stripeSubscription.current_period_start * 1000)
-      : null;
-    const periodEnd = stripeSubscription?.current_period_end
-      ? new Date(stripeSubscription.current_period_end * 1000)
-      : null;
-    const trialEnd = stripeSubscription?.trial_end
-      ? new Date(stripeSubscription.trial_end * 1000)
-      : null;
+    const periodStart = new Date();
+    const periodEnd = nextDueDate ? new Date(nextDueDate) : null;
 
     await client.query(
       `
@@ -1566,36 +1505,32 @@ const completePendingSignupFromCheckoutSession = async (
         organization_id,
         plan_key,
         status,
-        trial_ends_at,
         current_period_start,
         current_period_end,
-        stripe_customer_id,
-        stripe_subscription_id,
-        cancel_at_period_end
+        whmcs_client_id,
+        whmcs_order_id,
+        whmcs_invoice_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, 'active', $3, $4, $5, $6, $7)
       ON CONFLICT (organization_id)
       DO UPDATE SET
         plan_key = EXCLUDED.plan_key,
-        status = EXCLUDED.status,
-        trial_ends_at = COALESCE(EXCLUDED.trial_ends_at, subscriptions.trial_ends_at),
-        current_period_start = COALESCE(EXCLUDED.current_period_start, subscriptions.current_period_start),
+        status = 'active',
+        current_period_start = EXCLUDED.current_period_start,
         current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
-        stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, subscriptions.stripe_customer_id),
-        stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, subscriptions.stripe_subscription_id),
-        cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+        whmcs_client_id = EXCLUDED.whmcs_client_id,
+        whmcs_order_id = EXCLUDED.whmcs_order_id,
+        whmcs_invoice_id = EXCLUDED.whmcs_invoice_id,
         updated_at = NOW()
       `,
       [
         organization.id,
         pending.plan_key,
-        mapStripeSubscriptionStatus(stripeSubscription?.status || "active"),
-        trialEnd,
         periodStart,
         periodEnd,
-        session.customer || stripeSubscription?.customer || null,
-        stripeSubscription?.id || null,
-        Boolean(stripeSubscription?.cancel_at_period_end),
+        whmcsClientId || null,
+        whmcsOrderId || null,
+        whmcsInvoiceId || null,
       ],
     );
 
@@ -1644,6 +1579,9 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
       s.cancel_at_period_end,
       s.stripe_customer_id,
       s.stripe_subscription_id,
+      s.whmcs_client_id,
+      s.whmcs_order_id,
+      s.whmcs_invoice_id,
       p.name AS plan_name,
       p.monthly_price_cents,
       p.max_channels,
@@ -1723,87 +1661,37 @@ const getPlanKeyForStripePriceId = (priceId) => {
   return match?.[0] || null;
 };
 
-const isStripeCheckoutReadyForPlan = (planKey) => {
-  return Boolean(stripe && getStripePriceIdForPlan(planKey));
-};
-
-const mapStripeSubscriptionStatus = (status) => {
-  if (
-    ["active", "trialing", "past_due", "canceled", "incomplete"].includes(
-      status,
-    )
-  ) {
-    return status;
-  }
-
-  if (status === "unpaid") return "past_due";
-  return status || "incomplete";
-};
-
-const syncStripeSubscriptionToDatabase = async (
-  stripeSubscription,
-  fallback = {},
+// Applies a WHMCS order's current state to an already-existing
+// organization's subscription row (the "existing client upgrades/renews"
+// path — as opposed to completePendingSignupFromWhmcs, which is the
+// "brand new signup" path). Used by both the poller and the manual
+// /api/subscription/refresh endpoint.
+const syncWhmcsOrgSubscription = async (
+  organizationId,
+  {
+    planKey,
+    whmcsStatus,
+    whmcsClientId,
+    whmcsOrderId,
+    whmcsInvoiceId,
+    nextDueDate,
+  },
 ) => {
-  const item = stripeSubscription.items?.data?.[0];
-  const priceId = item?.price?.id;
-  const planKey =
-    fallback.planKey ||
-    stripeSubscription.metadata?.plan_key ||
-    getPlanKeyForStripePriceId(priceId) ||
-    "starter";
+  if (!organizationId) return null;
 
-  const organizationId =
-    fallback.organizationId || stripeSubscription.metadata?.organization_id;
+  const status = whmcs.mapWhmcsStatusToSubscriptionStatus(whmcsStatus);
 
-  const customerId = fallback.customerId || stripeSubscription.customer;
-
-  if (!organizationId && !customerId) {
-    console.warn(
-      "Stripe subscription sync skipped: no organization/customer id",
-    );
-    return null;
-  }
-
-  let resolvedOrganizationId = organizationId;
-
-  if (!resolvedOrganizationId && customerId) {
-    const existing = await pool.query(
+  if (planKey) {
+    await pool.query(
       `
-      SELECT organization_id
-      FROM subscriptions
-      WHERE stripe_customer_id = $1
-      LIMIT 1
+      UPDATE organizations
+      SET subscription_plan = $1,
+          updated_at = NOW()
+      WHERE id = $2
       `,
-      [customerId],
+      [planKey, organizationId],
     );
-
-    resolvedOrganizationId = existing.rows[0]?.organization_id;
   }
-
-  if (!resolvedOrganizationId) {
-    console.warn("Stripe subscription sync skipped: organization not found");
-    return null;
-  }
-
-  const periodStart = stripeSubscription.current_period_start
-    ? new Date(stripeSubscription.current_period_start * 1000)
-    : null;
-  const periodEnd = stripeSubscription.current_period_end
-    ? new Date(stripeSubscription.current_period_end * 1000)
-    : null;
-  const trialEnd = stripeSubscription.trial_end
-    ? new Date(stripeSubscription.trial_end * 1000)
-    : null;
-
-  await pool.query(
-    `
-    UPDATE organizations
-    SET subscription_plan = $1,
-        updated_at = NOW()
-    WHERE id = $2
-    `,
-    [planKey, resolvedOrganizationId],
-  );
 
   const result = await pool.query(
     `
@@ -1811,41 +1699,192 @@ const syncStripeSubscriptionToDatabase = async (
       organization_id,
       plan_key,
       status,
-      trial_ends_at,
       current_period_start,
       current_period_end,
-      stripe_customer_id,
-      stripe_subscription_id,
-      cancel_at_period_end
+      whmcs_client_id,
+      whmcs_order_id,
+      whmcs_invoice_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)
     ON CONFLICT (organization_id)
     DO UPDATE SET
-      plan_key = EXCLUDED.plan_key,
-      status = EXCLUDED.status,
-      trial_ends_at = COALESCE(EXCLUDED.trial_ends_at, subscriptions.trial_ends_at),
-      current_period_start = COALESCE(EXCLUDED.current_period_start, subscriptions.current_period_start),
-      current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
-      stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, subscriptions.stripe_customer_id),
-      stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, subscriptions.stripe_subscription_id),
-      cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+      plan_key = COALESCE($2, subscriptions.plan_key),
+      status = $3,
+      current_period_end = COALESCE($4, subscriptions.current_period_end),
+      whmcs_client_id = COALESCE($5, subscriptions.whmcs_client_id),
+      whmcs_order_id = COALESCE($6, subscriptions.whmcs_order_id),
+      whmcs_invoice_id = COALESCE($7, subscriptions.whmcs_invoice_id),
       updated_at = NOW()
     RETURNING *
     `,
     [
-      resolvedOrganizationId,
-      planKey,
-      mapStripeSubscriptionStatus(stripeSubscription.status),
-      trialEnd,
-      periodStart,
-      periodEnd,
-      customerId || null,
-      stripeSubscription.id,
-      Boolean(stripeSubscription.cancel_at_period_end),
+      organizationId,
+      planKey || null,
+      status,
+      nextDueDate ? new Date(nextDueDate) : null,
+      whmcsClientId || null,
+      whmcsOrderId || null,
+      whmcsInvoiceId || null,
     ],
   );
 
   return result.rows[0];
+};
+
+// ══════════════════════════════════════════
+// WHMCS BILLING POLLER
+// Since checkout happens entirely on WHMCS's own hosted cart, our app has
+// no inbound signal when someone pays. This runs on an interval (see the
+// setInterval call near server startup) and pulls WHMCS's own order list
+// instead, matching each new active order to either a pending_signups row
+// (brand new customer) or an existing admin's organization (plan
+// upgrade/renewal), and provisioning/syncing accordingly.
+//
+// Idempotency: processed_whmcs_orders records every order id this poller
+// has already acted on, so re-running the same order on the next cycle
+// (which will happen constantly, since GetOrders always returns recent
+// orders) is a no-op.
+// ══════════════════════════════════════════
+const pollWhmcsBilling = async () => {
+  if (!whmcs.isWhmcsConfigured()) return;
+
+  try {
+    const orders = await whmcs.getOrders({ limitNum: 50, status: "Active" });
+
+    for (const order of orders) {
+      const orderId = String(order.id);
+
+      const alreadyProcessed = await pool.query(
+        `SELECT 1 FROM processed_whmcs_orders WHERE whmcs_order_id = $1 LIMIT 1`,
+        [orderId],
+      );
+      if (alreadyProcessed.rows[0]) continue;
+
+      // GetOrders nests line items differently across WHMCS versions —
+      // handle both a single product object and an array of them.
+      const rawProducts = order.lineitems?.lineitem
+        ? Array.isArray(order.lineitems.lineitem)
+          ? order.lineitems.lineitem
+          : [order.lineitems.lineitem]
+        : [];
+
+      const productLine = rawProducts.find((item) =>
+        whmcs.getPlanKeyForWhmcsProductId(item.relid || item.pid),
+      );
+
+      const planKey = productLine
+        ? whmcs.getPlanKeyForWhmcsProductId(
+            productLine.relid || productLine.pid,
+          )
+        : null;
+
+      if (!planKey) {
+        // Not one of our recognized plan products (could be a one-off
+        // WHMCS product unrelated to this app) — nothing for us to do.
+        await pool.query(
+          `INSERT INTO processed_whmcs_orders (whmcs_order_id, outcome) VALUES ($1, 'skipped_unrecognized_product') ON CONFLICT DO NOTHING`,
+          [orderId],
+        );
+        continue;
+      }
+
+      let clientEmail = null;
+      try {
+        const clientDetails = await whmcs.getClientDetails(order.userid);
+        clientEmail = String(clientDetails.email || "").toLowerCase();
+      } catch (clientErr) {
+        console.error(
+          `[WHMCS-POLL] Failed to fetch client ${order.userid} for order ${orderId}:`,
+          clientErr.message,
+        );
+      }
+
+      if (!clientEmail) {
+        await pool.query(
+          `INSERT INTO processed_whmcs_orders (whmcs_order_id, outcome) VALUES ($1, 'skipped_no_client_email') ON CONFLICT DO NOTHING`,
+          [orderId],
+        );
+        continue;
+      }
+
+      // 1) Brand-new signup: does a pending_signups row match this email + plan?
+      const pendingResult = await pool.query(
+        `
+        SELECT * FROM pending_signups
+        WHERE client_email = $1 AND plan_key = $2 AND status = 'pending'
+        LIMIT 1
+        `,
+        [clientEmail, planKey],
+      );
+
+      if (pendingResult.rows[0]) {
+        try {
+          const completed = await completePendingSignupFromWhmcs(
+            pendingResult.rows[0],
+            {
+              whmcsClientId: order.userid,
+              whmcsOrderId: orderId,
+              nextDueDate: productLine?.nextduedate,
+            },
+          );
+
+          await pool.query(
+            `INSERT INTO processed_whmcs_orders (whmcs_order_id, organization_id, outcome) VALUES ($1, $2, 'provisioned_new_signup') ON CONFLICT DO NOTHING`,
+            [orderId, completed?.organization_id || null],
+          );
+        } catch (provisionErr) {
+          console.error(
+            `[WHMCS-POLL] Failed to provision pending signup for order ${orderId}:`,
+            provisionErr.message,
+          );
+        }
+        continue;
+      }
+
+      // 2) Existing customer upgrading/renewing: match by admin email.
+      const adminResult = await pool.query(
+        `
+        SELECT ou.organization_id
+        FROM admins a
+        JOIN organization_users ou ON ou.admin_id = a.id AND ou.role = 'owner'
+        WHERE a.email = $1
+        LIMIT 1
+        `,
+        [clientEmail],
+      );
+
+      const organizationId = adminResult.rows[0]?.organization_id;
+
+      if (organizationId) {
+        await syncWhmcsOrgSubscription(organizationId, {
+          planKey,
+          whmcsStatus: order.status,
+          whmcsClientId: order.userid,
+          whmcsOrderId: orderId,
+          nextDueDate: productLine?.nextduedate,
+        });
+
+        await pool.query(
+          `INSERT INTO processed_whmcs_orders (whmcs_order_id, organization_id, outcome) VALUES ($1, $2, 'synced_existing_org') ON CONFLICT DO NOTHING`,
+          [orderId, organizationId],
+        );
+        continue;
+      }
+
+      // Neither a pending signup nor an existing org owner matched this
+      // email — likely a manual/unrelated WHMCS sale. Flag it and move on;
+      // don't loop retrying forever on something we can't resolve.
+      console.error(
+        `[WHMCS-POLL] Order ${orderId} (plan ${planKey}, client ${clientEmail}) has no matching pending signup or organization — needs manual review.`,
+      );
+      await pool.query(
+        `INSERT INTO processed_whmcs_orders (whmcs_order_id, outcome) VALUES ($1, 'unmatched_needs_manual_review') ON CONFLICT DO NOTHING`,
+        [orderId],
+      );
+    }
+  } catch (error) {
+    console.error("[WHMCS-POLL] Billing poll failed:", error.message);
+  }
 };
 
 const enforceChannelLimit = async (req, res, next) => {
@@ -1895,9 +1934,9 @@ app.get("/api/public/plans", async (req, res) => {
       SELECT
         *,
         CASE
-          WHEN stripe_price_id IS NOT NULL AND stripe_price_id <> '' THEN TRUE
+          WHEN whmcs_product_id IS NOT NULL AND whmcs_product_id <> '' THEN TRUE
           ELSE FALSE
-        END AS stripe_configured
+        END AS whmcs_configured
       FROM plans
       WHERE is_active = TRUE
         AND plan_key <> 'internal'
@@ -1941,13 +1980,12 @@ app.post(
   async (req, res) => {
     try {
       const planKey = cleanOrgText(req.body.plan_key || "starter", 80);
-      const priceId = getStripePriceIdForPlan(planKey);
 
-      if (!stripe || !priceId) {
+      if (!whmcs.isWhmcsCheckoutReadyForPlan(planKey)) {
         return res.status(501).json({
           ok: false,
           message:
-            "Stripe checkout is not configured for this plan. Add Stripe keys and price IDs to the server .env.",
+            "WHMCS checkout is not configured for this plan. Add WHMCS API keys and product IDs to the server .env.",
         });
       }
 
@@ -1964,63 +2002,28 @@ app.post(
           .json({ ok: false, message: "Invalid plan selected" });
       }
 
-      const subscription = await ensureSubscriptionForOrganization(
-        req.organization.id,
-        req.organization.subscription_plan || "starter",
-      );
-
-      let customerId = subscription?.stripe_customer_id;
-
-      if (!customerId) {
-        const customer = await stripe.customers.create({
-          email: req.admin.email,
-          name: req.organization.name,
-          metadata: {
-            organization_id: String(req.organization.id),
-            admin_id: String(req.admin.id),
-          },
-        });
-
-        customerId = customer.id;
-
-        await pool.query(
-          `
-          UPDATE subscriptions
-          SET stripe_customer_id = $1,
-              updated_at = NOW()
-          WHERE organization_id = $2
-          `,
-          [customerId, req.organization.id],
-        );
-      }
-
-      const session = await stripe.checkout.sessions.create({
-        mode: "subscription",
-        customer: customerId,
-        line_items: [{ price: priceId, quantity: 1 }],
-        allow_promotion_codes: true,
-        success_url: `${CLIENT_URL.replace(/\/$/, "")}/?billing=success`,
-        cancel_url: `${CLIENT_URL.replace(/\/$/, "")}/?billing=cancelled`,
-        metadata: {
-          organization_id: String(req.organization.id),
-          plan_key: plan.plan_key,
-          admin_id: String(req.admin.id),
-        },
-        subscription_data: {
-          metadata: {
-            organization_id: String(req.organization.id),
-            plan_key: plan.plan_key,
-            admin_id: String(req.admin.id),
-          },
-        },
+      // Nothing to create ahead of time here — WHMCS's own hosted cart
+      // collects payment. The poller (pollWhmcsBilling) picks up the paid
+      // order afterwards and matches it back to this organization by the
+      // logged-in admin's email address.
+      const checkoutUrl = whmcs.buildWhmcsCheckoutUrl(plan.plan_key, {
+        email: req.admin.email,
+        firstName: req.admin.name,
       });
 
-      res.json({ ok: true, checkout_url: session.url, session_id: session.id });
+      if (!checkoutUrl) {
+        return res.status(501).json({
+          ok: false,
+          message: "WHMCS_CART_URL is not configured in the server .env.",
+        });
+      }
+
+      res.json({ ok: true, checkout_url: checkoutUrl });
     } catch (error) {
       console.error("Create subscription checkout error:", error);
       res.status(500).json({
         ok: false,
-        message: "Failed to create Stripe checkout session",
+        message: "Failed to build WHMCS checkout link",
         error: error.message,
       });
     }
@@ -2033,36 +2036,24 @@ app.post(
   resolveOrganizationForRequest,
   async (req, res) => {
     try {
-      if (!stripe) {
+      const portalUrl = whmcs.getWhmcsClientAreaUrl();
+
+      if (!portalUrl) {
         return res.status(501).json({
           ok: false,
-          message: "Stripe customer portal is not configured.",
+          message:
+            "WHMCS_CLIENT_AREA_URL is not configured in the server .env.",
         });
       }
 
-      const subscription = await ensureSubscriptionForOrganization(
-        req.organization.id,
-        req.organization.subscription_plan || "starter",
-      );
-
-      if (!subscription?.stripe_customer_id) {
-        return res.status(400).json({
-          ok: false,
-          message: "This tenant does not have a Stripe customer yet.",
-        });
-      }
-
-      const portalSession = await stripe.billingPortal.sessions.create({
-        customer: subscription.stripe_customer_id,
-        return_url: `${CLIENT_URL.replace(/\/$/, "")}/`,
-      });
-
-      res.json({ ok: true, portal_url: portalSession.url });
+      // WHMCS's client area handles its own login (by the client's email),
+      // so we just send them there rather than minting a session ourselves.
+      res.json({ ok: true, portal_url: portalUrl });
     } catch (error) {
       console.error("Create billing portal error:", error);
       res.status(500).json({
         ok: false,
-        message: "Failed to open Stripe billing portal",
+        message: "Failed to open WHMCS client area",
         error: error.message,
       });
     }
@@ -2075,10 +2066,10 @@ app.get(
   resolveOrganizationForRequest,
   async (req, res) => {
     try {
-      if (!stripe) {
+      if (!whmcs.isWhmcsConfigured()) {
         return res.status(501).json({
           ok: false,
-          message: "Stripe invoice history is not configured.",
+          message: "WHMCS invoice history is not configured.",
         });
       }
 
@@ -2087,37 +2078,34 @@ app.get(
         req.organization.subscription_plan || "starter",
       );
 
-      if (!subscription?.stripe_customer_id) {
+      if (!subscription?.whmcs_client_id) {
         return res.json({ ok: true, invoices: [] });
       }
 
-      const invoices = await stripe.invoices.list({
-        customer: subscription.stripe_customer_id,
-        limit: 12,
+      const whmcsInvoices = await whmcs.getInvoices({
+        userId: subscription.whmcs_client_id,
+        limitNum: 12,
       });
 
-      const formattedInvoices = (invoices.data || []).map((invoice) => ({
+      const clientAreaUrl = whmcs.getWhmcsClientAreaUrl();
+
+      const formattedInvoices = (whmcsInvoices || []).map((invoice) => ({
         id: invoice.id,
-        number: invoice.number,
-        status: invoice.status,
-        amount_due: invoice.amount_due,
-        amount_paid: invoice.amount_paid,
-        amount_remaining: invoice.amount_remaining,
-        currency: invoice.currency,
-        hosted_invoice_url: invoice.hosted_invoice_url,
-        invoice_pdf: invoice.invoice_pdf,
-        created: invoice.created
-          ? new Date(invoice.created * 1000).toISOString()
+        number: invoice.id,
+        status: String(invoice.status || "").toLowerCase(),
+        amount_paid:
+          invoice.status === "Paid"
+            ? Math.round(Number(invoice.total || 0) * 100)
+            : 0,
+        currency: "usd",
+        hosted_invoice_url: clientAreaUrl
+          ? `${clientAreaUrl.replace(/\/clientarea\.php$/, "")}/viewinvoice.php?id=${invoice.id}`
           : null,
-        due_date: invoice.due_date
-          ? new Date(invoice.due_date * 1000).toISOString()
-          : null,
-        period_start: invoice.period_start
-          ? new Date(invoice.period_start * 1000).toISOString()
-          : null,
-        period_end: invoice.period_end
-          ? new Date(invoice.period_end * 1000).toISOString()
-          : null,
+        invoice_pdf: null,
+        created: invoice.date || null,
+        due_date: invoice.duedate || null,
+        period_start: invoice.date || null,
+        period_end: invoice.duedate || null,
       }));
 
       res.json({ ok: true, invoices: formattedInvoices });
@@ -2138,30 +2126,34 @@ app.post(
   resolveOrganizationForRequest,
   async (req, res) => {
     try {
-      if (!stripe) {
-        const subscription = await ensureSubscriptionForOrganization(
-          req.organization.id,
-          req.organization.subscription_plan || "starter",
-        );
-
-        return res.json({ ok: true, subscription });
-      }
-
       const subscription = await ensureSubscriptionForOrganization(
         req.organization.id,
         req.organization.subscription_plan || "starter",
       );
 
-      if (subscription?.stripe_subscription_id) {
-        const stripeSubscription = await stripe.subscriptions.retrieve(
-          subscription.stripe_subscription_id,
+      if (whmcs.isWhmcsConfigured() && subscription?.whmcs_client_id) {
+        const products = await whmcs.getClientsProducts(
+          subscription.whmcs_client_id,
         );
 
-        await syncStripeSubscriptionToDatabase(stripeSubscription, {
-          organizationId: req.organization.id,
-          planKey: subscription.plan_key,
-          customerId: subscription.stripe_customer_id,
-        });
+        // If this client has more than one product, prefer whichever one
+        // matches a known plan and is currently active.
+        const match =
+          products.find(
+            (p) =>
+              whmcs.getPlanKeyForWhmcsProductId(p.pid) &&
+              String(p.status).toLowerCase() === "active",
+          ) || products.find((p) => whmcs.getPlanKeyForWhmcsProductId(p.pid));
+
+        if (match) {
+          await syncWhmcsOrgSubscription(req.organization.id, {
+            planKey: whmcs.getPlanKeyForWhmcsProductId(match.pid),
+            whmcsStatus: match.status,
+            whmcsClientId: subscription.whmcs_client_id,
+            whmcsOrderId: match.orderid,
+            nextDueDate: match.nextduedate,
+          });
+        }
       }
 
       const refreshed = await getOrganizationSubscriptionSummary(
@@ -2173,7 +2165,7 @@ app.post(
       console.error("Refresh subscription error:", error);
       res.status(500).json({
         ok: false,
-        message: "Failed to refresh subscription from Stripe",
+        message: "Failed to refresh subscription from WHMCS",
         error: error.message,
       });
     }
@@ -2287,11 +2279,11 @@ app.post("/api/public/signup", signupLimiter, async (req, res) => {
         .json({ ok: false, message: "Invalid plan selected" });
     }
 
-    if (!isStripeCheckoutReadyForPlan(plan.plan_key)) {
+    if (!whmcs.isWhmcsCheckoutReadyForPlan(plan.plan_key)) {
       return res.status(501).json({
         ok: false,
         message:
-          "Stripe checkout is not configured for this plan. Add Stripe keys and price IDs to the server .env.",
+          "WHMCS checkout is not configured for this plan. Add WHMCS API keys and product IDs to the server .env.",
       });
     }
 
@@ -2308,49 +2300,18 @@ app.post("/api/public/signup", signupLimiter, async (req, res) => {
       });
     }
 
-    const slugPreview = slugifyOrganization(organizationName);
     const streamKey = await generateUniqueStreamKey(organizationName);
-
     const passwordHash = await bcrypt.hash(clientPassword, 10);
 
-    const customer = await stripe.customers.create({
-      email: clientEmail,
-      name: organizationName,
-      metadata: {
-        client_name: clientName,
-        plan_key: plan.plan_key,
-      },
-    });
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: customer.id,
-      line_items: [
-        {
-          price: getStripePriceIdForPlan(plan.plan_key),
-          quantity: 1,
-        },
-      ],
-      allow_promotion_codes: true,
-      success_url: `${CLIENT_URL.replace(/\/$/, "")}/login?signup=success`,
-      cancel_url: `${CLIENT_URL.replace(/\/$/, "")}/signup?plan=${plan.plan_key}&checkout=cancelled`,
-      metadata: {
-        plan_key: plan.plan_key,
-        client_email: clientEmail,
-      },
-      subscription_data: {
-        metadata: {
-          plan_key: plan.plan_key,
-          client_email: clientEmail,
-        },
-      },
-    });
-
+    // Unlike the old Stripe flow, there's no checkout_session_id to key
+    // off of yet — the customer is about to leave our app entirely and
+    // pay on WHMCS's hosted cart. pollWhmcsBilling() matches this row back
+    // up afterwards by client_email + plan_key once WHMCS reports the
+    // order active/paid, so we key this upsert on the email instead.
     await pool.query(
       `
       INSERT INTO pending_signups (
         checkout_session_id,
-        stripe_customer_id,
         plan_key,
         organization_name,
         client_name,
@@ -2362,14 +2323,12 @@ app.post("/api/public/signup", signupLimiter, async (req, res) => {
         donation_url,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
       ON CONFLICT (checkout_session_id)
       DO UPDATE SET
-        stripe_customer_id = EXCLUDED.stripe_customer_id,
         plan_key = EXCLUDED.plan_key,
         organization_name = EXCLUDED.organization_name,
         client_name = EXCLUDED.client_name,
-        client_email = EXCLUDED.client_email,
         password_hash = EXCLUDED.password_hash,
         stream_key = EXCLUDED.stream_key,
         primary_color = EXCLUDED.primary_color,
@@ -2379,8 +2338,9 @@ app.post("/api/public/signup", signupLimiter, async (req, res) => {
         updated_at = NOW()
       `,
       [
-        session.id,
-        customer.id,
+        // client_email doubles as our synthetic "checkout session id" key
+        // since it's unique per pending signup and known before checkout.
+        `whmcs:${clientEmail}`,
         plan.plan_key,
         organizationName,
         clientName,
@@ -2393,11 +2353,15 @@ app.post("/api/public/signup", signupLimiter, async (req, res) => {
       ],
     );
 
+    const checkoutUrl = whmcs.buildWhmcsCheckoutUrl(plan.plan_key, {
+      email: clientEmail,
+      firstName: clientName,
+    });
+
     res.json({
       ok: true,
       requires_checkout: true,
-      checkout_url: session.url,
-      stripe_session_id: session.id,
+      checkout_url: checkoutUrl,
     });
   } catch (error) {
     console.error("Public signup error:", error);
@@ -3614,9 +3578,9 @@ async function getIntegrationHealthSnapshot() {
     }
   }
 
-  // Stripe
-  if (!stripe) {
-    results.stripe = {
+  // WHMCS
+  if (!whmcs.isWhmcsConfigured()) {
+    results.whmcs = {
       ok: false,
       status: "Not configured",
       latency_ms: null,
@@ -3624,14 +3588,14 @@ async function getIntegrationHealthSnapshot() {
   } else {
     try {
       const started = Date.now();
-      await stripe.balance.retrieve();
-      results.stripe = {
+      await whmcs.callWhmcsApi("GetOrders", { limitnum: 1 });
+      results.whmcs = {
         ok: true,
         status: "Online",
         latency_ms: Date.now() - started,
       };
     } catch (err) {
-      results.stripe = { ok: false, status: err.message, latency_ms: null };
+      results.whmcs = { ok: false, status: err.message, latency_ms: null };
     }
   }
 
@@ -13752,6 +13716,17 @@ app.delete(
         `NLM Streaming Manager API running on http://localhost:${PORT}`,
       );
     });
+
+    // WHMCS billing poller — see pollWhmcsBilling() for why this is a poll
+    // rather than a webhook. Runs once immediately, then on an interval.
+    if (whmcs.isWhmcsConfigured()) {
+      pollWhmcsBilling();
+      setInterval(pollWhmcsBilling, WHMCS_POLL_INTERVAL_MS);
+    } else {
+      console.error(
+        "[WHMCS-POLL] WHMCS is not configured (missing WHMCS_API_URL/IDENTIFIER/SECRET) — billing poller disabled.",
+      );
+    }
 
     // Proactively refresh YouTube access tokens before they expire (~1hr
     // lifetime), so a scheduled/automated go-live never fails mid-stream
