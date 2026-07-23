@@ -109,7 +109,13 @@ const corsOptions = {
       return callback(null, true);
     }
 
-    return callback(new Error(`CORS blocked origin: ${origin}`));
+    // Passing an Error here makes Express treat a simple CORS mismatch as
+    // an uncaught server error -- producing a raw, unstyled "Internal
+    // Server Error" page instead of just omitting CORS headers. Reject
+    // gracefully instead; the browser's own same-origin policy already
+    // blocks the response from being read by JS, no need to crash.
+    console.error(`CORS blocked origin: ${origin}`);
+    return callback(null, false);
   },
   credentials: true,
 };
