@@ -1105,7 +1105,14 @@ const PLAN_DEFINITIONS = [
   {
     key: "starter",
     name: "Essential",
-    monthly_price_cents: 2900,
+    // This price is ONLY used the very first time this plan_key is
+    // inserted into the DB — see the comment above the upsert in
+    // ensureSubscriptionTables. Set to match WHMCS's actual currently
+    // configured price (Essential Streaming Solution, confirmed in
+    // WHMCS's Pricing tab) rather than an arbitrary display number, so
+    // the fallback is correct even before the first successful live
+    // pricing fetch.
+    monthly_price_cents: 7999,
     max_channels: 1,
     max_admins: 2,
     max_storage_gb: 25,
@@ -1118,7 +1125,8 @@ const PLAN_DEFINITIONS = [
   {
     key: "pro",
     name: "Premium",
-    monthly_price_cents: 7900,
+    // Matches WHMCS's Deluxe Streaming Solution price — see note above.
+    monthly_price_cents: 9999,
     max_channels: 5,
     max_admins: 8,
     max_storage_gb: 150,
@@ -1131,7 +1139,8 @@ const PLAN_DEFINITIONS = [
   {
     key: "enterprise",
     name: "Enterprise",
-    monthly_price_cents: 19900,
+    // Matches WHMCS's Premium Streaming Solution price — see note above.
+    monthly_price_cents: 13999,
     max_channels: 25,
     max_admins: 50,
     max_storage_gb: 1000,
@@ -1220,10 +1229,39 @@ const ensureSubscriptionTables = async () => {
     )
   `);
 
+  // One-time correction: earlier deploys seeded plans with an arbitrary
+  // $29/$79/$199 pricing scheme that was never actually reconciled against
+  // WHMCS's real configured prices. Since the upsert below no longer
+  // touches monthly_price_cents on conflict (see comment above the loop),
+  // those wrong values would otherwise stay stuck on existing rows forever
+  // — this brings them in line with WHMCS once, the first time this runs
+  // against a DB that still has the old numbers. Safe to run repeatedly:
+  // a no-op once the values already match.
+  await pool.query(`
+    UPDATE plans SET monthly_price_cents = 7999, updated_at = NOW()
+    WHERE plan_key = 'starter' AND monthly_price_cents = 2900
+  `);
+  await pool.query(`
+    UPDATE plans SET monthly_price_cents = 9999, updated_at = NOW()
+    WHERE plan_key = 'pro' AND monthly_price_cents = 7900
+  `);
+  await pool.query(`
+    UPDATE plans SET monthly_price_cents = 13999, updated_at = NOW()
+    WHERE plan_key = 'enterprise' AND monthly_price_cents = 19900
+  `);
+
   for (const plan of PLAN_DEFINITIONS) {
     const stripePriceId = getStripePriceIdForPlan(plan.key);
     const whmcsProductId = whmcs.getWhmcsProductIdForPlan(plan.key);
 
+    // monthly_price_cents is intentionally NOT re-seeded from
+    // PLAN_DEFINITIONS on conflict below (see `= plans.monthly_price_cents`
+    // in the DO UPDATE) — WHMCS is the real source of truth for price, and
+    // /api/public/plans keeps this column updated as a write-through cache
+    // of the last known live price. If this upsert overwrote it with the
+    // hardcoded fallback on every restart, that cache would be wiped
+    // constantly. PLAN_DEFINITIONS' price is only ever used for a brand
+    // new plan_key's first insert, or if the row doesn't exist yet.
     await pool.query(
       `
       INSERT INTO plans (
@@ -1246,7 +1284,7 @@ const ensureSubscriptionTables = async () => {
       ON CONFLICT (plan_key)
       DO UPDATE SET
         name = EXCLUDED.name,
-        monthly_price_cents = EXCLUDED.monthly_price_cents,
+        monthly_price_cents = plans.monthly_price_cents,
         max_channels = EXCLUDED.max_channels,
         max_admins = EXCLUDED.max_admins,
         max_storage_gb = EXCLUDED.max_storage_gb,
@@ -1943,7 +1981,46 @@ app.get("/api/public/plans", async (req, res) => {
       ORDER BY monthly_price_cents ASC
     `);
 
-    res.json({ ok: true, plans: result.rows });
+    let plans = result.rows;
+
+    // WHMCS is the source of truth for price, not our own plans table —
+    // that table previously drifted out of sync with what WHMCS actually
+    // charges (a real incident: this app advertised $29/$79/$199 while
+    // WHMCS billed $79.99/$99.99/$139.99 for the same products). Fetch
+    // live pricing here and write it back to the DB so monthly_price_cents
+    // always reflects "last known real price" — used as the fallback on
+    // any request where the live WHMCS call fails (e.g. while its IP
+    // allow-list is still pending for this server).
+    if (whmcs.isWhmcsConfigured()) {
+      try {
+        const pids = plans.map((p) => p.whmcs_product_id).filter(Boolean);
+        const livePricing = await whmcs.getProductsPricing(pids);
+
+        plans = await Promise.all(
+          plans.map(async (plan) => {
+            const liveCents = livePricing[String(plan.whmcs_product_id)];
+
+            if (!liveCents || liveCents === plan.monthly_price_cents) {
+              return plan;
+            }
+
+            await pool.query(
+              `UPDATE plans SET monthly_price_cents = $1, updated_at = NOW() WHERE plan_key = $2`,
+              [liveCents, plan.plan_key],
+            );
+
+            return { ...plan, monthly_price_cents: liveCents };
+          }),
+        );
+      } catch (whmcsError) {
+        console.error(
+          "[WHMCS] Live pricing fetch failed, serving last-known prices:",
+          whmcsError.message,
+        );
+      }
+    }
+
+    res.json({ ok: true, plans });
   } catch (error) {
     console.error("Get public plans error:", error);
     res.status(500).json({ ok: false, message: "Failed to load plans" });

@@ -178,6 +178,35 @@ const getInvoices = async ({
   return data.invoices?.invoice || [];
 };
 
+// Live product pricing, keyed by pid -> monthly price in cents. Used so
+// /api/public/plans reflects whatever is actually configured in WHMCS
+// right now, rather than a value that can silently drift out of sync.
+// A pid with no USD pricing configured, or priced at 0/disabled, is
+// omitted from the result so callers can fall back to their last-known
+// price instead of showing $0.
+const getProductsPricing = async (pids = []) => {
+  const cleanPids = pids.filter(Boolean).map(String);
+  if (!cleanPids.length) return {};
+
+  const data = await callWhmcsApi("GetProducts", { pid: cleanPids.join(",") });
+  const rawProducts = data.products?.product || [];
+  const products = Array.isArray(rawProducts) ? rawProducts : [rawProducts];
+
+  const pricingByPid = {};
+
+  for (const product of products) {
+    const usdPricing = product.pricing?.USD;
+    if (!usdPricing) continue;
+
+    const monthly = Number(usdPricing.monthly);
+    if (!Number.isFinite(monthly) || monthly <= 0) continue;
+
+    pricingByPid[String(product.pid)] = Math.round(monthly * 100);
+  }
+
+  return pricingByPid;
+};
+
 module.exports = {
   isWhmcsConfigured,
   getWhmcsProductIdForPlan,
@@ -191,4 +220,5 @@ module.exports = {
   getClientDetails,
   getClientsProducts,
   getInvoices,
+  getProductsPricing,
 };
