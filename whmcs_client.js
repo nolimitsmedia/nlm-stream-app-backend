@@ -178,13 +178,15 @@ const getInvoices = async ({
   return data.invoices?.invoice || [];
 };
 
-// Live product pricing, keyed by pid -> monthly price in cents. Used so
+// Live product pricing + description, keyed by pid. Used so
 // /api/public/plans reflects whatever is actually configured in WHMCS
 // right now, rather than a value that can silently drift out of sync.
-// A pid with no USD pricing configured, or priced at 0/disabled, is
-// omitted from the result so callers can fall back to their last-known
-// price instead of showing $0.
-const getProductsPricing = async (pids = []) => {
+// A pid with no USD pricing configured, or priced at 0/disabled, has its
+// monthlyPriceCents omitted so callers can fall back to their last-known
+// price instead of showing $0. description/shortDescription come back as
+// empty strings if the product's corresponding fields are blank in
+// WHMCS — that's not an error, just nothing configured yet.
+const getProductsDetails = async (pids = []) => {
   const cleanPids = pids.filter(Boolean).map(String);
   if (!cleanPids.length) return {};
 
@@ -192,16 +194,49 @@ const getProductsPricing = async (pids = []) => {
   const rawProducts = data.products?.product || [];
   const products = Array.isArray(rawProducts) ? rawProducts : [rawProducts];
 
-  const pricingByPid = {};
+  const detailsByPid = {};
 
   for (const product of products) {
+    const pid = String(product.pid);
     const usdPricing = product.pricing?.USD;
-    if (!usdPricing) continue;
 
-    const monthly = Number(usdPricing.monthly);
-    if (!Number.isFinite(monthly) || monthly <= 0) continue;
+    let monthlyPriceCents = null;
+    if (usdPricing) {
+      const monthly = Number(usdPricing.monthly);
+      if (Number.isFinite(monthly) && monthly > 0) {
+        monthlyPriceCents = Math.round(monthly * 100);
+      }
+    }
 
-    pricingByPid[String(product.pid)] = Math.round(monthly * 100);
+    detailsByPid[pid] = {
+      monthlyPriceCents,
+      // WHMCS's "Product Short Description" and "Product Description"
+      // fields. I'm not 100% certain of the exact key casing WHMCS's API
+      // uses for the short description (varies across versions/docs), so
+      // this checks a few likely variants rather than assuming one.
+      // Confirm the real key name in a captured response if this ends up
+      // empty even after the field is filled in in WHMCS.
+      shortDescription: String(
+        product.shortDescription ||
+          product.shortdescription ||
+          product.short_description ||
+          "",
+      ).trim(),
+      description: String(product.description || "").trim(),
+    };
+  }
+
+  return detailsByPid;
+};
+
+// Backwards-compatible pricing-only accessor, kept since other callers
+// only need the price.
+const getProductsPricing = async (pids = []) => {
+  const details = await getProductsDetails(pids);
+  const pricingByPid = {};
+
+  for (const [pid, info] of Object.entries(details)) {
+    if (info.monthlyPriceCents) pricingByPid[pid] = info.monthlyPriceCents;
   }
 
   return pricingByPid;
@@ -221,4 +256,5 @@ module.exports = {
   getClientsProducts,
   getInvoices,
   getProductsPricing,
+  getProductsDetails,
 };

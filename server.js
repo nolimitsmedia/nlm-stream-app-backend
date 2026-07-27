@@ -1216,7 +1216,8 @@ const ensureSubscriptionTables = async () => {
   await pool.query(`
     ALTER TABLE plans
     ADD COLUMN IF NOT EXISTS stripe_price_id VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS whmcs_product_id VARCHAR(40)
+    ADD COLUMN IF NOT EXISTS whmcs_product_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS whmcs_description TEXT
   `);
 
   await pool.query(`
@@ -2000,27 +2001,48 @@ app.get("/api/public/plans", async (req, res) => {
     if (whmcs.isWhmcsConfigured()) {
       try {
         const pids = plans.map((p) => p.whmcs_product_id).filter(Boolean);
-        const livePricing = await whmcs.getProductsPricing(pids);
+        const liveDetails = await whmcs.getProductsDetails(pids);
 
         plans = await Promise.all(
           plans.map(async (plan) => {
-            const liveCents = livePricing[String(plan.whmcs_product_id)];
+            const details = liveDetails[String(plan.whmcs_product_id)];
+            if (!details) return plan;
 
-            if (!liveCents || liveCents === plan.monthly_price_cents) {
-              return plan;
-            }
+            const liveCents = details.monthlyPriceCents;
+            // Prefer the short description for display; fall back to the
+            // long description if only that's filled in. Both are blank
+            // strings, not null, when nothing's configured in WHMCS yet.
+            const liveDescription =
+              details.shortDescription || details.description || "";
+
+            const priceChanged =
+              liveCents && liveCents !== plan.monthly_price_cents;
+            const descriptionChanged =
+              liveDescription !== (plan.whmcs_description || "");
+
+            if (!priceChanged && !descriptionChanged) return plan;
 
             await pool.query(
-              `UPDATE plans SET monthly_price_cents = $1, updated_at = NOW() WHERE plan_key = $2`,
-              [liveCents, plan.plan_key],
+              `
+              UPDATE plans
+              SET monthly_price_cents = COALESCE($1, monthly_price_cents),
+                  whmcs_description = $2,
+                  updated_at = NOW()
+              WHERE plan_key = $3
+              `,
+              [liveCents || null, liveDescription, plan.plan_key],
             );
 
-            return { ...plan, monthly_price_cents: liveCents };
+            return {
+              ...plan,
+              monthly_price_cents: liveCents || plan.monthly_price_cents,
+              whmcs_description: liveDescription,
+            };
           }),
         );
       } catch (whmcsError) {
         console.error(
-          "[WHMCS] Live pricing fetch failed, serving last-known prices:",
+          "[WHMCS] Live pricing/description fetch failed, serving last-known values:",
           whmcsError.message,
         );
       }
