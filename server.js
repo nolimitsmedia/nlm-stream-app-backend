@@ -2015,28 +2015,41 @@ app.get("/api/public/plans", async (req, res) => {
             const liveDescription =
               details.shortDescription || details.description || "";
 
+            // WHMCS's real product name, e.g. "Essential Streaming
+            // Solution" — strip the repetitive "Streaming Solution" suffix
+            // to match the short-form naming already used in the
+            // business's own marketing (Essential/Deluxe/Premium), rather
+            // than showing the full WHMCS string verbatim on the card.
+            const liveName = details.name
+              ? details.name.replace(/\s+Streaming Solution$/i, "").trim()
+              : "";
+
             const priceChanged =
               liveCents && liveCents !== plan.monthly_price_cents;
             const descriptionChanged =
               liveDescription !== (plan.whmcs_description || "");
+            const nameChanged = liveName && liveName !== plan.name;
 
-            if (!priceChanged && !descriptionChanged) return plan;
+            if (!priceChanged && !descriptionChanged && !nameChanged)
+              return plan;
 
             await pool.query(
               `
               UPDATE plans
               SET monthly_price_cents = COALESCE($1, monthly_price_cents),
                   whmcs_description = $2,
+                  name = COALESCE(NULLIF($3, ''), name),
                   updated_at = NOW()
-              WHERE plan_key = $3
+              WHERE plan_key = $4
               `,
-              [liveCents || null, liveDescription, plan.plan_key],
+              [liveCents || null, liveDescription, liveName, plan.plan_key],
             );
 
             return {
               ...plan,
               monthly_price_cents: liveCents || plan.monthly_price_cents,
               whmcs_description: liveDescription,
+              name: liveName || plan.name,
             };
           }),
         );

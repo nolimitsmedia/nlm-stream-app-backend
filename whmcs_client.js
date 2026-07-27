@@ -210,6 +210,13 @@ const getProductsDetails = async (pids = []) => {
 
     detailsByPid[pid] = {
       monthlyPriceCents,
+      // WHMCS's actual product name (e.g. "Essential Streaming Solution").
+      // Kept separate from our hardcoded PLAN_DEFINITIONS display name so
+      // callers can choose to trust WHMCS's real name instead — this is
+      // what fixed a real bug where our "enterprise" plan_key (mapped to
+      // WHMCS's "Premium Streaming Solution", pid 69) was displaying the
+      // hardcoded label "Enterprise" instead of "Premium".
+      name: String(product.name || "").trim(),
       // WHMCS's "Product Short Description" and "Product Description"
       // fields. I'm not 100% certain of the exact key casing WHMCS's API
       // uses for the short description (varies across versions/docs), so
