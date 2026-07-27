@@ -1107,6 +1107,16 @@ const organizationScopedRoom = (prefix, organizationId, streamKey) => {
 |--------------------------------------------------------------------------
 */
 
+// Feature values below were corrected against the business's actual
+// marketing feature-grid (confirmed with the user), which differed from
+// the numbers this array previously held on several dimensions (channels,
+// storage, bitrate were all wrong; CDN bandwidth, egress bandwidth, TV
+// channel, recording, 30-min rewind, and reduced latency weren't tracked
+// at all). These are our own internal entitlement flags — unlike price/
+// name/description, WHMCS has no concept of them, so PLAN_DEFINITIONS
+// stays the authoritative source and these ARE re-synced to the DB on
+// every restart (see the DO UPDATE SET below), unlike the WHMCS-owned
+// fields.
 const PLAN_DEFINITIONS = [
   {
     key: "starter",
@@ -1119,10 +1129,23 @@ const PLAN_DEFINITIONS = [
     // the fallback is correct even before the first successful live
     // pricing fetch.
     monthly_price_cents: 7999,
+    // Hardcoded fallback description, used until a real one is written
+    // into WHMCS's Product Short Description field and live-fetched (see
+    // the whmcs_description handling in ensureSubscriptionTables — this
+    // only backfills a NULL/empty value, never overwrites a real fetched
+    // one).
+    description:
+      "Get live in minutes with 1 channel, 250GB CDN bandwidth, and everything you need for reliable HLS streaming.",
     max_channels: 1,
     max_admins: 2,
-    max_storage_gb: 25,
-    max_bitrate_kbps: 6000,
+    max_storage_gb: 0,
+    max_cdn_bandwidth_gb: 250,
+    max_egress_bandwidth_gb: 100,
+    max_bitrate_kbps: 4000,
+    tv_channel_enabled: false,
+    recording_enabled: false,
+    rewind_enabled: false,
+    reduced_latency_enabled: false,
     transcoding_enabled: false,
     analytics_enabled: false,
     custom_domain_enabled: false,
@@ -1130,13 +1153,21 @@ const PLAN_DEFINITIONS = [
   },
   {
     key: "pro",
-    name: "Premium",
+    name: "Deluxe",
     // Matches WHMCS's Deluxe Streaming Solution price — see note above.
     monthly_price_cents: 9999,
-    max_channels: 5,
+    description:
+      "Scale up with 3 channels, TV channel delivery, recording, 30-minute rewind, and reduced-latency streaming.",
+    max_channels: 3,
     max_admins: 8,
-    max_storage_gb: 150,
-    max_bitrate_kbps: 12000,
+    max_storage_gb: 50,
+    max_cdn_bandwidth_gb: 500,
+    max_egress_bandwidth_gb: 250,
+    max_bitrate_kbps: 10000,
+    tv_channel_enabled: true,
+    recording_enabled: true,
+    rewind_enabled: true,
+    reduced_latency_enabled: true,
     transcoding_enabled: true,
     analytics_enabled: true,
     custom_domain_enabled: false,
@@ -1144,13 +1175,21 @@ const PLAN_DEFINITIONS = [
   },
   {
     key: "enterprise",
-    name: "Enterprise",
+    name: "Premium",
     // Matches WHMCS's Premium Streaming Solution price — see note above.
     monthly_price_cents: 13999,
-    max_channels: 25,
+    description:
+      "Our full-featured tier — 5 channels, 1TB CDN bandwidth, recording, rewind, reduced latency, and priority support.",
+    max_channels: 5,
     max_admins: 50,
-    max_storage_gb: 1000,
-    max_bitrate_kbps: 25000,
+    max_storage_gb: 100,
+    max_cdn_bandwidth_gb: 1000,
+    max_egress_bandwidth_gb: 350,
+    max_bitrate_kbps: 15000,
+    tv_channel_enabled: true,
+    recording_enabled: true,
+    rewind_enabled: true,
+    reduced_latency_enabled: true,
     transcoding_enabled: true,
     analytics_enabled: true,
     custom_domain_enabled: true,
@@ -1160,10 +1199,17 @@ const PLAN_DEFINITIONS = [
     key: "internal",
     name: "Internal",
     monthly_price_cents: 0,
+    description: "",
     max_channels: 999,
     max_admins: 999,
     max_storage_gb: 9999,
+    max_cdn_bandwidth_gb: 99999,
+    max_egress_bandwidth_gb: 99999,
     max_bitrate_kbps: 50000,
+    tv_channel_enabled: true,
+    recording_enabled: true,
+    rewind_enabled: true,
+    reduced_latency_enabled: true,
     transcoding_enabled: true,
     analytics_enabled: true,
     custom_domain_enabled: true,
@@ -1181,7 +1227,13 @@ const ensureSubscriptionTables = async () => {
       max_channels INTEGER DEFAULT 1,
       max_admins INTEGER DEFAULT 2,
       max_storage_gb INTEGER DEFAULT 25,
+      max_cdn_bandwidth_gb INTEGER DEFAULT 0,
+      max_egress_bandwidth_gb INTEGER DEFAULT 0,
       max_bitrate_kbps INTEGER DEFAULT 6000,
+      tv_channel_enabled BOOLEAN DEFAULT FALSE,
+      recording_enabled BOOLEAN DEFAULT FALSE,
+      rewind_enabled BOOLEAN DEFAULT FALSE,
+      reduced_latency_enabled BOOLEAN DEFAULT FALSE,
       transcoding_enabled BOOLEAN DEFAULT FALSE,
       analytics_enabled BOOLEAN DEFAULT FALSE,
       custom_domain_enabled BOOLEAN DEFAULT FALSE,
@@ -1217,7 +1269,13 @@ const ensureSubscriptionTables = async () => {
     ALTER TABLE plans
     ADD COLUMN IF NOT EXISTS stripe_price_id VARCHAR(255),
     ADD COLUMN IF NOT EXISTS whmcs_product_id VARCHAR(40),
-    ADD COLUMN IF NOT EXISTS whmcs_description TEXT
+    ADD COLUMN IF NOT EXISTS whmcs_description TEXT,
+    ADD COLUMN IF NOT EXISTS max_cdn_bandwidth_gb INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS max_egress_bandwidth_gb INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS tv_channel_enabled BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS rewind_enabled BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS reduced_latency_enabled BOOLEAN DEFAULT FALSE
   `);
 
   await pool.query(`
@@ -1278,7 +1336,13 @@ const ensureSubscriptionTables = async () => {
         max_channels,
         max_admins,
         max_storage_gb,
+        max_cdn_bandwidth_gb,
+        max_egress_bandwidth_gb,
         max_bitrate_kbps,
+        tv_channel_enabled,
+        recording_enabled,
+        rewind_enabled,
+        reduced_latency_enabled,
         transcoding_enabled,
         analytics_enabled,
         custom_domain_enabled,
@@ -1287,7 +1351,7 @@ const ensureSubscriptionTables = async () => {
         whmcs_product_id,
         is_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, TRUE)
       ON CONFLICT (plan_key)
       DO UPDATE SET
         name = EXCLUDED.name,
@@ -1295,7 +1359,13 @@ const ensureSubscriptionTables = async () => {
         max_channels = EXCLUDED.max_channels,
         max_admins = EXCLUDED.max_admins,
         max_storage_gb = EXCLUDED.max_storage_gb,
+        max_cdn_bandwidth_gb = EXCLUDED.max_cdn_bandwidth_gb,
+        max_egress_bandwidth_gb = EXCLUDED.max_egress_bandwidth_gb,
         max_bitrate_kbps = EXCLUDED.max_bitrate_kbps,
+        tv_channel_enabled = EXCLUDED.tv_channel_enabled,
+        recording_enabled = EXCLUDED.recording_enabled,
+        rewind_enabled = EXCLUDED.rewind_enabled,
+        reduced_latency_enabled = EXCLUDED.reduced_latency_enabled,
         transcoding_enabled = EXCLUDED.transcoding_enabled,
         analytics_enabled = EXCLUDED.analytics_enabled,
         custom_domain_enabled = EXCLUDED.custom_domain_enabled,
@@ -1312,7 +1382,13 @@ const ensureSubscriptionTables = async () => {
         plan.max_channels,
         plan.max_admins,
         plan.max_storage_gb,
+        plan.max_cdn_bandwidth_gb,
+        plan.max_egress_bandwidth_gb,
         plan.max_bitrate_kbps,
+        plan.tv_channel_enabled,
+        plan.recording_enabled,
+        plan.rewind_enabled,
+        plan.reduced_latency_enabled,
         plan.transcoding_enabled,
         plan.analytics_enabled,
         plan.custom_domain_enabled,
@@ -1321,6 +1397,22 @@ const ensureSubscriptionTables = async () => {
         whmcsProductId || null,
       ],
     );
+
+    // Hardcoded fallback description ("for the meantime", per user) — only
+    // fills in an empty value. Never overwrites a real description once
+    // one has been fetched live from WHMCS (see the /api/public/plans
+    // overlay), so this naturally stops mattering the moment real WHMCS
+    // copy exists.
+    if (plan.description) {
+      await pool.query(
+        `
+        UPDATE plans
+        SET whmcs_description = $1, updated_at = NOW()
+        WHERE plan_key = $2 AND (whmcs_description IS NULL OR whmcs_description = '')
+        `,
+        [plan.description, plan.key],
+      );
+    }
   }
 
   await pool.query(`
