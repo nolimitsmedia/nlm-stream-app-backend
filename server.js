@@ -8,7 +8,7 @@ const { Server } = require("socket.io");
 const { exec, spawn, execSync } = require("child_process");
 const os = require("os");
 const crypto = require("crypto");
-require("dotenv").config();
+require("dotenv").config({ override: true });
 
 const fs = require("fs");
 const path = require("path");
