@@ -2162,8 +2162,7 @@ const pollWhmcsBilling = async () => {
 const BITRATE_POLL_INTERVAL_MS = 20 * 1000;
 const BITRATE_GRACE_MULTIPLIER = 1.1; // 10% grace over the plan's cap
 const BITRATE_SUSTAINED_MS = 5 * 60 * 1000; // must stay over cap this long to count as one violation
-const BITRATE_VIOLATION_WINDOW_DAYS = 30;
-const BITRATE_ESCALATION_THRESHOLD = 3; // 3rd violation in the window triggers a kick
+const BITRATE_VIOLATION_WINDOW_DAYS = 30; // just for informational "seen N times" context now
 
 // In-memory only — tracks how long each currently-live stream has been
 // continuously over its cap. Deliberately not persisted: only a violation
@@ -2172,36 +2171,15 @@ const BITRATE_ESCALATION_THRESHOLD = 3; // 3rd violation in the window triggers 
 const bitrateOverCapTracker = new Map(); // stream_key -> { since: ms timestamp, recorded: bool }
 const unmappedStreamsLogged = new Set(); // stream_key -> already logged "no matching plan" once
 
-const kickSrsPublisher = async (streamName) => {
-  try {
-    const clientsRes = await fetch(`${SRS_API_URL}/api/v1/clients/`);
-    if (!clientsRes.ok) return false;
-    const clientsData = await clientsRes.json();
-
-    // NOTE: SRS's client-list field names for identifying the publisher of
-    // a given stream (vs. viewers) haven't been verified against a live
-    // response from this SRS instance — this checks the most likely shape,
-    // but confirm against real output if kicks don't actually happen.
-    const publisher = (clientsData.clients || []).find(
-      (c) => c.stream === streamName && (c.type === "publish" || c.publish),
-    );
-
-    if (!publisher?.id) return false;
-
-    const kickRes = await fetch(
-      `${SRS_API_URL}/api/v1/clients/${publisher.id}`,
-      { method: "DELETE" },
-    );
-    return kickRes.ok;
-  } catch (err) {
-    console.error(
-      `[BITRATE] Failed to kick publisher for ${streamName}:`,
-      err.message,
-    );
-    return false;
-  }
-};
-
+// This is now INFORMATIONAL ONLY — no kick, ever. Now that the hard cap
+// (autoCapBitrateStream) actually enforces the ceiling regardless of what
+// the source encoder pushes, there's nothing left for a raw-source
+// bitrate check to protect against: a customer literally cannot exceed
+// their plan's delivered bitrate anymore, so disconnecting them for their
+// encoder setting alone would serve no purpose — and would kill the
+// working capped transcode too, since it reads from that same raw
+// connection. This just lets them know their encoder is set higher than
+// their plan needs, so they can save their own upload bandwidth.
 const recordBitrateViolation = async ({
   organizationId,
   channelId,
@@ -2214,24 +2192,15 @@ const recordBitrateViolation = async ({
     SELECT COUNT(*)::int AS count
     FROM plan_alerts
     WHERE organization_id = $1
-      AND alert_type IN ('bitrate_warning', 'bitrate_kick')
+      AND alert_type = 'bitrate_warning'
       AND created_at > NOW() - INTERVAL '${BITRATE_VIOLATION_WINDOW_DAYS} days'
     `,
     [organizationId],
   );
 
-  const violationNumber = (priorCountResult.rows[0]?.count || 0) + 1;
-  const shouldKick = violationNumber >= BITRATE_ESCALATION_THRESHOLD;
+  const timesSeen = (priorCountResult.rows[0]?.count || 0) + 1;
 
-  let kicked = false;
-  if (shouldKick) {
-    kicked = await kickSrsPublisher(streamName);
-  }
-
-  const alertType = kicked ? "bitrate_kick" : "bitrate_warning";
-  const message = kicked
-    ? `Stream "${streamName}" was disconnected for repeatedly exceeding your plan's ${capKbps}Mbps bitrate limit (this is violation #${violationNumber} in the last ${BITRATE_VIOLATION_WINDOW_DAYS} days). Lower your encoder's bitrate or upgrade your plan.`
-    : `Stream "${streamName}" is exceeding your plan's ${Math.round(capKbps / 1000)}Mbps bitrate limit (observed ~${Math.round(observedKbps / 1000)}Mbps). Please lower your encoder's bitrate — repeated violations will result in the stream being disconnected.`;
+  const message = `Stream "${streamName}"'s encoder is set to ~${Math.round(observedKbps / 1000)}Mbps, higher than your plan's ${Math.round(capKbps / 1000)}Mbps limit. We're automatically capping the delivered stream to stay within your plan, so viewers aren't affected — but lowering your encoder's bitrate to match would save your own upload bandwidth.${timesSeen > 1 ? ` (Seen ${timesSeen} times in the last ${BITRATE_VIOLATION_WINDOW_DAYS} days.)` : ""}`;
 
   await pool.query(
     `
@@ -2239,12 +2208,11 @@ const recordBitrateViolation = async ({
       organization_id, channel_id, alert_type, message,
       observed_bitrate_kbps, plan_bitrate_kbps
     )
-    VALUES ($1, $2, $3, $4, $5, $6)
+    VALUES ($1, $2, 'bitrate_warning', $3, $4, $5)
     `,
     [
       organizationId,
       channelId || null,
-      alertType,
       message,
       Math.round(observedKbps),
       capKbps,
@@ -2252,7 +2220,7 @@ const recordBitrateViolation = async ({
   );
 
   console.log(
-    `[BITRATE] ${alertType} recorded for org ${organizationId}, stream ${streamName} (violation #${violationNumber}${kicked ? ", KICKED" : ""})`,
+    `[BITRATE] Informational notice recorded for org ${organizationId}, stream ${streamName} (seen ${timesSeen}x in ${BITRATE_VIOLATION_WINDOW_DAYS}d)`,
   );
 };
 
