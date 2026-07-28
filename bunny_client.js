@@ -156,10 +156,25 @@ const getPullZoneStatistics = async (pullZoneId, dateFrom, dateTo) => {
   return callBunnyApi("GET", `/statistics?${params.toString()}`);
 };
 
+// Total bandwidth (bytes) served by a pull zone over a date range.
+//
+// NOTE: this reads `TotalBandwidthUsed` from Bunny's /statistics response
+// based on its commonly-documented shape — not confirmed against a real
+// response from this account. If bandwidth quota checks always come back
+// as 0 despite real traffic, check a raw response from this endpoint for
+// the actual field name before assuming something else is broken.
+const getTotalBandwidthUsedBytes = async (pullZoneId, dateFrom, dateTo) => {
+  if (!pullZoneId) return 0;
+
+  const stats = await getPullZoneStatistics(pullZoneId, dateFrom, dateTo);
+  return Number(stats.TotalBandwidthUsed || 0);
+};
+
 module.exports = {
   isBunnyAccountConfigured,
   provisionBunnyZonesForOrganization,
   createPullZoneForOrganization,
   createStorageZoneForOrganization,
   getPullZoneStatistics,
+  getTotalBandwidthUsedBytes,
 };

@@ -8263,6 +8263,16 @@ const bitrateCapRetryCount = new Map();
 // the same stream logging "giving up" at both attempt 4 AND attempt 5,
 // meaning two independent chains were both writing to the same counter).
 const bitrateCapGeneration = new Map();
+// Tracks the currently-alive ffmpeg ChildProcess per stream_key. The
+// generation counter above stops a STALE retry chain from spawning a NEW
+// process, but does nothing about an OLD process that's still alive and
+// still trying to publish — confirmed via real logs showing two
+// "on_publish — app: live_capped" events back-to-back with no
+// on_unpublish between them, meaning two ffmpeg instances were both
+// actively fighting over the same output connection. Explicitly killing
+// the previous instance before starting a new one guarantees at most one
+// can ever be alive for a given stream_key at a time.
+const activeBitrateCapProcesses = new Map();
 const MAX_BITRATE_CAP_RETRIES = 3;
 
 function autoCapBitrateStream(streamKey, capKbps, generation) {
@@ -8277,6 +8287,18 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
       `[BITRATE-CAP] Skipping superseded session for ${streamKey} (a newer broadcast session has since started).`,
     );
     return;
+  }
+
+  // Explicitly kill any prior instance still alive for this stream_key
+  // before starting a new one — see the comment on
+  // activeBitrateCapProcesses above for why the generation check alone
+  // isn't sufficient to prevent two ffmpeg processes colliding.
+  const priorProcess = activeBitrateCapProcesses.get(streamKey);
+  if (priorProcess && priorProcess.exitCode === null && !priorProcess.killed) {
+    console.warn(
+      `[BITRATE-CAP] Killing still-alive prior ffmpeg instance for ${streamKey} before starting a new one.`,
+    );
+    priorProcess.kill("SIGKILL");
   }
 
   if (isServerLoadTooHighForNewTranscode()) {
@@ -8331,6 +8353,7 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
   ];
 
   const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
+  activeBitrateCapProcesses.set(streamKey, ffmpegProcess);
 
   // Keep only a bounded tail of stderr for diagnostics on failure —
   // deliberately self-limited (unlike exec()'s buffer, this is just for
@@ -8349,6 +8372,13 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
   });
 
   ffmpegProcess.on("exit", async (code, signal) => {
+    // Only clear the tracking entry if THIS process is still the one
+    // recorded — if a newer spawn already overwrote it, leave that one
+    // alone.
+    if (activeBitrateCapProcesses.get(streamKey) === ffmpegProcess) {
+      activeBitrateCapProcesses.delete(streamKey);
+    }
+
     if (code === 0 || code === null) return; // clean exit (e.g. source ended normally) — nothing to retry
 
     // If a newer session has started since THIS process was spawned,
