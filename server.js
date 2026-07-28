@@ -8179,6 +8179,15 @@ const getOrgMaxBitrateKbps = async (organizationId) => {
   return Number(result.rows[0]?.max_bitrate_kbps || 0);
 };
 
+// Retry bookkeeping for the bitrate-cap transcode — keyed by stream_key,
+// reset whenever a fresh on_publish starts a new broadcast session (see
+// the on_publish handler). Caps retries so a persistently-broken
+// encode (e.g. an incompatible source format) doesn't loop forever
+// burning CPU — after MAX_BITRATE_CAP_RETRIES, the stream just stays on
+// the uncapped fallback for the rest of that session.
+const bitrateCapRetryCount = new Map();
+const MAX_BITRATE_CAP_RETRIES = 3;
+
 function autoCapBitrateStream(streamKey, capKbps) {
   if (!capKbps) return;
 
@@ -8198,9 +8207,53 @@ function autoCapBitrateStream(streamKey, capKbps) {
 
   const cmd = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v ${capKbps}k -maxrate ${capKbps}k -bufsize ${capKbps * 2}k -c:a aac -b:a 128k -f flv "${output}"`;
 
-  exec(cmd, (err) => {
-    if (err)
-      console.error(`[BITRATE-CAP] Error for ${streamKey}:`, err.message);
+  exec(cmd, async (err, stdout, stderr) => {
+    if (!err) return; // clean exit (e.g. source ended normally) — nothing to retry
+
+    // Log the actual ffmpeg error detail, not just the generic "Command
+    // failed" message — this is what's needed to diagnose WHY it crashed
+    // in the first place (a truncated pm2 log tail can miss this).
+    const stderrTail = String(stderr || "")
+      .trim()
+      .split("\n")
+      .slice(-15)
+      .join("\n");
+    console.error(
+      `[BITRATE-CAP] Error for ${streamKey}: ${err.message}\n--- ffmpeg stderr (last 15 lines) ---\n${stderrTail}`,
+    );
+
+    // Only retry if the raw source is STILL actually live — if the
+    // broadcaster simply stopped streaming, this exit is expected and
+    // on_unpublish already handles cleanup; retrying would just spawn a
+    // pointless transcode with no input.
+    try {
+      const liveCheck = await pool.query(
+        `SELECT is_live FROM channels WHERE stream_key = $1`,
+        [streamKey],
+      );
+
+      if (!liveCheck.rows[0]?.is_live) return;
+
+      const attempts = (bitrateCapRetryCount.get(streamKey) || 0) + 1;
+      bitrateCapRetryCount.set(streamKey, attempts);
+
+      if (attempts > MAX_BITRATE_CAP_RETRIES) {
+        console.error(
+          `[BITRATE-CAP] Giving up on ${streamKey} after ${attempts} failed attempts — it will stay on the uncapped fallback for the rest of this broadcast.`,
+        );
+        return;
+      }
+
+      console.warn(
+        `[BITRATE-CAP] Transcode ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_BITRATE_CAP_RETRIES}) for ${streamKey}`,
+      );
+      setTimeout(() => autoCapBitrateStream(streamKey, capKbps), 3000);
+    } catch (checkErr) {
+      console.error(
+        `[BITRATE-CAP] Failed to check live status for retry decision on ${streamKey}:`,
+        checkErr.message,
+      );
+    }
   });
 }
 
@@ -8993,6 +9046,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
     getOrgMaxBitrateKbps(channel.org_id)
       .then((capKbps) => {
         if (capKbps) {
+          bitrateCapRetryCount.delete(streamKey); // fresh session, fresh retry budget
           setTimeout(() => autoCapBitrateStream(streamKey, capKbps), 3000);
         }
       })
