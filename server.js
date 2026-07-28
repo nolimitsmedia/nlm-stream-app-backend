@@ -8253,10 +8253,31 @@ const getOrgMaxBitrateKbps = async (organizationId) => {
 // burning CPU — after MAX_BITRATE_CAP_RETRIES, the stream just stays on
 // the uncapped fallback for the rest of that session.
 const bitrateCapRetryCount = new Map();
+// Tracks which "broadcast session" is current for a given stream_key. A
+// fresh on_publish bumps this; any retry chain from a PRIOR session
+// checks this before acting and abandons itself if superseded. Without
+// this, a brief encoder reconnect (a new on_publish) while an old failed
+// transcode's retry chain is still in-flight would let both chains spawn
+// ffmpeg processes publishing to the same live_capped/{streamKey} name
+// concurrently — a real race that was actually happening (evidenced by
+// the same stream logging "giving up" at both attempt 4 AND attempt 5,
+// meaning two independent chains were both writing to the same counter).
+const bitrateCapGeneration = new Map();
 const MAX_BITRATE_CAP_RETRIES = 3;
 
-function autoCapBitrateStream(streamKey, capKbps) {
+function autoCapBitrateStream(streamKey, capKbps, generation) {
   if (!capKbps) return;
+
+  // If a newer broadcast session has since started for this stream_key
+  // (a fresh on_publish bumped the generation), this call belongs to a
+  // stale, already-superseded session — abandon it rather than risk two
+  // concurrent ffmpeg processes racing to publish the same output name.
+  if (bitrateCapGeneration.get(streamKey) !== generation) {
+    console.log(
+      `[BITRATE-CAP] Skipping superseded session for ${streamKey} (a newer broadcast session has since started).`,
+    );
+    return;
+  }
 
   if (isServerLoadTooHighForNewTranscode()) {
     console.warn(
@@ -8330,6 +8351,11 @@ function autoCapBitrateStream(streamKey, capKbps) {
   ffmpegProcess.on("exit", async (code, signal) => {
     if (code === 0 || code === null) return; // clean exit (e.g. source ended normally) — nothing to retry
 
+    // If a newer session has started since THIS process was spawned,
+    // stay quiet — this exit is expected (superseded), not a real
+    // failure worth logging or retrying over.
+    if (bitrateCapGeneration.get(streamKey) !== generation) return;
+
     console.error(
       `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- ffmpeg stderr (last ~4000 chars) ---\n${stderrTail}`,
     );
@@ -8359,7 +8385,10 @@ function autoCapBitrateStream(streamKey, capKbps) {
       console.warn(
         `[BITRATE-CAP] Transcode ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_BITRATE_CAP_RETRIES}) for ${streamKey}`,
       );
-      setTimeout(() => autoCapBitrateStream(streamKey, capKbps), 3000);
+      setTimeout(
+        () => autoCapBitrateStream(streamKey, capKbps, generation),
+        5000,
+      );
     } catch (checkErr) {
       console.error(
         `[BITRATE-CAP] Failed to check live status for retry decision on ${streamKey}:`,
@@ -9158,8 +9187,18 @@ app.post("/api/srs/on_publish", async (req, res) => {
     getOrgMaxBitrateKbps(channel.org_id)
       .then((capKbps) => {
         if (capKbps) {
+          // New broadcast session — bump the generation so any OLD retry
+          // chain still in-flight for this stream_key (e.g. from a brief
+          // encoder reconnect blip) recognizes it's been superseded and
+          // abandons itself, instead of racing this new attempt to
+          // publish to the same live_capped/{streamKey} name.
+          const generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
+          bitrateCapGeneration.set(streamKey, generation);
           bitrateCapRetryCount.delete(streamKey); // fresh session, fresh retry budget
-          setTimeout(() => autoCapBitrateStream(streamKey, capKbps), 3000);
+          setTimeout(
+            () => autoCapBitrateStream(streamKey, capKbps, generation),
+            3000,
+          );
         }
       })
       .catch((err) =>
