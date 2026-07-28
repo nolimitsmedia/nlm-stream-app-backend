@@ -8107,6 +8107,35 @@ async function getActiveLiveCount(organizationId) {
 }
 
 // ── Helper: auto-transcode using FFmpeg ───────────────────────────
+// Same exec()-to-spawn() fix as autoCapBitrateStream below applies here
+// too — exec() buffers all output in memory and kills the process once
+// that buffer fills, which any long-running ffmpeg process will
+// eventually hit. This pre-existed the bitrate-cap work but shares the
+// identical flaw, so it's fixed here at the same time.
+const spawnFfmpegVariant = (label, streamKey, args) => {
+  const proc = spawn("ffmpeg", args);
+  let stderrTail = "";
+
+  proc.stderr.on("data", (chunk) => {
+    stderrTail += chunk.toString();
+    if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+  });
+
+  proc.on("error", (err) => {
+    console.error(
+      `[Transcode] ${label} failed to spawn for ${streamKey}:`,
+      err.message,
+    );
+  });
+
+  proc.on("exit", (code, signal) => {
+    if (code === 0 || code === null) return;
+    console.error(
+      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- stderr tail ---\n${stderrTail}`,
+    );
+  });
+};
+
 function autoTranscodeStream(streamKey) {
   const input = `rtmp://localhost/live/${streamKey}`;
   const out720 = `rtmp://localhost/live/${streamKey}_720p`;
@@ -8114,17 +8143,55 @@ function autoTranscodeStream(streamKey) {
 
   console.log(`[Transcode] Starting 720p + 480p for: ${streamKey}`);
 
-  const cmd720 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 2500k -s 1280x720 -c:a aac -b:a 128k -f flv "${out720}"`;
-  const cmd480 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 1200k -s 854x480 -c:a aac -b:a 96k -f flv "${out480}"`;
+  spawnFfmpegVariant("720p", streamKey, [
+    "-y",
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-b:v",
+    "2500k",
+    "-s",
+    "1280x720",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-f",
+    "flv",
+    out720,
+  ]);
 
-  exec(cmd720, (err) => {
-    if (err)
-      console.error(`[Transcode] 720p error for ${streamKey}:`, err.message);
-  });
-  exec(cmd480, (err) => {
-    if (err)
-      console.error(`[Transcode] 480p error for ${streamKey}:`, err.message);
-  });
+  spawnFfmpegVariant("480p", streamKey, [
+    "-y",
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-b:v",
+    "1200k",
+    "-s",
+    "854x480",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "96k",
+    "-f",
+    "flv",
+    out480,
+  ]);
 }
 
 // ══════════════════════════════════════════
@@ -8205,21 +8272,66 @@ function autoCapBitrateStream(streamKey, capKbps) {
     `[BITRATE-CAP] Starting hard cap at ${capKbps}kbps for: ${streamKey}`,
   );
 
-  const cmd = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v ${capKbps}k -maxrate ${capKbps}k -bufsize ${capKbps * 2}k -c:a aac -b:a 128k -f flv "${output}"`;
+  // Using spawn() here, NOT exec() — this is the actual root cause of the
+  // "Conversion failed!" crashes: exec() buffers all stdout/stderr in
+  // memory and KILLS the child process once that buffer fills (~1MB by
+  // default) — fine for a short command, fatal for ffmpeg, which prints a
+  // continuous stream of progress lines for as long as it runs. Any real
+  // (non-trivial-length) broadcast would eventually hit that limit and
+  // get silently killed. spawn() streams output instead of buffering it,
+  // so there's no such limit — confirmed via a manual run on the server
+  // that this exact ffmpeg command encodes correctly on its own; the bug
+  // was purely in how Node was invoking it, not the command itself.
+  const ffmpegArgs = [
+    "-y",
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-b:v",
+    `${capKbps}k`,
+    "-maxrate",
+    `${capKbps}k`,
+    "-bufsize",
+    `${capKbps * 2}k`,
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-f",
+    "flv",
+    output,
+  ];
 
-  exec(cmd, async (err, stdout, stderr) => {
-    if (!err) return; // clean exit (e.g. source ended normally) — nothing to retry
+  const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
 
-    // Log the actual ffmpeg error detail, not just the generic "Command
-    // failed" message — this is what's needed to diagnose WHY it crashed
-    // in the first place (a truncated pm2 log tail can miss this).
-    const stderrTail = String(stderr || "")
-      .trim()
-      .split("\n")
-      .slice(-15)
-      .join("\n");
+  // Keep only a bounded tail of stderr for diagnostics on failure —
+  // deliberately self-limited (unlike exec()'s buffer, this is just for
+  // our own logging, not something that can kill the process).
+  let stderrTail = "";
+  ffmpegProcess.stderr.on("data", (chunk) => {
+    stderrTail += chunk.toString();
+    if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+  });
+
+  ffmpegProcess.on("error", (err) => {
     console.error(
-      `[BITRATE-CAP] Error for ${streamKey}: ${err.message}\n--- ffmpeg stderr (last 15 lines) ---\n${stderrTail}`,
+      `[BITRATE-CAP] Failed to spawn ffmpeg for ${streamKey}:`,
+      err.message,
+    );
+  });
+
+  ffmpegProcess.on("exit", async (code, signal) => {
+    if (code === 0 || code === null) return; // clean exit (e.g. source ended normally) — nothing to retry
+
+    console.error(
+      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- ffmpeg stderr (last ~4000 chars) ---\n${stderrTail}`,
     );
 
     // Only retry if the raw source is STILL actually live — if the
