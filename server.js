@@ -52,6 +52,11 @@ const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
 const RECORDINGS_ROOT = process.env.RECORDINGS_ROOT || "C:/nlm-srs/recordings";
 const RECORDINGS_LIVE_ROOT = path.join(RECORDINGS_ROOT, "live");
+// Where DVR writes the bitrate-capped transcode's recordings (see
+// autoCapBitrateStream) — this is now the OFFICIAL source for archived
+// recordings, since it reflects what viewers actually watched (the
+// enforced/capped bitrate), not whatever the raw encoder pushed.
+const RECORDINGS_LIVE_CAPPED_ROOT = path.join(RECORDINGS_ROOT, "live_capped");
 const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
 const BUNNY_STORAGE_HOSTNAME = process.env.BUNNY_STORAGE_HOSTNAME || "";
 const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
@@ -2257,7 +2262,19 @@ const pollBitrateCompliance = async () => {
     if (!response.ok) return;
 
     const data = await response.json();
-    const activeStreams = (data.streams || []).filter((s) => s.publish?.active);
+    const activeStreams = (data.streams || []).filter((s) => {
+      if (!s.publish?.active) return false;
+      // Only check the raw ingest app — live_capped (the new hard-cap
+      // transcode output) and the existing _720p/_480p ABR variants all
+      // re-publish under the same base stream name and would otherwise
+      // be double-counted or confuse which bitrate is "real". NOTE: the
+      // exact field SRS uses for app name in this response (`s.app`)
+      // isn't confirmed against a live payload — if this ever silently
+      // stops catching real streams, check the actual field name here.
+      if (s.app && s.app !== "live") return false;
+      if (s.name?.endsWith("_720p") || s.name?.endsWith("_480p")) return false;
+      return true;
+    });
 
     if (!activeStreams.length) {
       bitrateOverCapTracker.clear();
@@ -8142,6 +8159,83 @@ function autoTranscodeStream(streamKey) {
   });
 }
 
+// ══════════════════════════════════════════
+// BITRATE HARD CAP (real-time transcoding)
+// Chosen over the softer "monitor and warn" approach — every stream gets
+// forcibly re-encoded down to its plan's exact bitrate ceiling, published
+// back into SRS as a second stream under the "live_capped" app. Viewers
+// are served this capped copy (see the /api/hls/ proxy above, which tries
+// live_capped first and falls back to raw live/ if no cap is running).
+//
+// Deliberately does NOT track/kill the spawned ffmpeg process explicitly:
+// like the existing 720p/480p auto-transcode above, ffmpeg reading from
+// a live RTMP source exits on its own once that source disconnects
+// (on_unpublish), so no separate process-lifecycle management is needed.
+//
+// SAFETY FALLBACK: before spawning a new transcode, checks current server
+// load. If the server is already heavily loaded (many concurrent
+// transcodes), skips capping for this NEW stream rather than adding more
+// load on top of an already-strained server — that stream is served
+// uncapped (raw) instead of failing to start at all. This check only runs
+// at stream-start; it does not kill already-running transcodes if load
+// spikes afterward, since forcibly interrupting an active broadcast to
+// relieve load is a worse failure mode than not capping one stream.
+const MAX_LOAD_PER_CORE_FOR_NEW_TRANSCODE = 0.85;
+
+const isServerLoadTooHighForNewTranscode = () => {
+  const oneMinuteLoad = os.loadavg()[0];
+  const coreCount = os.cpus().length || 1;
+  const loadPerCore = oneMinuteLoad / coreCount;
+
+  return loadPerCore > MAX_LOAD_PER_CORE_FOR_NEW_TRANSCODE;
+};
+
+// Reliable max-bitrate lookup — deliberately NOT reusing
+// getOrgStreamingPlan() above, since that queries a `subscription_plans`
+// table that's separate from the `plans` table used everywhere else in
+// this integration, and isn't confirmed to be kept in sync. Uses the same
+// LEFT JOIN + COALESCE fallback already proven correct in the bitrate
+// compliance monitor.
+const getOrgMaxBitrateKbps = async (organizationId) => {
+  const result = await pool.query(
+    `
+    SELECT p.max_bitrate_kbps
+    FROM organizations o
+    LEFT JOIN subscriptions s ON s.organization_id = o.id
+    JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
+    WHERE o.id = $1
+    `,
+    [organizationId],
+  );
+
+  return Number(result.rows[0]?.max_bitrate_kbps || 0);
+};
+
+function autoCapBitrateStream(streamKey, capKbps) {
+  if (!capKbps) return;
+
+  if (isServerLoadTooHighForNewTranscode()) {
+    console.warn(
+      `[BITRATE-CAP] Server load too high — skipping cap for ${streamKey}, serving uncapped raw stream instead.`,
+    );
+    return;
+  }
+
+  const input = `rtmp://localhost/live/${streamKey}`;
+  const output = `rtmp://localhost/live_capped/${streamKey}`;
+
+  console.log(
+    `[BITRATE-CAP] Starting hard cap at ${capKbps}kbps for: ${streamKey}`,
+  );
+
+  const cmd = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v ${capKbps}k -maxrate ${capKbps}k -bufsize ${capKbps * 2}k -c:a aac -b:a 128k -f flv "${output}"`;
+
+  exec(cmd, (err) => {
+    if (err)
+      console.error(`[BITRATE-CAP] Error for ${streamKey}:`, err.message);
+  });
+}
+
 // ── Helper: auto-sync recordings after stream ends ────────────────
 // ══════════════════════════════════════════
 // BUNNY STORAGE ARCHIVAL
@@ -8337,27 +8431,30 @@ const archiveReadyRecordingsForOrganization = async (organizationId) => {
 const cleanupUnrecordedFilesForOrganization = async (organizationId) => {
   try {
     const allowedChannels = await getAllowedChannelMap(organizationId);
-    if (!fs.existsSync(RECORDINGS_LIVE_ROOT)) return;
 
-    for (const streamName of allowedChannels.keys()) {
-      const streamFolder = path.join(RECORDINGS_LIVE_ROOT, streamName);
-      if (
-        !fs.existsSync(streamFolder) ||
-        !fs.statSync(streamFolder).isDirectory()
-      ) {
-        continue;
-      }
+    for (const root of [RECORDINGS_LIVE_ROOT, RECORDINGS_LIVE_CAPPED_ROOT]) {
+      if (!fs.existsSync(root)) continue;
 
-      for (const file of fs.readdirSync(streamFolder)) {
-        if (file.endsWith(".tmp") || file.endsWith(".part")) continue; // still being written
-        const filePath = path.join(streamFolder, file);
-        try {
-          if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
-        } catch (fileErr) {
-          console.error(
-            `[RECORDING-GATE] Failed to remove ${filePath}:`,
-            fileErr.message,
-          );
+      for (const streamName of allowedChannels.keys()) {
+        const streamFolder = path.join(root, streamName);
+        if (
+          !fs.existsSync(streamFolder) ||
+          !fs.statSync(streamFolder).isDirectory()
+        ) {
+          continue;
+        }
+
+        for (const file of fs.readdirSync(streamFolder)) {
+          if (file.endsWith(".tmp") || file.endsWith(".part")) continue; // still being written
+          const filePath = path.join(streamFolder, file);
+          try {
+            if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
+          } catch (fileErr) {
+            console.error(
+              `[RECORDING-GATE] Failed to remove ${filePath}:`,
+              fileErr.message,
+            );
+          }
         }
       }
     }
@@ -8416,6 +8513,171 @@ const checkStorageQuota = async (organizationId, summary) => {
   );
 };
 
+// ══════════════════════════════════════════
+// BANDWIDTH QUOTA MONITOR (CDN + egress)
+// Only meaningful for orgs with their own dedicated Bunny zones (see
+// per-org zone provisioning) — Bunny's statistics are per-zone, so a
+// grandfathered org sharing the platform zone can't be measured
+// individually at all. Runs on a slow interval (bandwidth is a monthly
+// quota, not a real-time concern like bitrate), checking usage since the
+// start of the current calendar month.
+//
+// Same non-destructive philosophy as storage: WARNS only. Unlike
+// storage, bandwidth already delivered can't be undone, and the only
+// real "hard" enforcement option (disabling the pull zone) would take a
+// church's public watch page and replay library offline entirely until
+// next month or an upgrade — a much harsher action than anything else
+// built so far. Not doing that without an explicit decision to.
+// ══════════════════════════════════════════
+const BANDWIDTH_POLL_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6 hours
+const BANDWIDTH_ALERT_COOLDOWN_HOURS = 24;
+
+const checkBandwidthQuotaForZone = async ({
+  organizationId,
+  pullZoneId,
+  usedBytes,
+  maxGb,
+  alertType,
+  label,
+}) => {
+  const maxBytes = Number(maxGb || 0) * 1024 ** 3;
+  if (!pullZoneId || !maxBytes || usedBytes <= maxBytes) return;
+
+  const recentAlert = await pool.query(
+    `
+    SELECT 1 FROM plan_alerts
+    WHERE organization_id = $1
+      AND alert_type = $2
+      AND created_at > NOW() - INTERVAL '${BANDWIDTH_ALERT_COOLDOWN_HOURS} hours'
+    LIMIT 1
+    `,
+    [organizationId, alertType],
+  );
+
+  if (recentAlert.rows[0]) return;
+
+  const usedGb = (usedBytes / 1024 ** 3).toFixed(1);
+
+  await pool.query(
+    `INSERT INTO plan_alerts (organization_id, alert_type, message) VALUES ($1, $2, $3)`,
+    [
+      organizationId,
+      alertType,
+      `You've used ${usedGb}GB of your plan's ${maxGb}GB monthly ${label} limit. This resets at the start of next month, or upgrade your plan for a higher limit.`,
+    ],
+  );
+
+  console.log(
+    `[BANDWIDTH] ${label} quota warning recorded for org ${organizationId} (${usedGb}GB / ${maxGb}GB)`,
+  );
+};
+
+const pollBandwidthCompliance = async () => {
+  if (!bunny.isBunnyAccountConfigured()) return;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT o.id AS organization_id, o.bunny_pull_zone_id,
+             o.bunny_recordings_pull_zone_id,
+             p.max_cdn_bandwidth_gb, p.max_egress_bandwidth_gb
+      FROM organizations o
+      JOIN subscriptions s ON s.organization_id = o.id
+      JOIN plans p ON p.plan_key = s.plan_key
+      WHERE o.bunny_pull_zone_id IS NOT NULL
+      `,
+    );
+
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    for (const org of result.rows) {
+      try {
+        if (org.bunny_pull_zone_id) {
+          const cdnBytes = await bunny.getTotalBandwidthUsedBytes(
+            org.bunny_pull_zone_id,
+            monthStart,
+            now,
+          );
+          await checkBandwidthQuotaForZone({
+            organizationId: org.organization_id,
+            pullZoneId: org.bunny_pull_zone_id,
+            usedBytes: cdnBytes,
+            maxGb: org.max_cdn_bandwidth_gb,
+            alertType: "cdn_bandwidth_warning",
+            label: "CDN bandwidth",
+          });
+        }
+
+        if (org.bunny_recordings_pull_zone_id) {
+          const egressBytes = await bunny.getTotalBandwidthUsedBytes(
+            org.bunny_recordings_pull_zone_id,
+            monthStart,
+            now,
+          );
+          await checkBandwidthQuotaForZone({
+            organizationId: org.organization_id,
+            pullZoneId: org.bunny_recordings_pull_zone_id,
+            usedBytes: egressBytes,
+            maxGb: org.max_egress_bandwidth_gb,
+            alertType: "egress_bandwidth_warning",
+            label: "recording egress bandwidth",
+          });
+        }
+      } catch (orgErr) {
+        console.error(
+          `[BANDWIDTH] Check failed for org ${org.organization_id}:`,
+          orgErr.message,
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[BANDWIDTH] Compliance poll failed:", err.message);
+  }
+};
+
+// Cleans up just the raw (uncapped) DVR output for an org's channels —
+// used both for orgs without recording_enabled (cleanupUnrecordedFilesForOrganization
+// cleans both roots) and for orgs WITH recording enabled, where the raw
+// copy still gets written by SRS's DVR (it fires for both the "live" and
+// "live_capped" apps) but is never archived — only the capped copy is.
+// Left uncleaned, raw DVR output would otherwise accumulate disk forever
+// with no purpose.
+const cleanupRawDvrFiles = async (organizationId) => {
+  try {
+    const allowedChannels = await getAllowedChannelMap(organizationId);
+    if (!fs.existsSync(RECORDINGS_LIVE_ROOT)) return;
+
+    for (const streamName of allowedChannels.keys()) {
+      const streamFolder = path.join(RECORDINGS_LIVE_ROOT, streamName);
+      if (
+        !fs.existsSync(streamFolder) ||
+        !fs.statSync(streamFolder).isDirectory()
+      ) {
+        continue;
+      }
+
+      for (const file of fs.readdirSync(streamFolder)) {
+        if (file.endsWith(".tmp") || file.endsWith(".part")) continue;
+        const filePath = path.join(streamFolder, file);
+        try {
+          if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
+        } catch (fileErr) {
+          console.error(
+            `[RAW-DVR-CLEANUP] Failed to remove ${filePath}:`,
+            fileErr.message,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[RAW-DVR-CLEANUP] Failed for org ${organizationId}:`,
+      err.message,
+    );
+  }
+};
+
 async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
   setTimeout(async () => {
     try {
@@ -8436,6 +8698,10 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
 
       // Archive newly-ready recordings to Bunny Storage (if configured)
       await archiveReadyRecordingsForOrganization(organizationId);
+
+      // Raw (uncapped) DVR output is never archived — only the capped
+      // copy is — so clean it up here to avoid it silently filling disk.
+      await cleanupRawDvrFiles(organizationId);
 
       // Storage quota check — re-fetch the summary so used_storage_bytes
       // reflects the recording we just archived. Deliberately a WARNING
@@ -8503,42 +8769,63 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
     const cacheKey = `${streamKey}${qs}`;
     const cached = manifestCache.get(cacheKey);
+    let resolvedApp;
 
     if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
+      resolvedApp = cached.resolvedApp;
     } else {
-      const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${streamKey}.m3u8${qs}`;
+      // Try the bitrate-capped transcode output first — see
+      // autoCapBitrateStream. If it's not running (server load was too
+      // high when the stream started, ffmpeg crashed, or capping simply
+      // isn't configured for this org's plan), fall back to the raw
+      // ingest so the stream stays watchable either way.
+      const candidateApps = ["live_capped", "live"];
+      let upstream = null;
+      let upstreamUrl = null;
 
-      console.log("[HLS REQUEST]", upstreamUrl);
+      for (const app of candidateApps) {
+        const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
 
-      const upstream = await fetch(upstreamUrl, {
-        signal: AbortSignal.timeout(20000),
-        redirect: "follow",
-        headers: {
-          "ngrok-skip-browser-warning": "1",
-          "User-Agent": "NLM-Streaming-Backend/1.0",
-          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-        },
-      });
+        try {
+          const candidateResponse = await fetch(candidateUrl, {
+            signal: AbortSignal.timeout(20000),
+            redirect: "follow",
+            headers: {
+              "ngrok-skip-browser-warning": "1",
+              "User-Agent": "NLM-Streaming-Backend/1.0",
+              Accept:
+                "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+            },
+          });
+
+          if (candidateResponse.ok) {
+            upstream = candidateResponse;
+            upstreamUrl = candidateUrl;
+            resolvedApp = app;
+            break;
+          }
+        } catch {
+          // try the next candidate app
+        }
+      }
+
+      console.log("[HLS REQUEST]", { streamKey, resolvedApp, upstreamUrl });
+
+      if (!upstream) {
+        console.error("[HLS UPSTREAM ERROR]", {
+          streamKey,
+          triedApps: candidateApps,
+        });
+
+        return res.status(502).send("HLS unavailable");
+      }
 
       console.log("[HLS RESPONSE]", {
         status: upstream.status,
         contentType: upstream.headers.get("content-type"),
         finalUrl: upstream.url,
       });
-
-      if (!upstream.ok) {
-        const errorText = await upstream.text();
-
-        console.error("[HLS UPSTREAM ERROR]", {
-          status: upstream.status,
-          url: upstreamUrl,
-          finalUrl: upstream.url,
-          response: errorText.substring(0, 500),
-        });
-
-        return res.status(502).send("HLS unavailable");
-      }
 
       text = await upstream.text();
 
@@ -8550,6 +8837,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       manifestCache.set(cacheKey, {
         text,
+        resolvedApp,
         cachedAt: Date.now(),
       });
     }
@@ -8576,7 +8864,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         if (pathPart.endsWith(".ts")) {
           const segmentName = pathPart.split("/").pop();
 
-          return `/api/hls/seg/${encodeURIComponent(
+          return `/api/hls/seg/${encodeURIComponent(resolvedApp)}/${encodeURIComponent(
             streamKey,
           )}/${encodeURIComponent(segmentName)}${suffix}`;
         }
@@ -8610,13 +8898,14 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   }
 });
 
-app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
-  const { segment } = req.params;
+app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
+  const { app, segment } = req.params;
   const qs = req.originalUrl.includes("?")
     ? "?" + req.originalUrl.split("?")[1]
     : "";
 
-  const cached = segmentCache.get(segment);
+  const cacheKey = `${app}/${segment}`;
+  const cached = segmentCache.get(cacheKey);
   if (cached) {
     res.setHeader("Content-Type", cached.contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -8626,7 +8915,7 @@ app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
   }
 
   try {
-    const upstream = await fetch(`${SRS_HLS_ORIGIN}/live/${segment}${qs}`, {
+    const upstream = await fetch(`${SRS_HLS_ORIGIN}/${app}/${segment}${qs}`, {
       signal: AbortSignal.timeout(10000),
     });
     if (!upstream.ok)
@@ -8637,7 +8926,7 @@ app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=30");
     res.setHeader("X-Segment-Cache", "MISS");
     const buffer = Buffer.from(await upstream.arrayBuffer());
-    segmentCache.set(segment, {
+    segmentCache.set(cacheKey, {
       buffer,
       contentType,
       cachedAt: Date.now(),
@@ -8655,10 +8944,23 @@ app.get("/api/hls/seg/:streamKey/:segment", async (req, res) => {
 // ══════════════════════════════════════════
 app.post("/api/srs/on_publish", async (req, res) => {
   const streamKey = req.body?.stream || req.body?.name || "";
-  console.log(`[SRS] on_publish — stream key: ${streamKey}`);
+  const publishApp = req.body?.app || "";
+  console.log(
+    `[SRS] on_publish — app: ${publishApp}, stream key: ${streamKey}`,
+  );
 
-  // Skip transcoded variant streams (they re-publish to SRS too)
-  if (streamKey.endsWith("_720p") || streamKey.endsWith("_480p")) {
+  // Skip transcoded variant streams (they re-publish to SRS too) — this
+  // includes the existing _720p/_480p ABR variants AND our own
+  // bitrate-capping transcode's republish into the live_capped app. Both
+  // are internal re-publishes of an already-validated stream, not a new
+  // broadcaster connecting — running the full validation/capping logic
+  // again here would at best be redundant and at worst spawn a duplicate
+  // (or recursive) transcode of an already-capped stream.
+  if (
+    streamKey.endsWith("_720p") ||
+    streamKey.endsWith("_480p") ||
+    publishApp === "live_capped"
+  ) {
     return res.json({ code: 0 });
   }
 
@@ -8716,6 +9018,23 @@ app.post("/api/srs/on_publish", async (req, res) => {
       setTimeout(() => autoTranscodeStream(streamKey), 3000);
     }
 
+    // 4b. Hard bitrate cap — spawns a transcode that forces this stream's
+    // output down to the org's plan bitrate ceiling, regardless of what
+    // the source encoder pushes. Same startup delay as the ABR transcode
+    // above, for the same reason (let the raw stream stabilize first).
+    getOrgMaxBitrateKbps(channel.org_id)
+      .then((capKbps) => {
+        if (capKbps) {
+          setTimeout(() => autoCapBitrateStream(streamKey, capKbps), 3000);
+        }
+      })
+      .catch((err) =>
+        console.error(
+          `[BITRATE-CAP] Failed to look up bitrate cap for org ${channel.org_id}:`,
+          err.message,
+        ),
+      );
+
     // 5. Notify all connected dashboard clients via socket
     if (io) {
       io.emit("stream:live", {
@@ -8741,9 +9060,16 @@ app.post("/api/srs/on_publish", async (req, res) => {
 // ══════════════════════════════════════════
 app.post("/api/srs/on_unpublish", async (req, res) => {
   const streamKey = req.body?.stream || req.body?.name || "";
-  console.log(`[SRS] on_unpublish — stream key: ${streamKey}`);
+  const publishApp = req.body?.app || "";
+  console.log(
+    `[SRS] on_unpublish — app: ${publishApp}, stream key: ${streamKey}`,
+  );
 
-  if (streamKey.endsWith("_720p") || streamKey.endsWith("_480p")) {
+  if (
+    streamKey.endsWith("_720p") ||
+    streamKey.endsWith("_480p") ||
+    publishApp === "live_capped"
+  ) {
     return res.json({ code: 0 });
   }
 
@@ -10189,7 +10515,7 @@ const getRecordingAbsolutePath = (streamKey, fileName) => {
 
   if (!cleanStream || !cleanFile) return null;
 
-  const basePath = path.resolve(RECORDINGS_LIVE_ROOT);
+  const basePath = path.resolve(RECORDINGS_LIVE_CAPPED_ROOT);
   const filePath = path.resolve(basePath, cleanStream, cleanFile);
 
   if (!filePath.startsWith(basePath)) return null;
@@ -10722,7 +11048,7 @@ const scanRecordingFilesForOrganization = async (
   organizationId,
   { processReady = false } = {},
 ) => {
-  const recordingsPath = RECORDINGS_LIVE_ROOT;
+  const recordingsPath = RECORDINGS_LIVE_CAPPED_ROOT;
   const allowedChannels = await getAllowedChannelMap(organizationId);
   const recordings = [];
 
@@ -14530,6 +14856,13 @@ app.delete(
 
     // Bitrate compliance monitor — see pollBitrateCompliance() above.
     setInterval(pollBitrateCompliance, BITRATE_POLL_INTERVAL_MS);
+
+    // Bandwidth quota monitor — see pollBandwidthCompliance() above. Runs
+    // once immediately, then on its slower interval.
+    if (bunny.isBunnyAccountConfigured()) {
+      pollBandwidthCompliance();
+      setInterval(pollBandwidthCompliance, BANDWIDTH_POLL_INTERVAL_MS);
+    }
 
     // Proactively refresh YouTube access tokens before they expire (~1hr
     // lifetime), so a scheduled/automated go-live never fails mid-stream
