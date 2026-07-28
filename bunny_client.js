@@ -1,0 +1,147 @@
+// server/bunny_client.js
+//
+// Wraps Bunny.net's Core/Account API (api.bunny.net) — this is DIFFERENT
+// from the existing shared-zone Storage API usage elsewhere in the app
+// (which uses a single Storage Zone's own password to upload/download
+// files). This module uses the account-level API key to CREATE new zones
+// and pull account-wide statistics — capabilities the storage zone
+// password cannot do.
+//
+// Built for the "separate Bunny pull+storage zone per organization"
+// architecture decided in chat, so per-org CDN/egress bandwidth can
+// eventually be measured via Bunny's per-zone statistics instead of one
+// shared platform-wide total. Existing organizations are grandfathered
+// onto the original shared zones (BUNNY_STORAGE_ZONE/HOSTNAME/API_KEY env
+// vars, used elsewhere in server.js) — only NEW organizations get their
+// own dedicated zones via this module.
+
+const BUNNY_API_BASE = "https://api.bunny.net";
+const BUNNY_ACCOUNT_API_KEY = process.env.BUNNY_ACCOUNT_API_KEY || "";
+
+// The origin server pull zones fetch HLS segments from — same origin the
+// existing shared "nlmstream" pull zone already points at.
+const BUNNY_ORIGIN_URL = process.env.BUNNY_ORIGIN_URL || "";
+
+// Storage zones need a region code, not a full hostname — the existing
+// shared storage zone is in NY (ny.storage.bunnycdn.com), so default to
+// that same region for consistency unless told otherwise.
+const BUNNY_STORAGE_ZONE_REGION = process.env.BUNNY_STORAGE_ZONE_REGION || "NY";
+
+const isBunnyAccountConfigured = () => Boolean(BUNNY_ACCOUNT_API_KEY);
+
+const callBunnyApi = async (method, path, body) => {
+  if (!isBunnyAccountConfigured()) {
+    throw new Error(
+      "Bunny account API is not configured (missing BUNNY_ACCOUNT_API_KEY)",
+    );
+  }
+
+  const response = await fetch(`${BUNNY_API_BASE}${path}`, {
+    method,
+    headers: {
+      AccessKey: BUNNY_ACCOUNT_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20000),
+  });
+
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+
+  if (!response.ok) {
+    throw new Error(
+      `Bunny API ${method} ${path} failed (HTTP ${response.status}): ${data.Message || text || "unknown error"}`,
+    );
+  }
+
+  return data;
+};
+
+// Creates a new Pull Zone for an organization's live HLS delivery. Returns
+// the zone's id and its default CDN hostname ({name}.b-cdn.net).
+//
+// NOTE: field names below (OriginUrl, PullZone.Id/Hostnames, etc.) follow
+// Bunny's documented Pull Zone API shape as of when this was written — if
+// zone creation fails with an unexpected response shape, check Bunny's
+// current API docs for any field renames before assuming the API key
+// itself is the problem.
+const createPullZoneForOrganization = async (orgSlug) => {
+  if (!BUNNY_ORIGIN_URL) {
+    throw new Error(
+      "BUNNY_ORIGIN_URL is not configured — needed to know what origin server new pull zones should fetch from",
+    );
+  }
+
+  const zoneName = `nlm-${orgSlug}`;
+
+  const result = await callBunnyApi("POST", "/pullzone", {
+    Name: zoneName,
+    OriginUrl: BUNNY_ORIGIN_URL,
+    Type: 0, // 0 = Standard/Premium tier pull zone
+  });
+
+  return {
+    pullZoneId: result.Id,
+    pullZoneName: result.Name,
+    // Bunny's default CDN hostname for a pull zone is always
+    // {name}.b-cdn.net — also present in result.Hostnames[0].Value, but
+    // this is deterministic and doesn't require parsing that array.
+    pullZoneHostname: `${zoneName}.b-cdn.net`,
+  };
+};
+
+// Creates a new Storage Zone for an organization's own recording archive.
+// Returns the zone's id, hostname, and its own generated access password
+// (needed for uploading files directly to it — separate from the account
+// API key used to create it).
+const createStorageZoneForOrganization = async (orgSlug) => {
+  const zoneName = `nlm-${orgSlug}-recordings`;
+
+  const result = await callBunnyApi("POST", "/storagezone", {
+    Name: zoneName,
+    Region: BUNNY_STORAGE_ZONE_REGION,
+  });
+
+  return {
+    storageZoneId: result.Id,
+    storageZoneName: result.Name,
+    storageZoneHostname:
+      result.StorageHostname ||
+      `${BUNNY_STORAGE_ZONE_REGION.toLowerCase()}.storage.bunnycdn.com`,
+    storageZonePassword: result.Password,
+  };
+};
+
+// Full provisioning for a brand-new organization: creates both zones and
+// returns everything needed to store on the organizations row. Throws if
+// either step fails — deliberately not partial/best-effort, since a
+// half-provisioned org (e.g. pull zone created but storage zone failed)
+// would be a confusing state to debug later.
+const provisionBunnyZonesForOrganization = async (orgSlug) => {
+  const pullZone = await createPullZoneForOrganization(orgSlug);
+  const storageZone = await createStorageZoneForOrganization(orgSlug);
+
+  return { ...pullZone, ...storageZone };
+};
+
+// Per-zone bandwidth statistics — will be used once quota ENFORCEMENT is
+// built on top of this provisioning. dateFrom/dateTo are Date objects.
+const getPullZoneStatistics = async (pullZoneId, dateFrom, dateTo) => {
+  const params = new URLSearchParams({
+    pullZoneId: String(pullZoneId),
+    dateFrom: dateFrom.toISOString(),
+    dateTo: dateTo.toISOString(),
+  });
+
+  return callBunnyApi("GET", `/statistics?${params.toString()}`);
+};
+
+module.exports = {
+  isBunnyAccountConfigured,
+  provisionBunnyZonesForOrganization,
+  createPullZoneForOrganization,
+  createStorageZoneForOrganization,
+  getPullZoneStatistics,
+};

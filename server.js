@@ -16,6 +16,7 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const whmcs = require("./whmcs_client");
+const bunny = require("./bunny_client");
 
 let UAParser = null;
 try {
@@ -777,6 +778,66 @@ const ensureUniqueOrganizationSlug = async (name, existingId = null) => {
   }
 };
 
+// Provisions a dedicated Bunny pull zone + storage zone for a brand-new
+// organization, and saves the results onto its organizations row. Called
+// AFTER an organization already exists and its creation transaction has
+// committed — deliberately not inside that transaction, since an external
+// API call has no place holding a DB transaction open.
+//
+// Deliberately non-fatal: if Bunny provisioning fails (account API not
+// configured, Bunny outage, etc.), this logs and returns without
+// throwing — a brand-new customer's signup should never be blocked by a
+// CDN-provisioning hiccup. The organization simply falls back to the
+// shared platform zone (same as all pre-existing/grandfathered orgs)
+// until provisioning is retried.
+const provisionBunnyZonesForNewOrganization = async (organization) => {
+  if (!bunny.isBunnyAccountConfigured()) {
+    console.log(
+      `[BUNNY-PROVISION] Skipping org ${organization.id} (${organization.name}) — BUNNY_ACCOUNT_API_KEY not configured, will use the shared platform zone.`,
+    );
+    return;
+  }
+
+  try {
+    const zones = await bunny.provisionBunnyZonesForOrganization(
+      organization.slug,
+    );
+
+    await pool.query(
+      `
+      UPDATE organizations
+      SET bunny_pull_zone_id = $1,
+          bunny_pull_zone_hostname = $2,
+          bunny_storage_zone_id = $3,
+          bunny_storage_zone_name = $4,
+          bunny_storage_zone_hostname = $5,
+          bunny_storage_zone_password = $6,
+          bunny_provisioned_at = NOW(),
+          updated_at = NOW()
+      WHERE id = $7
+      `,
+      [
+        zones.pullZoneId,
+        zones.pullZoneHostname,
+        zones.storageZoneId,
+        zones.storageZoneName,
+        zones.storageZoneHostname,
+        zones.storageZonePassword,
+        organization.id,
+      ],
+    );
+
+    console.log(
+      `[BUNNY-PROVISION] Created dedicated zones for org ${organization.id} (${organization.name}): pull=${zones.pullZoneHostname}, storage=${zones.storageZoneName}`,
+    );
+  } catch (err) {
+    console.error(
+      `[BUNNY-PROVISION] Failed to provision Bunny zones for org ${organization.id} (${organization.name}):`,
+      err.message,
+    );
+  }
+};
+
 const ensureOrganizationTables = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS organizations (
@@ -817,6 +878,17 @@ const ensureOrganizationTables = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS bunny_pull_zone_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS bunny_pull_zone_hostname VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS bunny_storage_zone_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS bunny_storage_zone_name VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS bunny_storage_zone_hostname VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS bunny_storage_zone_password TEXT,
+    ADD COLUMN IF NOT EXISTS bunny_provisioned_at TIMESTAMPTZ
   `);
 
   const defaultOrgResult = await pool.query(`
@@ -1710,6 +1782,12 @@ const completePendingSignupFromWhmcs = async (
     console.log(
       `Completed paid signup for ${pending.client_email} / ${organization.name}`,
     );
+
+    // Fire-and-forget from the caller's perspective (this function itself
+    // still awaits it so provisioning happens promptly, but a failure here
+    // is logged and swallowed, not thrown — see the function's own
+    // comment for why).
+    await provisionBunnyZonesForNewOrganization(organization);
 
     return completedResult.rows[0];
   } catch (error) {
@@ -2939,6 +3017,8 @@ app.post(
         [organization.id, req.admin.id],
       );
 
+      await provisionBunnyZonesForNewOrganization(organization);
+
       res.json({
         ok: true,
         organization,
@@ -3592,6 +3672,8 @@ app.post(
       );
 
       await client.query("COMMIT");
+
+      await provisionBunnyZonesForNewOrganization(organization);
 
       const watchUrl = `${CLIENT_URL.replace(/\/$/, "")}/watch/${streamKey}`;
       const playbackUrl = `${HLS_BASE_URL.replace(/\/$/, "")}/live/${streamKey}.m3u8`;
