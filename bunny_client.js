@@ -92,25 +92,43 @@ const createPullZoneForOrganization = async (orgSlug) => {
   };
 };
 
-// Creates a new Storage Zone for an organization's own recording archive.
-// Returns the zone's id, hostname, and its own generated access password
-// (needed for uploading files directly to it — separate from the account
-// API key used to create it).
+// Creates a new Storage Zone for an organization's own recording archive,
+// AND a Pull Zone linked to it (origin = that storage zone, not a URL) so
+// archived recordings are publicly servable via a CDN URL — mirroring
+// exactly how the existing shared "nlm-stream-recordings" zone already
+// works (a storage zone plus a same-named connected pull zone). Per
+// Bunny's own docs, serving files directly from a Storage Zone without a
+// connected Pull Zone breaches their Terms of Service, so this step isn't
+// optional.
+//
+// NOTE: the exact field signaling "this pull zone's origin is a storage
+// zone" (StorageZoneId on the create payload, omitting OriginUrl) is
+// based on Bunny's documented response shape, not a confirmed request
+// example — verify in the Bunny dashboard that the created pull zone
+// actually shows "Storage Zone" as its origin type before trusting this
+// for a real customer's recordings.
 const createStorageZoneForOrganization = async (orgSlug) => {
   const zoneName = `nlm-${orgSlug}-recordings`;
 
-  const result = await callBunnyApi("POST", "/storagezone", {
+  const storageResult = await callBunnyApi("POST", "/storagezone", {
     Name: zoneName,
     Region: BUNNY_STORAGE_ZONE_REGION,
   });
 
+  const pullZoneResult = await callBunnyApi("POST", "/pullzone", {
+    Name: zoneName,
+    StorageZoneId: storageResult.Id,
+  });
+
   return {
-    storageZoneId: result.Id,
-    storageZoneName: result.Name,
+    storageZoneId: storageResult.Id,
+    storageZoneName: storageResult.Name,
     storageZoneHostname:
-      result.StorageHostname ||
+      storageResult.StorageHostname ||
       `${BUNNY_STORAGE_ZONE_REGION.toLowerCase()}.storage.bunnycdn.com`,
-    storageZonePassword: result.Password,
+    storageZonePassword: storageResult.Password,
+    recordingsPullZoneId: pullZoneResult.Id,
+    recordingsCdnUrl: `https://${zoneName}.b-cdn.net`,
   };
 };
 

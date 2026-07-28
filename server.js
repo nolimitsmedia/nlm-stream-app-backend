@@ -812,9 +812,11 @@ const provisionBunnyZonesForNewOrganization = async (organization) => {
           bunny_storage_zone_name = $4,
           bunny_storage_zone_hostname = $5,
           bunny_storage_zone_password = $6,
+          bunny_recordings_pull_zone_id = $7,
+          bunny_recordings_cdn_url = $8,
           bunny_provisioned_at = NOW(),
           updated_at = NOW()
-      WHERE id = $7
+      WHERE id = $9
       `,
       [
         zones.pullZoneId,
@@ -823,12 +825,14 @@ const provisionBunnyZonesForNewOrganization = async (organization) => {
         zones.storageZoneName,
         zones.storageZoneHostname,
         zones.storageZonePassword,
+        zones.recordingsPullZoneId,
+        zones.recordingsCdnUrl,
         organization.id,
       ],
     );
 
     console.log(
-      `[BUNNY-PROVISION] Created dedicated zones for org ${organization.id} (${organization.name}): pull=${zones.pullZoneHostname}, storage=${zones.storageZoneName}`,
+      `[BUNNY-PROVISION] Created dedicated zones for org ${organization.id} (${organization.name}): pull=${zones.pullZoneHostname}, storage=${zones.storageZoneName}, recordingsCdn=${zones.recordingsCdnUrl}`,
     );
   } catch (err) {
     console.error(
@@ -888,6 +892,8 @@ const ensureOrganizationTables = async () => {
     ADD COLUMN IF NOT EXISTS bunny_storage_zone_name VARCHAR(255),
     ADD COLUMN IF NOT EXISTS bunny_storage_zone_hostname VARCHAR(255),
     ADD COLUMN IF NOT EXISTS bunny_storage_zone_password TEXT,
+    ADD COLUMN IF NOT EXISTS bunny_recordings_pull_zone_id VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS bunny_recordings_cdn_url VARCHAR(255),
     ADD COLUMN IF NOT EXISTS bunny_provisioned_at TIMESTAMPTZ
   `);
 
@@ -8124,14 +8130,47 @@ function autoTranscodeStream(streamKey) {
 // organization slug and date, then removes the local copy to
 // save server disk space.
 // ══════════════════════════════════════════
-const uploadFileToBunnyStorage = async (localFilePath, remotePath) => {
+// Resolves which Bunny storage zone credentials to use for a given
+// organization — its own dedicated zone if one was provisioned, otherwise
+// the shared platform zone (grandfathered orgs, or a new org where
+// provisioning didn't succeed). Accepts either a full organization row or
+// just the relevant bunny_* fields.
+const getOrgBunnyZoneCreds = (org = {}) => {
+  const hasOwnZone = Boolean(
+    org.bunny_storage_zone_name && org.bunny_storage_zone_password,
+  );
+
+  return {
+    hasOwnZone,
+    zoneCreds: hasOwnZone
+      ? {
+          zoneName: org.bunny_storage_zone_name,
+          hostname: org.bunny_storage_zone_hostname,
+          apiKey: org.bunny_storage_zone_password,
+        }
+      : {},
+    cdnBaseUrl: hasOwnZone
+      ? org.bunny_recordings_cdn_url
+      : BUNNY_RECORDINGS_CDN_URL,
+  };
+};
+
+const uploadFileToBunnyStorage = async (
+  localFilePath,
+  remotePath,
+  zoneCreds = {},
+) => {
+  const hostname = zoneCreds.hostname || BUNNY_STORAGE_HOSTNAME;
+  const zoneName = zoneCreds.zoneName || BUNNY_STORAGE_ZONE;
+  const apiKey = zoneCreds.apiKey || BUNNY_STORAGE_API_KEY;
+
   const stats = fs.statSync(localFilePath);
-  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+  const url = `https://${hostname}/${zoneName}/${remotePath}`;
 
   const response = await fetch(url, {
     method: "PUT",
     headers: {
-      AccessKey: BUNNY_STORAGE_API_KEY,
+      AccessKey: apiKey,
       "Content-Type": "application/octet-stream",
       "Content-Length": String(stats.size),
     },
@@ -8147,15 +8186,19 @@ const uploadFileToBunnyStorage = async (localFilePath, remotePath) => {
   return true;
 };
 
-const deleteFileFromBunnyStorage = async (remotePath) => {
-  if (!remotePath || !BUNNY_STORAGE_API_KEY) return;
+const deleteFileFromBunnyStorage = async (remotePath, zoneCreds = {}) => {
+  const hostname = zoneCreds.hostname || BUNNY_STORAGE_HOSTNAME;
+  const zoneName = zoneCreds.zoneName || BUNNY_STORAGE_ZONE;
+  const apiKey = zoneCreds.apiKey || BUNNY_STORAGE_API_KEY;
 
-  const url = `https://${BUNNY_STORAGE_HOSTNAME}/${BUNNY_STORAGE_ZONE}/${remotePath}`;
+  if (!remotePath || !apiKey) return;
+
+  const url = `https://${hostname}/${zoneName}/${remotePath}`;
 
   try {
     const response = await fetch(url, {
       method: "DELETE",
-      headers: { AccessKey: BUNNY_STORAGE_API_KEY },
+      headers: { AccessKey: apiKey },
     });
 
     if (!response.ok && response.status !== 404) {
@@ -8175,11 +8218,15 @@ const archiveRecordingRow = async (recording) => {
     );
 
     const orgResult = await pool.query(
-      `SELECT slug FROM organizations WHERE id = $1`,
+      `SELECT slug, bunny_storage_zone_name, bunny_storage_zone_hostname,
+              bunny_storage_zone_password, bunny_recordings_cdn_url
+       FROM organizations WHERE id = $1`,
       [recording.organization_id],
     );
-    const orgSlug =
-      orgResult.rows[0]?.slug || `org-${recording.organization_id}`;
+    const org = orgResult.rows[0] || {};
+    const orgSlug = org.slug || `org-${recording.organization_id}`;
+
+    const { hasOwnZone, zoneCreds, cdnBaseUrl } = getOrgBunnyZoneCreds(org);
 
     const dateSource =
       recording.started_at || recording.created_at || new Date();
@@ -8196,9 +8243,14 @@ const archiveRecordingRow = async (recording) => {
     }
 
     const channelSlug = recording.stream_key || "unknown-channel";
-    const remotePath = `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
+    // Own-zone recordings don't need the org slug in the path (the zone
+    // itself is already org-specific) — kept for the shared zone, where
+    // it's how different orgs' files stay separated within one zone.
+    const remotePath = hasOwnZone
+      ? `${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`
+      : `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
 
-    await uploadFileToBunnyStorage(fileToArchive, remotePath);
+    await uploadFileToBunnyStorage(fileToArchive, remotePath, zoneCreds);
 
     // Delete local files now that upload succeeded
     const filesToRemove = [
@@ -8211,16 +8263,21 @@ const archiveRecordingRow = async (recording) => {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
 
+    const cdnUrl = `${cdnBaseUrl.replace(/\/$/, "")}/${remotePath}`;
+
     await pool.query(
       `UPDATE recordings
        SET archive_status = 'archived',
            bunny_storage_path = $1,
+           bunny_cdn_url = $2,
            bunny_archived_at = NOW()
-       WHERE id = $2`,
-      [remotePath, recording.id],
+       WHERE id = $3`,
+      [remotePath, cdnUrl, recording.id],
     );
 
-    console.log(`[BUNNY] Archived recording #${recording.id} -> ${remotePath}`);
+    console.log(
+      `[BUNNY] Archived recording #${recording.id} -> ${remotePath} (${hasOwnZone ? "own zone" : "shared zone"})`,
+    );
   } catch (err) {
     console.error(
       `[BUNNY] Failed to archive recording #${recording.id}:`,
@@ -10364,6 +10421,7 @@ const ensureRecordingLibraryTable = async () => {
     ADD COLUMN IF NOT EXISTS bitrate_kbps INTEGER,
     ADD COLUMN IF NOT EXISTS codec VARCHAR(80),
     ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS bunny_cdn_url TEXT,
     ADD COLUMN IF NOT EXISTS public_slug VARCHAR(255),
     ADD COLUMN IF NOT EXISTS public_title VARCHAR(255),
     ADD COLUMN IF NOT EXISTS public_description TEXT,
@@ -10467,17 +10525,17 @@ const mapRecordingRowToDto = (row, channelName = null) => {
     archived_at: row.bunny_archived_at || null,
     url:
       row.archive_status === "archived" && row.bunny_storage_path
-        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        ? row.bunny_cdn_url || formatBunnyRecordingUrl(row.bunny_storage_path)
         : playable
           ? formatRecordingPlaybackUrl(streamKey, mp4File)
           : formatRecordingUrl(streamKey, file),
     download_url:
       row.archive_status === "archived" && row.bunny_storage_path
-        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        ? row.bunny_cdn_url || formatBunnyRecordingUrl(row.bunny_storage_path)
         : formatRecordingUrl(streamKey, playable ? mp4File : file),
     source_download_url:
       row.archive_status === "archived" && row.bunny_storage_path
-        ? formatBunnyRecordingUrl(row.bunny_storage_path)
+        ? row.bunny_cdn_url || formatBunnyRecordingUrl(row.bunny_storage_path)
         : formatRecordingUrl(streamKey, file),
   };
 };
@@ -11432,7 +11490,11 @@ app.delete(
         recording.archive_status === "archived" &&
         recording.bunny_storage_path
       ) {
-        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
+        const { zoneCreds } = getOrgBunnyZoneCreds(req.organization);
+        await deleteFileFromBunnyStorage(
+          recording.bunny_storage_path,
+          zoneCreds,
+        );
       }
 
       await pool.query(
@@ -13261,7 +13323,11 @@ app.delete(
         recording?.archive_status === "archived" &&
         recording?.bunny_storage_path
       ) {
-        await deleteFileFromBunnyStorage(recording.bunny_storage_path);
+        const { zoneCreds } = getOrgBunnyZoneCreds(req.organization);
+        await deleteFileFromBunnyStorage(
+          recording.bunny_storage_path,
+          zoneCreds,
+        );
       }
 
       await pool.query(
