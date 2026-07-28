@@ -8939,6 +8939,24 @@ const SEGMENT_CACHE_TTL_MS = 15000;
 const manifestCache = new Map(); // streamKey -> { text, cachedAt }
 const MANIFEST_CACHE_TTL_MS = 1000;
 
+// Once a broadcast has successfully resolved to either live_capped or
+// live, stick with that SAME app for the rest of that broadcast rather
+// than re-deciding on every poll. Silently flipping between the two apps
+// mid-session — even from a single transient blip, not just a real
+// crash — causes a genuine HLS playback discontinuity (different segment
+// timeline/numbering), which real testing confirmed as a bufferStalledError
+// in the player. Keyed by stream_key; invalidated whenever the channel
+// starts a genuinely NEW broadcast (different live_started_at), so a
+// fresh stream always gets to try live_capped again from scratch.
+const stickyHlsApp = new Map(); // streamKey -> { app, liveStartedAtMs }
+
+// How long a brand-new broadcast gets to bring its bitrate-cap transcode
+// online before its startup lag is treated as a genuine failure and we
+// commit to the uncapped fallback for the rest of that session. Comfortably
+// covers the ~3s spawn delay plus time for ffmpeg to connect and produce
+// its first HLS segment.
+const HLS_CAPPED_STARTUP_GRACE_MS = 20 * 1000;
+
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of segmentCache) {
@@ -8967,12 +8985,28 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       text = cached.text;
       resolvedApp = cached.resolvedApp;
     } else {
-      // Try the bitrate-capped transcode output first — see
-      // autoCapBitrateStream. If it's not running (server load was too
-      // high when the stream started, ffmpeg crashed, or capping simply
-      // isn't configured for this org's plan), fall back to the raw
-      // ingest so the stream stays watchable either way.
-      const candidateApps = ["live_capped", "live"];
+      const channelResult = await pool.query(
+        `SELECT live_started_at FROM channels WHERE stream_key = $1`,
+        [streamKey],
+      );
+      const liveStartedAt = channelResult.rows[0]?.live_started_at;
+      const liveStartedAtMs = liveStartedAt
+        ? new Date(liveStartedAt).getTime()
+        : null;
+
+      const sticky = stickyHlsApp.get(streamKey);
+      const stickyValid =
+        sticky && liveStartedAtMs && sticky.liveStartedAtMs === liveStartedAtMs;
+
+      // Once committed to an app for THIS broadcast, only ever try that
+      // one — never silently re-route to the other app mid-session, even
+      // on a transient failure (a real player-facing HLS discontinuity
+      // bug came from exactly that). A fresh broadcast (no valid sticky
+      // entry yet) tries live_capped first, same as before.
+      const candidateApps = stickyValid
+        ? [sticky.app]
+        : ["live_capped", "live"];
+
       let upstream = null;
       let upstreamUrl = null;
 
@@ -9002,15 +9036,45 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         }
       }
 
-      console.log("[HLS REQUEST]", { streamKey, resolvedApp, upstreamUrl });
+      console.log("[HLS REQUEST]", {
+        streamKey,
+        resolvedApp,
+        upstreamUrl,
+        sticky: stickyValid ? sticky.app : null,
+      });
 
       if (!upstream) {
+        // A fresh broadcast whose bitrate-cap transcode hasn't come
+        // online yet is NOT a genuine failure — it just needs a moment.
+        // During this grace window, never commit to the raw fallback;
+        // instead tell the player to wait and retry shortly (it already
+        // handles this gracefully, showing "Waiting for stream
+        // segments..."), so no viewer starts on the raw stream only to
+        // get yanked over to live_capped moments later.
+        const withinStartupGrace =
+          !stickyValid &&
+          liveStartedAtMs &&
+          Date.now() - liveStartedAtMs < HLS_CAPPED_STARTUP_GRACE_MS;
+
+        if (withinStartupGrace) {
+          console.log(
+            "[HLS] Within startup grace window, asking player to retry shortly",
+            { streamKey },
+          );
+          return res.status(503).send("Stream starting, please retry shortly");
+        }
+
         console.error("[HLS UPSTREAM ERROR]", {
           streamKey,
           triedApps: candidateApps,
         });
 
         return res.status(502).send("HLS unavailable");
+      }
+
+      // Commit to this app for the rest of the broadcast.
+      if (liveStartedAtMs) {
+        stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
       }
 
       console.log("[HLS RESPONSE]", {
@@ -9299,6 +9363,8 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     if (orgId) {
       autoSyncRecordingsDelayed(orgId, 8000);
     }
+
+    stickyHlsApp.delete(streamKey);
 
     console.log(`[SRS] Stream offline: ${streamKey}`);
     res.json({ code: 0 });

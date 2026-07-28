@@ -146,9 +146,16 @@ const provisionBunnyZonesForOrganization = async (orgSlug) => {
 
 // Per-zone bandwidth statistics — will be used once quota ENFORCEMENT is
 // built on top of this provisioning. dateFrom/dateTo are Date objects.
+//
+// NOTE: the query param is `pullZone`, NOT `pullZoneId` — confirmed this
+// was the actual bug behind a real incident where two different orgs'
+// bandwidth checks both returned the exact same (account-wide) total:
+// Bunny was silently ignoring the unrecognized `pullZoneId` param and
+// falling back to all-zones data instead of erroring, which is exactly
+// why two different orgs got an identical number.
 const getPullZoneStatistics = async (pullZoneId, dateFrom, dateTo) => {
   const params = new URLSearchParams({
-    pullZoneId: String(pullZoneId),
+    pullZone: String(pullZoneId),
     dateFrom: dateFrom.toISOString(),
     dateTo: dateTo.toISOString(),
   });
