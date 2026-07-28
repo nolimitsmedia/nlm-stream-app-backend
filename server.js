@@ -1755,7 +1755,8 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
       p.custom_domain_enabled,
       p.priority_support_enabled,
       COALESCE(channel_usage.count, 0)::int AS used_channels,
-      COALESCE(member_usage.count, 0)::int AS used_admins
+      COALESCE(member_usage.count, 0)::int AS used_admins,
+      COALESCE(storage_usage.total_bytes, 0)::bigint AS used_storage_bytes
     FROM subscriptions s
     JOIN plans p ON p.plan_key = s.plan_key
     LEFT JOIN (
@@ -1770,6 +1771,12 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
       WHERE organization_id = $1
       GROUP BY organization_id
     ) member_usage ON member_usage.organization_id = s.organization_id
+    LEFT JOIN (
+      SELECT organization_id, SUM(file_size_bytes) AS total_bytes
+      FROM recordings
+      WHERE organization_id = $1
+      GROUP BY organization_id
+    ) storage_usage ON storage_usage.organization_id = s.organization_id
     WHERE s.organization_id = $1
     LIMIT 1
     `,
@@ -8204,6 +8211,53 @@ const cleanupUnrecordedFilesForOrganization = async (organizationId) => {
   }
 };
 
+const STORAGE_QUOTA_ALERT_COOLDOWN_HOURS = 24;
+
+// Warns an org when they've gone over their plan's storage cap. Does NOT
+// delete or block anything — recorded church/ministry services are real
+// content, not a technical setting like bitrate, so this only notifies.
+// A cooldown prevents re-alerting on every single new recording once
+// already over quota.
+const checkStorageQuota = async (organizationId, summary) => {
+  if (!summary) return;
+
+  const maxBytes = Number(summary.max_storage_gb || 0) * 1024 ** 3;
+  const usedBytes = Number(summary.used_storage_bytes || 0);
+
+  if (!maxBytes || usedBytes <= maxBytes) return;
+
+  const recentAlert = await pool.query(
+    `
+    SELECT 1 FROM plan_alerts
+    WHERE organization_id = $1
+      AND alert_type = 'storage_quota_warning'
+      AND created_at > NOW() - INTERVAL '${STORAGE_QUOTA_ALERT_COOLDOWN_HOURS} hours'
+    LIMIT 1
+    `,
+    [organizationId],
+  );
+
+  if (recentAlert.rows[0]) return; // already warned recently, don't spam
+
+  const usedGb = (usedBytes / 1024 ** 3).toFixed(1);
+  const maxGb = Number(summary.max_storage_gb || 0);
+
+  await pool.query(
+    `
+    INSERT INTO plan_alerts (organization_id, alert_type, message)
+    VALUES ($1, 'storage_quota_warning', $2)
+    `,
+    [
+      organizationId,
+      `You've used ${usedGb}GB of your plan's ${maxGb}GB recording storage limit. Delete old recordings or upgrade your plan to keep archiving new ones.`,
+    ],
+  );
+
+  console.log(
+    `[STORAGE] Quota warning recorded for org ${organizationId} (${usedGb}GB / ${maxGb}GB)`,
+  );
+};
+
 async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
   setTimeout(async () => {
     try {
@@ -8224,6 +8278,18 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
 
       // Archive newly-ready recordings to Bunny Storage (if configured)
       await archiveReadyRecordingsForOrganization(organizationId);
+
+      // Storage quota check — re-fetch the summary so used_storage_bytes
+      // reflects the recording we just archived. Deliberately a WARNING
+      // only, same philosophy as the bitrate monitor: don't delete or
+      // block a church's actual recorded content over a storage cap,
+      // just flag it so they can clean up old recordings or upgrade.
+      // (This is my judgment call, not something explicitly decided in
+      // chat — flag if a harder cap is wanted, e.g. blocking new
+      // recordings once significantly over quota.)
+      const updatedSummary =
+        await getOrganizationSubscriptionSummary(organizationId);
+      await checkStorageQuota(organizationId, updatedSummary);
 
       // Notify dashboard via socket
       if (io)
