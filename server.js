@@ -2074,6 +2074,7 @@ const BITRATE_ESCALATION_THRESHOLD = 3; // 3rd violation in the window triggers 
 // that actually crosses the sustained-duration threshold gets written to
 // plan_alerts, so a brief blip never touches the DB at all.
 const bitrateOverCapTracker = new Map(); // stream_key -> { since: ms timestamp, recorded: bool }
+const unmappedStreamsLogged = new Set(); // stream_key -> already logged "no matching plan" once
 
 const kickSrsPublisher = async (streamName) => {
   try {
@@ -2177,8 +2178,9 @@ const pollBitrateCompliance = async () => {
       `
       SELECT c.stream_key, c.id AS channel_id, c.organization_id, p.max_bitrate_kbps
       FROM channels c
-      JOIN subscriptions s ON s.organization_id = c.organization_id
-      JOIN plans p ON p.plan_key = s.plan_key
+      JOIN organizations o ON o.id = c.organization_id
+      LEFT JOIN subscriptions s ON s.organization_id = c.organization_id
+      JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
       WHERE c.stream_key = ANY($1::text[])
       `,
       [streamNames],
@@ -2194,10 +2196,21 @@ const pollBitrateCompliance = async () => {
     for (const key of bitrateOverCapTracker.keys()) {
       if (!liveStreamNames.has(key)) bitrateOverCapTracker.delete(key);
     }
+    for (const key of unmappedStreamsLogged) {
+      if (!liveStreamNames.has(key)) unmappedStreamsLogged.delete(key);
+    }
 
     for (const stream of activeStreams) {
       const info = infoByStreamKey.get(stream.name);
-      if (!info || !info.max_bitrate_kbps) continue; // unmapped or no cap configured
+      if (!info || !info.max_bitrate_kbps) {
+        if (!unmappedStreamsLogged.has(stream.name)) {
+          console.log(
+            `[BITRATE] Stream "${stream.name}" is live but has no matching channel/plan cap — skipping compliance check for it.`,
+          );
+          unmappedStreamsLogged.add(stream.name);
+        }
+        continue;
+      }
 
       const observedKbps = Number(stream.kbps?.recv_30s || 0);
       const capKbps = Number(info.max_bitrate_kbps);
