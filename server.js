@@ -6075,6 +6075,24 @@ const getPublicWatchStatus = async (streamKey) => {
     organizationId,
   );
 
+  // If this organization has its own dedicated Bunny pull zone (see the
+  // per-org zone provisioning work), the watch page should route through
+  // it instead of the shared platform CDN — same backend /api/hls/ proxy
+  // logic either way (it's origin-agnostic), just a different front door.
+  // null here means "use the shared default", which the frontend already
+  // falls back to.
+  let hlsBaseUrl = null;
+  try {
+    const orgZoneResult = await pool.query(
+      `SELECT bunny_pull_zone_hostname FROM organizations WHERE id = $1`,
+      [organizationId],
+    );
+    const hostname = orgZoneResult.rows[0]?.bunny_pull_zone_hostname;
+    if (hostname) hlsBaseUrl = `https://${hostname}`;
+  } catch (zoneErr) {
+    console.error("Watch status zone lookup error:", zoneErr.message);
+  }
+
   return {
     organization_id: organizationId,
     organization: brandingData.organization,
@@ -6084,6 +6102,7 @@ const getPublicWatchStatus = async (streamKey) => {
     stream: activeStream || null,
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
+    hlsBaseUrl,
   };
 };
 
