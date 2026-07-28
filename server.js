@@ -1294,6 +1294,25 @@ const ensureSubscriptionTables = async () => {
     )
   `);
 
+  // Records both the in-app notification shown to admins AND the history
+  // used to decide when a repeat bitrate violation escalates to a kick
+  // (see BITRATE_ESCALATION_THRESHOLD / pollBitrateCompliance below) — one
+  // table serves both purposes rather than keeping separate ones in sync.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS plan_alerts (
+      id SERIAL PRIMARY KEY,
+      organization_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
+      channel_id INTEGER REFERENCES channels(id) ON DELETE SET NULL,
+      alert_type VARCHAR(60) NOT NULL,
+      message TEXT NOT NULL,
+      observed_bitrate_kbps INTEGER,
+      plan_bitrate_kbps INTEGER,
+      acknowledged BOOLEAN DEFAULT FALSE,
+      acknowledged_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
   // One-time correction: earlier deploys seeded plans with an arbitrary
   // $29/$79/$199 pricing scheme that was never actually reconciled against
   // WHMCS's real configured prices. Since the upsert below no longer
@@ -1724,7 +1743,13 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
       p.max_channels,
       p.max_admins,
       p.max_storage_gb,
+      p.max_cdn_bandwidth_gb,
+      p.max_egress_bandwidth_gb,
       p.max_bitrate_kbps,
+      p.tv_channel_enabled,
+      p.recording_enabled,
+      p.rewind_enabled,
+      p.reduced_latency_enabled,
       p.transcoding_enabled,
       p.analytics_enabled,
       p.custom_domain_enabled,
@@ -2021,6 +2046,194 @@ const pollWhmcsBilling = async () => {
     }
   } catch (error) {
     console.error("[WHMCS-POLL] Billing poll failed:", error.message);
+  }
+};
+
+// ══════════════════════════════════════════
+// BITRATE COMPLIANCE MONITOR
+// Church/ministry live streaming is the primary use case here, so a hard
+// disconnect over a first-time bitrate mistake (e.g. a volunteer's OBS
+// misconfigured) is the wrong customer experience — this monitors and
+// WARNS first, only escalating to an actual kick after repeat sustained
+// violations. See the chat discussion this was built from for the
+// reasoning behind that choice over a harder transcode-based cap.
+//
+// Polls SRS's stream list ONCE per cycle (not once per stream — SRS
+// returns every active stream's stats in a single call), so this scales
+// to many concurrent orgs streaming at once (e.g. a Sunday morning peak)
+// without added per-stream cost.
+// ══════════════════════════════════════════
+const BITRATE_POLL_INTERVAL_MS = 20 * 1000;
+const BITRATE_GRACE_MULTIPLIER = 1.1; // 10% grace over the plan's cap
+const BITRATE_SUSTAINED_MS = 5 * 60 * 1000; // must stay over cap this long to count as one violation
+const BITRATE_VIOLATION_WINDOW_DAYS = 30;
+const BITRATE_ESCALATION_THRESHOLD = 3; // 3rd violation in the window triggers a kick
+
+// In-memory only — tracks how long each currently-live stream has been
+// continuously over its cap. Deliberately not persisted: only a violation
+// that actually crosses the sustained-duration threshold gets written to
+// plan_alerts, so a brief blip never touches the DB at all.
+const bitrateOverCapTracker = new Map(); // stream_key -> { since: ms timestamp, recorded: bool }
+
+const kickSrsPublisher = async (streamName) => {
+  try {
+    const clientsRes = await fetch(`${SRS_API_URL}/api/v1/clients/`);
+    if (!clientsRes.ok) return false;
+    const clientsData = await clientsRes.json();
+
+    // NOTE: SRS's client-list field names for identifying the publisher of
+    // a given stream (vs. viewers) haven't been verified against a live
+    // response from this SRS instance — this checks the most likely shape,
+    // but confirm against real output if kicks don't actually happen.
+    const publisher = (clientsData.clients || []).find(
+      (c) => c.stream === streamName && (c.type === "publish" || c.publish),
+    );
+
+    if (!publisher?.id) return false;
+
+    const kickRes = await fetch(
+      `${SRS_API_URL}/api/v1/clients/${publisher.id}`,
+      { method: "DELETE" },
+    );
+    return kickRes.ok;
+  } catch (err) {
+    console.error(
+      `[BITRATE] Failed to kick publisher for ${streamName}:`,
+      err.message,
+    );
+    return false;
+  }
+};
+
+const recordBitrateViolation = async ({
+  organizationId,
+  channelId,
+  streamName,
+  observedKbps,
+  capKbps,
+}) => {
+  const priorCountResult = await pool.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM plan_alerts
+    WHERE organization_id = $1
+      AND alert_type IN ('bitrate_warning', 'bitrate_kick')
+      AND created_at > NOW() - INTERVAL '${BITRATE_VIOLATION_WINDOW_DAYS} days'
+    `,
+    [organizationId],
+  );
+
+  const violationNumber = (priorCountResult.rows[0]?.count || 0) + 1;
+  const shouldKick = violationNumber >= BITRATE_ESCALATION_THRESHOLD;
+
+  let kicked = false;
+  if (shouldKick) {
+    kicked = await kickSrsPublisher(streamName);
+  }
+
+  const alertType = kicked ? "bitrate_kick" : "bitrate_warning";
+  const message = kicked
+    ? `Stream "${streamName}" was disconnected for repeatedly exceeding your plan's ${capKbps}Mbps bitrate limit (this is violation #${violationNumber} in the last ${BITRATE_VIOLATION_WINDOW_DAYS} days). Lower your encoder's bitrate or upgrade your plan.`
+    : `Stream "${streamName}" is exceeding your plan's ${Math.round(capKbps / 1000)}Mbps bitrate limit (observed ~${Math.round(observedKbps / 1000)}Mbps). Please lower your encoder's bitrate — repeated violations will result in the stream being disconnected.`;
+
+  await pool.query(
+    `
+    INSERT INTO plan_alerts (
+      organization_id, channel_id, alert_type, message,
+      observed_bitrate_kbps, plan_bitrate_kbps
+    )
+    VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [
+      organizationId,
+      channelId || null,
+      alertType,
+      message,
+      Math.round(observedKbps),
+      capKbps,
+    ],
+  );
+
+  console.log(
+    `[BITRATE] ${alertType} recorded for org ${organizationId}, stream ${streamName} (violation #${violationNumber}${kicked ? ", KICKED" : ""})`,
+  );
+};
+
+const pollBitrateCompliance = async () => {
+  try {
+    const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const activeStreams = (data.streams || []).filter((s) => s.publish?.active);
+
+    if (!activeStreams.length) {
+      bitrateOverCapTracker.clear();
+      return;
+    }
+
+    const streamNames = activeStreams.map((s) => s.name);
+    const channelResult = await pool.query(
+      `
+      SELECT c.stream_key, c.id AS channel_id, c.organization_id, p.max_bitrate_kbps
+      FROM channels c
+      JOIN subscriptions s ON s.organization_id = c.organization_id
+      JOIN plans p ON p.plan_key = s.plan_key
+      WHERE c.stream_key = ANY($1::text[])
+      `,
+      [streamNames],
+    );
+
+    const infoByStreamKey = new Map(
+      channelResult.rows.map((row) => [row.stream_key, row]),
+    );
+
+    const liveStreamNames = new Set(streamNames);
+    // Clear tracking for any stream that's no longer live, so a fresh
+    // session always starts its sustained-duration count from zero.
+    for (const key of bitrateOverCapTracker.keys()) {
+      if (!liveStreamNames.has(key)) bitrateOverCapTracker.delete(key);
+    }
+
+    for (const stream of activeStreams) {
+      const info = infoByStreamKey.get(stream.name);
+      if (!info || !info.max_bitrate_kbps) continue; // unmapped or no cap configured
+
+      const observedKbps = Number(stream.kbps?.recv_30s || 0);
+      const capKbps = Number(info.max_bitrate_kbps);
+      const isOverCap = observedKbps > capKbps * BITRATE_GRACE_MULTIPLIER;
+
+      if (!isOverCap) {
+        bitrateOverCapTracker.delete(stream.name);
+        continue;
+      }
+
+      const tracked = bitrateOverCapTracker.get(stream.name);
+
+      if (!tracked) {
+        bitrateOverCapTracker.set(stream.name, {
+          since: Date.now(),
+          recorded: false,
+        });
+        continue;
+      }
+
+      if (tracked.recorded) continue; // already actioned this sustained streak
+
+      if (Date.now() - tracked.since < BITRATE_SUSTAINED_MS) continue; // not sustained long enough yet
+
+      tracked.recorded = true;
+
+      await recordBitrateViolation({
+        organizationId: info.organization_id,
+        channelId: info.channel_id,
+        streamName: stream.name,
+        observedKbps,
+        capKbps,
+      });
+    }
+  } catch (err) {
+    console.error("[BITRATE] Compliance poll failed:", err.message);
   }
 };
 
@@ -3833,6 +4046,86 @@ app.get(
   async (req, res) => {
     const results = await getIntegrationHealthSnapshot();
     res.json({ ok: true, integrations: results });
+  },
+);
+
+// Org-scoped: an org's own admins see their own plan-limit alerts
+// (bitrate warnings/kicks, and any future plan-enforcement notices) on
+// their dashboard.
+app.get(
+  "/api/organization/alerts",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT * FROM plan_alerts
+        WHERE organization_id = $1 AND acknowledged = FALSE
+        ORDER BY created_at DESC
+        LIMIT 20
+        `,
+        [req.organization.id],
+      );
+
+      res.json({ ok: true, alerts: result.rows });
+    } catch (error) {
+      console.error("Get organization alerts error:", error);
+      res.status(500).json({ ok: false, message: "Failed to load alerts" });
+    }
+  },
+);
+
+app.post(
+  "/api/organization/alerts/:id/acknowledge",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      await pool.query(
+        `
+        UPDATE plan_alerts
+        SET acknowledged = TRUE, acknowledged_at = NOW()
+        WHERE id = $1 AND organization_id = $2
+        `,
+        [req.params.id, req.organization.id],
+      );
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error("Acknowledge alert error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to acknowledge alert" });
+    }
+  },
+);
+
+// Platform-wide: super_admin sees recent alerts across every organization,
+// for the Super Admin Dashboard.
+app.get(
+  "/api/admin/plan-alerts",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT pa.*, o.name AS organization_name
+        FROM plan_alerts pa
+        JOIN organizations o ON o.id = pa.organization_id
+        ORDER BY pa.created_at DESC
+        LIMIT 50
+        `,
+      );
+
+      res.json({ ok: true, alerts: result.rows });
+    } catch (error) {
+      console.error("Get admin plan alerts error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to load plan alerts" });
+    }
   },
 );
 
@@ -7857,9 +8150,60 @@ const archiveReadyRecordingsForOrganization = async (organizationId) => {
   }
 };
 
+// Deletes raw local recording files for an organization's channels without
+// ever creating `recordings` DB rows or archiving to Bunny — used when the
+// org's plan doesn't include recording_enabled, so they don't accumulate
+// local disk usage for a feature they haven't paid for. Mirrors the same
+// "delete after we're done with it" pattern archiveRecordingRow already
+// uses for the paid path.
+const cleanupUnrecordedFilesForOrganization = async (organizationId) => {
+  try {
+    const allowedChannels = await getAllowedChannelMap(organizationId);
+    if (!fs.existsSync(RECORDINGS_LIVE_ROOT)) return;
+
+    for (const streamName of allowedChannels.keys()) {
+      const streamFolder = path.join(RECORDINGS_LIVE_ROOT, streamName);
+      if (
+        !fs.existsSync(streamFolder) ||
+        !fs.statSync(streamFolder).isDirectory()
+      ) {
+        continue;
+      }
+
+      for (const file of fs.readdirSync(streamFolder)) {
+        if (file.endsWith(".tmp") || file.endsWith(".part")) continue; // still being written
+        const filePath = path.join(streamFolder, file);
+        try {
+          if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
+        } catch (fileErr) {
+          console.error(
+            `[RECORDING-GATE] Failed to remove ${filePath}:`,
+            fileErr.message,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[RECORDING-GATE] Cleanup failed for org ${organizationId}:`,
+      err.message,
+    );
+  }
+};
+
 async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
   setTimeout(async () => {
     try {
+      const summary = await getOrganizationSubscriptionSummary(organizationId);
+
+      if (!summary?.recording_enabled) {
+        console.log(
+          `[RECORDING-GATE] Org ${organizationId}'s plan (${summary?.plan_key || "unknown"}) does not include recording — cleaning up raw files instead of archiving.`,
+        );
+        await cleanupUnrecordedFilesForOrganization(organizationId);
+        return;
+      }
+
       console.log(`[DVR] Auto-syncing recordings for org: ${organizationId}`);
       await scanRecordingFilesForOrganization(organizationId, {
         processReady: true,
@@ -13937,6 +14281,9 @@ app.delete(
         "[WHMCS-POLL] WHMCS is not configured (missing WHMCS_API_URL/IDENTIFIER/SECRET) — billing poller disabled.",
       );
     }
+
+    // Bitrate compliance monitor — see pollBitrateCompliance() above.
+    setInterval(pollBitrateCompliance, BITRATE_POLL_INTERVAL_MS);
 
     // Proactively refresh YouTube access tokens before they expire (~1hr
     // lifetime), so a scheduled/automated go-live never fails mid-stream
