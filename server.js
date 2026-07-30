@@ -6078,32 +6078,6 @@ const getPublicWatchStatus = async (streamKey) => {
     console.error("Watch status zone lookup error:", zoneErr.message);
   }
 
-  // Plan-gated delivery features — which HLS manifest to request (single
-  // vs. ABR master playlist) and how aggressively LivePlayer should
-  // buffer both depend on the organization's actual paid plan, not a
-  // platform-wide default. Same organizations/subscriptions/plans join
-  // pattern already used for bitrate-cap lookups elsewhere.
-  let transcodingEnabled = false;
-  let reducedLatencyEnabled = false;
-  try {
-    const planResult = await pool.query(
-      `
-      SELECT p.transcoding_enabled, p.reduced_latency_enabled
-      FROM organizations o
-      LEFT JOIN subscriptions s ON s.organization_id = o.id
-      JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
-      WHERE o.id = $1
-      `,
-      [organizationId],
-    );
-    transcodingEnabled = Boolean(planResult.rows[0]?.transcoding_enabled);
-    reducedLatencyEnabled = Boolean(
-      planResult.rows[0]?.reduced_latency_enabled,
-    );
-  } catch (planErr) {
-    console.error("Watch status plan lookup error:", planErr.message);
-  }
-
   return {
     organization_id: organizationId,
     organization: brandingData.organization,
@@ -6114,8 +6088,6 @@ const getPublicWatchStatus = async (streamKey) => {
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
     hlsBaseUrl,
-    transcodingEnabled,
-    reducedLatencyEnabled,
   };
 };
 
@@ -8355,6 +8327,32 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
   // was purely in how Node was invoking it, not the command itself.
   const ffmpegArgs = [
     "-y",
+    // Input-side resilience flags — added after observing intermittent
+    // "Input/output error" crashes reading from the raw 'live' RTMP
+    // input (see BITRATE-CAP crash logs). Best-reasoned explanation:
+    // gop_cache is now off (tonight's latency tuning), so a brand-new
+    // subscriber — including this ffmpeg process — no longer gets an
+    // instant cached keyframe and must wait for the next real one,
+    // which could be a couple seconds out depending on OBS's keyframe
+    // interval. These flags give ffmpeg more patience during that wait
+    // instead of erroring out, and let it auto-reconnect on a genuine
+    // transient read hiccup rather than crashing the whole process.
+    // Not a confirmed root-cause fix — worth comparing crash frequency
+    // before/after in the logs.
+    "-analyzeduration",
+    "10000000",
+    "-probesize",
+    "10000000",
+    "-rw_timeout",
+    "10000000",
+    "-reconnect",
+    "1",
+    "-reconnect_at_eof",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
     "-i",
     input,
     "-map",
@@ -8982,21 +8980,8 @@ const stickyHlsApp = new Map(); // streamKey -> { app, liveStartedAtMs }
 // online before its startup lag is treated as a genuine failure and we
 // commit to the uncapped fallback for the rest of that session. Comfortably
 // covers the ~3s spawn delay plus time for ffmpeg to connect and produce
-// its first HLS segment. Used when BOTH live_capped and raw live have
-// failed — waiting the full window costs nothing extra there, since
-// there's no video to show either way.
+// its first HLS segment.
 const HLS_CAPPED_STARTUP_GRACE_MS = 20 * 1000;
-
-// Shorter, separate tolerance for the specific case where raw 'live'
-// DID succeed but live_capped hasn't (yet) — i.e. a viewer could be
-// watching uncapped right now if we don't wait. Observed live_capped
-// crash-and-auto-retry cycles take ~2s in practice, so this gives
-// comfortable margin to absorb that without leaving a viewer stuck on
-// a black screen for the full 20s grace window if the transcode is
-// genuinely slow to start this time. Past this shorter window, fall
-// back to raw rather than keep blocking — bounded risk of a brief
-// uncapped moment beats an open-ended stuck player.
-const HLS_CAPPED_RACE_TOLERANCE_MS = 8 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -9050,7 +9035,6 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       let upstream = null;
       let upstreamUrl = null;
-      let rawDeferredDueToRaceTolerance = false;
 
       for (const app of candidateApps) {
         const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
@@ -9068,28 +9052,6 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
           });
 
           if (candidateResponse.ok) {
-            // A live_capped failure within the short race-tolerance
-            // window is NOT a green light to accept 'live' (raw) as the
-            // resolved app — that's exactly the race that let a
-            // transient live_capped crash-and-auto-retry (which
-            // recovers a couple seconds later on its own) permanently
-            // strand a viewer on the uncapped stream for the rest of
-            // the broadcast, since sticky-app then never re-checks.
-            // Defer instead — see the withinStartupGrace branch below,
-            // which returns "retry shortly" for this request. Past
-            // HLS_CAPPED_RACE_TOLERANCE_MS, stop deferring and accept
-            // raw, rather than blocking the viewer all the way out to
-            // the full HLS_CAPPED_STARTUP_GRACE_MS window.
-            if (
-              app === "live" &&
-              !stickyValid &&
-              liveStartedAtMs &&
-              Date.now() - liveStartedAtMs < HLS_CAPPED_RACE_TOLERANCE_MS
-            ) {
-              rawDeferredDueToRaceTolerance = true;
-              continue;
-            }
-
             upstream = candidateResponse;
             upstreamUrl = candidateUrl;
             resolvedApp = app;
@@ -9123,7 +9085,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         if (withinStartupGrace) {
           console.log(
             "[HLS] Within startup grace window, asking player to retry shortly",
-            { streamKey, rawDeferredDueToRaceTolerance },
+            { streamKey },
           );
           return res.status(503).send("Stream starting, please retry shortly");
         }
