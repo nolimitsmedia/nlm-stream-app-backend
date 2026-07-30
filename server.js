@@ -9037,6 +9037,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       let upstream = null;
       let upstreamUrl = null;
+      let cappedFailedWithinGrace = false;
 
       for (const app of candidateApps) {
         const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
@@ -9054,6 +9055,25 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
           });
 
           if (candidateResponse.ok) {
+            // A live_capped failure during the startup-grace window is
+            // NOT a green light to accept 'live' (raw) as the resolved
+            // app — that's exactly the race that let a transient
+            // live_capped crash-and-auto-retry (which recovers a couple
+            // seconds later on its own) permanently strand a viewer on
+            // the uncapped stream for the rest of the broadcast, since
+            // sticky-app then never re-checks. Treat this the same as
+            // "not ready yet" instead — see the withinStartupGrace
+            // branch below.
+            if (
+              app === "live" &&
+              !stickyValid &&
+              liveStartedAtMs &&
+              Date.now() - liveStartedAtMs < HLS_CAPPED_STARTUP_GRACE_MS
+            ) {
+              cappedFailedWithinGrace = true;
+              continue;
+            }
+
             upstream = candidateResponse;
             upstreamUrl = candidateUrl;
             resolvedApp = app;
@@ -9087,7 +9107,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         if (withinStartupGrace) {
           console.log(
             "[HLS] Within startup grace window, asking player to retry shortly",
-            { streamKey },
+            { streamKey, cappedFailedWithinGrace },
           );
           return res.status(503).send("Stream starting, please retry shortly");
         }
