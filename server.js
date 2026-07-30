@@ -6020,6 +6020,9 @@ const getPublicWatchStatus = async (streamKey) => {
         clients: 0,
         kbps: { recv_30s: 0 },
         encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
+        liveStartedAtMs: ch.live_started_at
+          ? new Date(ch.live_started_at).getTime()
+          : 0,
       };
     }
   } catch (dbErr) {
@@ -8027,7 +8030,11 @@ app.get(
             clients: viewerMetrics.active_viewers,
             viewerMetrics,
             uptime_seconds: uptimeSeconds,
-            encoderGeneration: bitrateCapEncoderGeneration.get(stream.name) || 0,
+            encoderGeneration:
+              bitrateCapEncoderGeneration.get(stream.name) || 0,
+            liveStartedAtMs: liveStartedAt
+              ? new Date(liveStartedAt).getTime()
+              : 0,
           };
         }),
       );
@@ -8041,7 +8048,7 @@ app.get(
       // SRS not reachable - fall back to DB is_live
       try {
         const liveResult = await pool.query(
-          `SELECT stream_key, name,
+          `SELECT stream_key, name, live_started_at,
                   EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
            FROM channels WHERE organization_id = $1 AND is_live = TRUE`,
           [req.organization.id],
@@ -8054,7 +8061,11 @@ app.get(
           kbps: { recv_30s: 0 },
           frames: 0,
           source: "db_webhook",
-          encoderGeneration: bitrateCapEncoderGeneration.get(ch.stream_key) || 0,
+          encoderGeneration:
+            bitrateCapEncoderGeneration.get(ch.stream_key) || 0,
+          liveStartedAtMs: ch.live_started_at
+            ? new Date(ch.live_started_at).getTime()
+            : 0,
         }));
         return res.json({
           ok: true,
