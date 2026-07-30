@@ -6019,6 +6019,7 @@ const getPublicWatchStatus = async (streamKey) => {
         publish: { active: true, active_age: ch.uptime_seconds || 0 },
         clients: 0,
         kbps: { recv_30s: 0 },
+        encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
       };
     }
   } catch (dbErr) {
@@ -6035,6 +6036,12 @@ const getPublicWatchStatus = async (streamKey) => {
       activeStream = (data.streams || []).find(
         (s) => s.name === streamKey && s.publish?.active,
       );
+      if (activeStream) {
+        activeStream = {
+          ...activeStream,
+          encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
+        };
+      }
     } catch {
       /* silent - SRS not reachable from cloud */
     }
@@ -8020,6 +8027,7 @@ app.get(
             clients: viewerMetrics.active_viewers,
             viewerMetrics,
             uptime_seconds: uptimeSeconds,
+            encoderGeneration: bitrateCapEncoderGeneration.get(stream.name) || 0,
           };
         }),
       );
@@ -8046,6 +8054,7 @@ app.get(
           kbps: { recv_30s: 0 },
           frames: 0,
           source: "db_webhook",
+          encoderGeneration: bitrateCapEncoderGeneration.get(ch.stream_key) || 0,
         }));
         return res.json({
           ok: true,
@@ -8274,6 +8283,17 @@ const bitrateCapGeneration = new Map();
 // can ever be alive for a given stream_key at a time.
 const activeBitrateCapProcesses = new Map();
 const MAX_BITRATE_CAP_RETRIES = 3;
+// Bumped every time a NEW ffmpeg process actually spawns for a stream_key's
+// bitrate cap (a crash+retry within the SAME broadcast counts — this is
+// deliberately NOT the same thing as bitrateCapGeneration above, which only
+// changes on a fresh on_publish). A restart here means the underlying
+// encoded video has a genuine cut — new keyframe timing/GOP structure —
+// that SRS's HLS output has no way to mark as EXT-X-DISCONTINUITY, so
+// hls.js has no warning before it tries (and fails) to append across it.
+// Exposed to the frontend via /api/public/watch and /api/srs/streams so a
+// live_capped viewer's player can proactively remount (fresh MediaSource)
+// instead of hitting a bufferAppendError reactively.
+const bitrateCapEncoderGeneration = new Map();
 
 function autoCapBitrateStream(streamKey, capKbps, generation) {
   if (!capKbps) return;
@@ -8370,6 +8390,10 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
 
   const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
   activeBitrateCapProcesses.set(streamKey, ffmpegProcess);
+  bitrateCapEncoderGeneration.set(
+    streamKey,
+    (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
+  );
 
   // Keep only a bounded tail of stderr for diagnostics on failure —
   // deliberately self-limited (unlike exec()'s buffer, this is just for
