@@ -8996,10 +8996,12 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
     const cacheKey = `${streamKey}${qs}`;
     const cached = manifestCache.get(cacheKey);
     let resolvedApp;
+    let resolvedLiveStartedAtMs;
 
     if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
       resolvedApp = cached.resolvedApp;
+      resolvedLiveStartedAtMs = cached.liveStartedAtMs;
     } else {
       const channelResult = await pool.query(
         `SELECT live_started_at FROM channels WHERE stream_key = $1`,
@@ -9025,6 +9027,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       let upstream = null;
       let upstreamUrl = null;
+      let cappedFailed = false;
 
       for (const app of candidateApps) {
         const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
@@ -9046,9 +9049,47 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
             upstreamUrl = candidateUrl;
             resolvedApp = app;
             break;
+          } else if (app === "live_capped") {
+            cappedFailed = true;
           }
         } catch {
+          if (app === "live_capped") {
+            cappedFailed = true;
+          }
           // try the next candidate app
+        }
+      }
+
+      // A fresh (non-sticky) resolution where live_capped failed but the
+      // raw "live" fallback succeeded is NOT necessarily a real cap
+      // failure — live_capped's own ffmpeg can be alive and publishing but
+      // simply hasn't written its first HLS segment yet (confirmed via
+      // real logs: a viewer's first manifest request landing ~4s after
+      // on_publish, well inside live_capped's own startup lag, was enough
+      // to permanently commit that whole broadcast to the uncapped
+      // fallback). Only accept the "live" fallback here once the cap has
+      // definitively given up (its retry budget is exhausted) or its
+      // startup grace window has actually elapsed — otherwise ask the
+      // player to retry shortly, same as the both-failed case below, so
+      // live_capped gets a fair chance to come online first.
+      if (
+        upstream &&
+        resolvedApp === "live" &&
+        !stickyValid &&
+        cappedFailed &&
+        liveStartedAtMs
+      ) {
+        const cappedGaveUp =
+          (bitrateCapRetryCount.get(streamKey) || 0) > MAX_BITRATE_CAP_RETRIES;
+        const pastGraceWindow =
+          Date.now() - liveStartedAtMs >= HLS_CAPPED_STARTUP_GRACE_MS;
+
+        if (!cappedGaveUp && !pastGraceWindow) {
+          console.log(
+            "[HLS] live_capped not ready yet and hasn't given up — asking player to retry shortly instead of committing to raw fallback",
+            { streamKey },
+          );
+          return res.status(503).send("Stream starting, please retry shortly");
         }
       }
 
@@ -9093,6 +9134,8 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
       }
 
+      resolvedLiveStartedAtMs = liveStartedAtMs;
+
       console.log("[HLS RESPONSE]", {
         status: upstream.status,
         contentType: upstream.headers.get("content-type"),
@@ -9110,6 +9153,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       manifestCache.set(cacheKey, {
         text,
         resolvedApp,
+        liveStartedAtMs: resolvedLiveStartedAtMs,
         cachedAt: Date.now(),
       });
     }
@@ -9135,10 +9179,19 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
         if (pathPart.endsWith(".ts")) {
           const segmentName = pathPart.split("/").pop();
+          // Tags each segment URL with this broadcast's liveStartedAt so the
+          // segment proxy's cache (below) can never serve bytes from a PRIOR
+          // session for a filename SRS happens to reuse (its HLS sequence
+          // numbering resets per publish) — confirmed as a real risk since a
+          // 10s OBS stop/restart is well inside the segment cache's 15s TTL.
+          const sessionToken = resolvedLiveStartedAtMs || 0;
+          const sessionSuffix = suffix
+            ? `${suffix}&_s=${sessionToken}`
+            : `?_s=${sessionToken}`;
 
           return `/api/hls/seg/${encodeURIComponent(resolvedApp)}/${encodeURIComponent(
             streamKey,
-          )}/${encodeURIComponent(segmentName)}${suffix}`;
+          )}/${encodeURIComponent(segmentName)}${sessionSuffix}`;
         }
 
         if (pathPart.endsWith(".m3u8")) {
@@ -9171,12 +9224,21 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 });
 
 app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
-  const { app, segment } = req.params;
-  const qs = req.originalUrl.includes("?")
-    ? "?" + req.originalUrl.split("?")[1]
+  const { app, streamKey, segment } = req.params;
+
+  // _s is our own session tag (see the manifest rewrite above), not
+  // something SRS understands — strip it before forwarding upstream, and
+  // use it (not the raw filename alone) as the cache key so a filename
+  // reused by a NEW broadcast session can never resolve to a PRIOR
+  // session's cached bytes.
+  const sessionToken = req.query._s || "0";
+  const upstreamParams = new URLSearchParams(req.query);
+  upstreamParams.delete("_s");
+  const upstreamQs = upstreamParams.toString()
+    ? `?${upstreamParams.toString()}`
     : "";
 
-  const cacheKey = `${app}/${segment}`;
+  const cacheKey = `${app}/${streamKey}/${sessionToken}/${segment}`;
   const cached = segmentCache.get(cacheKey);
   if (cached) {
     res.setHeader("Content-Type", cached.contentType);
@@ -9187,9 +9249,12 @@ app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
   }
 
   try {
-    const upstream = await fetch(`${SRS_HLS_ORIGIN}/${app}/${segment}${qs}`, {
-      signal: AbortSignal.timeout(10000),
-    });
+    const upstream = await fetch(
+      `${SRS_HLS_ORIGIN}/${app}/${segment}${upstreamQs}`,
+      {
+        signal: AbortSignal.timeout(10000),
+      },
+    );
     if (!upstream.ok)
       return res.status(upstream.status).send("Segment unavailable");
     const contentType = "video/mp2t";
