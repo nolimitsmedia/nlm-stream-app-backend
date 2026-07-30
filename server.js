@@ -6078,6 +6078,32 @@ const getPublicWatchStatus = async (streamKey) => {
     console.error("Watch status zone lookup error:", zoneErr.message);
   }
 
+  // Plan-gated delivery features — which HLS manifest to request (single
+  // vs. ABR master playlist) and how aggressively LivePlayer should
+  // buffer both depend on the organization's actual paid plan, not a
+  // platform-wide default. Same organizations/subscriptions/plans join
+  // pattern already used for bitrate-cap lookups elsewhere.
+  let transcodingEnabled = false;
+  let reducedLatencyEnabled = false;
+  try {
+    const planResult = await pool.query(
+      `
+      SELECT p.transcoding_enabled, p.reduced_latency_enabled
+      FROM organizations o
+      LEFT JOIN subscriptions s ON s.organization_id = o.id
+      JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
+      WHERE o.id = $1
+      `,
+      [organizationId],
+    );
+    transcodingEnabled = Boolean(planResult.rows[0]?.transcoding_enabled);
+    reducedLatencyEnabled = Boolean(
+      planResult.rows[0]?.reduced_latency_enabled,
+    );
+  } catch (planErr) {
+    console.error("Watch status plan lookup error:", planErr.message);
+  }
+
   return {
     organization_id: organizationId,
     organization: brandingData.organization,
@@ -6088,6 +6114,8 @@ const getPublicWatchStatus = async (streamKey) => {
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
     hlsBaseUrl,
+    transcodingEnabled,
+    reducedLatencyEnabled,
   };
 };
 
