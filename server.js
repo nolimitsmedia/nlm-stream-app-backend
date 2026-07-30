@@ -8329,30 +8329,20 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     "-y",
     // Input-side resilience flags — added after observing intermittent
     // "Input/output error" crashes reading from the raw 'live' RTMP
-    // input (see BITRATE-CAP crash logs). Best-reasoned explanation:
-    // gop_cache is now off (tonight's latency tuning), so a brand-new
-    // subscriber — including this ffmpeg process — no longer gets an
-    // instant cached keyframe and must wait for the next real one,
-    // which could be a couple seconds out depending on OBS's keyframe
-    // interval. These flags give ffmpeg more patience during that wait
-    // instead of erroring out, and let it auto-reconnect on a genuine
-    // transient read hiccup rather than crashing the whole process.
-    // Not a confirmed root-cause fix — worth comparing crash frequency
-    // before/after in the logs.
+    // input. NOTE: -reconnect/-reconnect_at_eof/-reconnect_streamed/
+    // -reconnect_delay_max were tried here and REMOVED — this ffmpeg
+    // build (5.1.10) rejects them for this input with "Option
+    // reconnect not found.", causing ffmpeg to exit immediately on
+    // every single invocation. That made the crash rate dramatically
+    // worse, not better — confirmed via live logs showing every
+    // attempt failing instantly with that exact message. Keeping only
+    // analyzeduration/probesize/rw_timeout, which were NOT rejected.
     "-analyzeduration",
     "10000000",
     "-probesize",
     "10000000",
     "-rw_timeout",
     "10000000",
-    "-reconnect",
-    "1",
-    "-reconnect_at_eof",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "5",
     "-i",
     input,
     "-map",
