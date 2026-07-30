@@ -8982,8 +8982,21 @@ const stickyHlsApp = new Map(); // streamKey -> { app, liveStartedAtMs }
 // online before its startup lag is treated as a genuine failure and we
 // commit to the uncapped fallback for the rest of that session. Comfortably
 // covers the ~3s spawn delay plus time for ffmpeg to connect and produce
-// its first HLS segment.
+// its first HLS segment. Used when BOTH live_capped and raw live have
+// failed — waiting the full window costs nothing extra there, since
+// there's no video to show either way.
 const HLS_CAPPED_STARTUP_GRACE_MS = 20 * 1000;
+
+// Shorter, separate tolerance for the specific case where raw 'live'
+// DID succeed but live_capped hasn't (yet) — i.e. a viewer could be
+// watching uncapped right now if we don't wait. Observed live_capped
+// crash-and-auto-retry cycles take ~2s in practice, so this gives
+// comfortable margin to absorb that without leaving a viewer stuck on
+// a black screen for the full 20s grace window if the transcode is
+// genuinely slow to start this time. Past this shorter window, fall
+// back to raw rather than keep blocking — bounded risk of a brief
+// uncapped moment beats an open-ended stuck player.
+const HLS_CAPPED_RACE_TOLERANCE_MS = 8 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -9037,7 +9050,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       let upstream = null;
       let upstreamUrl = null;
-      let cappedFailedWithinGrace = false;
+      let rawDeferredDueToRaceTolerance = false;
 
       for (const app of candidateApps) {
         const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
@@ -9055,22 +9068,25 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
           });
 
           if (candidateResponse.ok) {
-            // A live_capped failure during the startup-grace window is
-            // NOT a green light to accept 'live' (raw) as the resolved
-            // app — that's exactly the race that let a transient
-            // live_capped crash-and-auto-retry (which recovers a couple
-            // seconds later on its own) permanently strand a viewer on
-            // the uncapped stream for the rest of the broadcast, since
-            // sticky-app then never re-checks. Treat this the same as
-            // "not ready yet" instead — see the withinStartupGrace
-            // branch below.
+            // A live_capped failure within the short race-tolerance
+            // window is NOT a green light to accept 'live' (raw) as the
+            // resolved app — that's exactly the race that let a
+            // transient live_capped crash-and-auto-retry (which
+            // recovers a couple seconds later on its own) permanently
+            // strand a viewer on the uncapped stream for the rest of
+            // the broadcast, since sticky-app then never re-checks.
+            // Defer instead — see the withinStartupGrace branch below,
+            // which returns "retry shortly" for this request. Past
+            // HLS_CAPPED_RACE_TOLERANCE_MS, stop deferring and accept
+            // raw, rather than blocking the viewer all the way out to
+            // the full HLS_CAPPED_STARTUP_GRACE_MS window.
             if (
               app === "live" &&
               !stickyValid &&
               liveStartedAtMs &&
-              Date.now() - liveStartedAtMs < HLS_CAPPED_STARTUP_GRACE_MS
+              Date.now() - liveStartedAtMs < HLS_CAPPED_RACE_TOLERANCE_MS
             ) {
-              cappedFailedWithinGrace = true;
+              rawDeferredDueToRaceTolerance = true;
               continue;
             }
 
@@ -9107,7 +9123,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         if (withinStartupGrace) {
           console.log(
             "[HLS] Within startup grace window, asking player to retry shortly",
-            { streamKey, cappedFailedWithinGrace },
+            { streamKey, rawDeferredDueToRaceTolerance },
           );
           return res.status(503).send("Stream starting, please retry shortly");
         }
