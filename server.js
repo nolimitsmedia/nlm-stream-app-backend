@@ -1815,8 +1815,8 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
     `
     SELECT
       s.id AS subscription_id,
-      s.organization_id,
-      s.plan_key,
+      o.id AS organization_id,
+      COALESCE(s.plan_key, o.subscription_plan, 'starter') AS plan_key,
       s.status,
       s.trial_ends_at,
       s.current_period_start,
@@ -1846,27 +1846,28 @@ const getOrganizationSubscriptionSummary = async (organizationId) => {
       COALESCE(channel_usage.count, 0)::int AS used_channels,
       COALESCE(member_usage.count, 0)::int AS used_admins,
       COALESCE(storage_usage.total_bytes, 0)::bigint AS used_storage_bytes
-    FROM subscriptions s
-    JOIN plans p ON p.plan_key = s.plan_key
+    FROM organizations o
+    LEFT JOIN subscriptions s ON s.organization_id = o.id
+    JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
     LEFT JOIN (
       SELECT organization_id, COUNT(*) AS count
       FROM channels
       WHERE organization_id = $1
       GROUP BY organization_id
-    ) channel_usage ON channel_usage.organization_id = s.organization_id
+    ) channel_usage ON channel_usage.organization_id = o.id
     LEFT JOIN (
       SELECT organization_id, COUNT(*) AS count
       FROM organization_users
       WHERE organization_id = $1
       GROUP BY organization_id
-    ) member_usage ON member_usage.organization_id = s.organization_id
+    ) member_usage ON member_usage.organization_id = o.id
     LEFT JOIN (
       SELECT organization_id, SUM(file_size_bytes) AS total_bytes
       FROM recordings
       WHERE organization_id = $1
       GROUP BY organization_id
-    ) storage_usage ON storage_usage.organization_id = s.organization_id
-    WHERE s.organization_id = $1
+    ) storage_usage ON storage_usage.organization_id = o.id
+    WHERE o.id = $1
     LIMIT 1
     `,
     [organizationId],
@@ -6002,6 +6003,40 @@ const getPublicWatchStatus = async (streamKey) => {
   let activeStream = null;
   const organizationId = await getOrganizationIdForStreamKey(streamKey);
 
+  // Reduced-latency and ABR/transcoding plan flags — previously wired into
+  // this response but found missing on a fresh audit against the actual
+  // deployed server.js (WatchPage.jsx defaults both to false when the API
+  // doesn't send them, so this silently disabled reduced latency and ABR
+  // for every organization, not just some). Uses the same LEFT JOIN +
+  // COALESCE(s.plan_key, o.subscription_plan, 'starter') pattern already
+  // proven correct in getOrgMaxBitrateKbps, rather than
+  // getOrganizationSubscriptionSummary's plain JOIN, since that function
+  // returns null entirely for an org with no subscriptions row yet.
+  let reducedLatencyEnabled = false;
+  let transcodingEnabled = false;
+  if (organizationId) {
+    try {
+      const planFlagsResult = await pool.query(
+        `
+        SELECT p.reduced_latency_enabled, p.transcoding_enabled
+        FROM organizations o
+        LEFT JOIN subscriptions s ON s.organization_id = o.id
+        JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
+        WHERE o.id = $1
+        `,
+        [organizationId],
+      );
+      reducedLatencyEnabled = Boolean(
+        planFlagsResult.rows[0]?.reduced_latency_enabled,
+      );
+      transcodingEnabled = Boolean(
+        planFlagsResult.rows[0]?.transcoding_enabled,
+      );
+    } catch (planErr) {
+      console.error("Watch status plan flags lookup error:", planErr.message);
+    }
+  }
+
   // PRIMARY: Check DB is_live flag set by SRS on_publish webhook
   try {
     const channelResult = await pool.query(
@@ -6098,6 +6133,8 @@ const getPublicWatchStatus = async (streamKey) => {
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
     hlsBaseUrl,
+    reducedLatencyEnabled,
+    transcodingEnabled,
   };
 };
 
@@ -8089,19 +8126,29 @@ app.get(
 // ── Helper: get plan limits for an org ────────────────────────────
 async function getOrgStreamingPlan(organizationId) {
   try {
+    // Previously queried a `subscription_plans` table that — confirmed via
+    // a direct DB check — does not exist at all ("relation does not
+    // exist"). Its error was silently swallowed by the catch below,
+    // meaning EVERY organization got transcoding_enabled: false and
+    // max_concurrent_streams: 1 regardless of actual plan, on every single
+    // broadcast — a real, live bug (e.g. a Premium org with 5 channels
+    // could never have more than 1 simultaneously live). Fixed to use the
+    // real `plans` table with the same safe LEFT JOIN + COALESCE fallback
+    // used elsewhere. max_channels doubles as the concurrent-live-stream
+    // ceiling since there's no separate "concurrent streams" concept
+    // anywhere else in the plan model — a plan's channel count is what it
+    // can have live at once.
     const result = await pool.query(
       `
       SELECT
-        sub.plan_key,
-        sp.transcoding_enabled,
-        sp.max_channels,
-        COALESCE(sp.max_concurrent_streams, 999) AS max_concurrent_streams
-      FROM subscriptions sub
-      JOIN subscription_plans sp ON sp.plan_key = sub.plan_key
-      WHERE sub.organization_id = $1
-        AND sub.status IN ('active', 'trialing')
-      ORDER BY sub.created_at DESC
-      LIMIT 1
+        COALESCE(s.plan_key, o.subscription_plan, 'starter') AS plan_key,
+        p.transcoding_enabled,
+        p.max_channels,
+        p.max_channels AS max_concurrent_streams
+      FROM organizations o
+      LEFT JOIN subscriptions s ON s.organization_id = o.id
+      JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
+      WHERE o.id = $1
       `,
       [organizationId],
     );
@@ -8111,7 +8158,11 @@ async function getOrgStreamingPlan(organizationId) {
         max_concurrent_streams: 1,
       }
     );
-  } catch {
+  } catch (err) {
+    console.error(
+      `[PLAN] Failed to look up streaming plan for org ${organizationId}, defaulting to most restrictive limits:`,
+      err.message,
+    );
     return { transcoding_enabled: false, max_concurrent_streams: 1 };
   }
 }
@@ -8825,8 +8876,8 @@ const pollBandwidthCompliance = async () => {
              o.bunny_recordings_pull_zone_id,
              p.max_cdn_bandwidth_gb, p.max_egress_bandwidth_gb
       FROM organizations o
-      JOIN subscriptions s ON s.organization_id = o.id
-      JOIN plans p ON p.plan_key = s.plan_key
+      LEFT JOIN subscriptions s ON s.organization_id = o.id
+      JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
       WHERE o.bunny_pull_zone_id IS NOT NULL
       `,
     );
