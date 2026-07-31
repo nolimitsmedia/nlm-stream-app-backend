@@ -8183,10 +8183,58 @@ async function getActiveLiveCount(organizationId) {
 // that buffer fills, which any long-running ffmpeg process will
 // eventually hit. This pre-existed the bitrate-cap work but shares the
 // identical flaw, so it's fixed here at the same time.
-const spawnFfmpegVariant = (label, streamKey, args) => {
-  const proc = spawn("ffmpeg", args);
-  let stderrTail = "";
+const activeTranscodeProcesses = new Map(); // key: `${streamKey}:${label}`
+const transcodeRetryCount = new Map(); // key: `${streamKey}:${label}`
+const MAX_TRANSCODE_RETRIES = 3;
 
+// NOTE: bitrateCapGeneration, bitrateCapEncoderGeneration, and
+// isServerLoadTooHighForNewTranscode are declared further down this file
+// but are only ever referenced here from inside function bodies invoked at
+// runtime (never at module-load time), so by the time any of these actually
+// run, every top-level const below has already been initialized.
+const spawnFfmpegVariant = (label, streamKey, args, generation) => {
+  // Same supersession guard as autoCapBitrateStream — abandon if a newer
+  // broadcast session has started since this call was scheduled, rather
+  // than risk racing a fresh attempt to publish to the same output name.
+  if (bitrateCapGeneration.get(streamKey) !== generation) {
+    console.log(
+      `[Transcode] Skipping superseded ${label} session for ${streamKey} (a newer broadcast session has since started).`,
+    );
+    return;
+  }
+
+  const retryKey = `${streamKey}:${label}`;
+
+  const priorProcess = activeTranscodeProcesses.get(retryKey);
+  if (priorProcess && priorProcess.exitCode === null && !priorProcess.killed) {
+    console.warn(
+      `[Transcode] Killing still-alive prior ${label} instance for ${streamKey} before starting a new one.`,
+    );
+    priorProcess.kill("SIGKILL");
+  }
+
+  if (isServerLoadTooHighForNewTranscode()) {
+    console.warn(
+      `[Transcode] Server load too high — skipping ${label} for ${streamKey}.`,
+    );
+    return;
+  }
+
+  const proc = spawn("ffmpeg", args);
+  activeTranscodeProcesses.set(retryKey, proc);
+
+  // Shared with the bitrate-cap process's own generation counter — ANY of
+  // the three transcodes (live_capped, 720p, 480p) restarting bumps this
+  // same value, so the frontend's remount key (encoderGeneration) reflects
+  // a real discontinuity regardless of which specific rendition changed
+  // underneath it. Previously this only bumped for live_capped, leaving
+  // 720p/480p restarts invisible to the player entirely.
+  bitrateCapEncoderGeneration.set(
+    streamKey,
+    (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
+  );
+
+  let stderrTail = "";
   proc.stderr.on("data", (chunk) => {
     stderrTail += chunk.toString();
     if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
@@ -8199,70 +8247,146 @@ const spawnFfmpegVariant = (label, streamKey, args) => {
     );
   });
 
-  proc.on("exit", (code, signal) => {
-    if (code === 0 || code === null) return;
+  proc.on("exit", async (code, signal) => {
+    if (activeTranscodeProcesses.get(retryKey) === proc) {
+      activeTranscodeProcesses.delete(retryKey);
+    }
+
+    if (code === 0 || code === null) return; // clean exit — nothing to retry
+
+    // A newer session has started since THIS process was spawned — stay
+    // quiet, this exit is expected (superseded), not a real failure.
+    if (bitrateCapGeneration.get(streamKey) !== generation) return;
+
     console.error(
-      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- stderr tail ---\n${stderrTail}`,
+      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- ffmpeg stderr (last ~4000 chars) ---\n${stderrTail}`,
     );
+
+    // Only retry if the raw source is STILL actually live — same guard as
+    // the bitrate-cap retry chain, for the same reason.
+    try {
+      const liveCheck = await pool.query(
+        `SELECT is_live FROM channels WHERE stream_key = $1`,
+        [streamKey],
+      );
+
+      if (!liveCheck.rows[0]?.is_live) return;
+
+      const attempts = (transcodeRetryCount.get(retryKey) || 0) + 1;
+      transcodeRetryCount.set(retryKey, attempts);
+
+      if (attempts > MAX_TRANSCODE_RETRIES) {
+        console.error(
+          `[Transcode] Giving up on ${label} for ${streamKey} after ${attempts} failed attempts — that rendition will be unavailable for the rest of this broadcast.`,
+        );
+        return;
+      }
+
+      console.warn(
+        `[Transcode] ${label} ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_TRANSCODE_RETRIES}) for ${streamKey}`,
+      );
+      setTimeout(
+        () => spawnFfmpegVariant(label, streamKey, args, generation),
+        5000,
+      );
+    } catch (err) {
+      console.error(
+        `[Transcode] Failed to check live status for ${streamKey} before retrying ${label}:`,
+        err.message,
+      );
+    }
   });
 };
 
-function autoTranscodeStream(streamKey) {
+function autoTranscodeStream(streamKey, generation) {
+  if (bitrateCapGeneration.get(streamKey) !== generation) {
+    console.log(
+      `[Transcode] Skipping superseded session for ${streamKey} (a newer broadcast session has since started).`,
+    );
+    return;
+  }
+
   const input = `rtmp://localhost/live/${streamKey}`;
   const out720 = `rtmp://localhost/live/${streamKey}_720p`;
   const out480 = `rtmp://localhost/live/${streamKey}_480p`;
 
   console.log(`[Transcode] Starting 720p + 480p for: ${streamKey}`);
 
-  spawnFfmpegVariant("720p", streamKey, [
-    "-y",
-    "-i",
-    input,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a:0?",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-b:v",
-    "2500k",
-    "-s",
-    "1280x720",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    "-f",
-    "flv",
-    out720,
-  ]);
+  // Same input-side resilience flags already proven to reduce (not fully
+  // eliminate — see MAX_TRANSCODE_RETRIES above for the rest) the
+  // "Input/output error" crash rate on the bitrate-cap transcode reading
+  // this exact same RTMP source. Applied here too since these two
+  // processes hit the identical risk reading from the raw live app.
+  const inputResilienceFlags = [
+    "-analyzeduration",
+    "10000000",
+    "-probesize",
+    "10000000",
+    "-rw_timeout",
+    "10000000",
+  ];
 
-  spawnFfmpegVariant("480p", streamKey, [
-    "-y",
-    "-i",
-    input,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a:0?",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-b:v",
-    "1200k",
-    "-s",
-    "854x480",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "96k",
-    "-f",
-    "flv",
-    out480,
-  ]);
+  spawnFfmpegVariant(
+    "720p",
+    streamKey,
+    [
+      "-y",
+      ...inputResilienceFlags,
+      "-i",
+      input,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-b:v",
+      "2500k",
+      "-s",
+      "1280x720",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-f",
+      "flv",
+      out720,
+    ],
+    generation,
+  );
+
+  spawnFfmpegVariant(
+    "480p",
+    streamKey,
+    [
+      "-y",
+      ...inputResilienceFlags,
+      "-i",
+      input,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-b:v",
+      "1200k",
+      "-s",
+      "854x480",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "96k",
+      "-f",
+      "flv",
+      out480,
+    ],
+    generation,
+  );
 }
 
 // ══════════════════════════════════════════
@@ -9292,7 +9416,29 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       })
       .join("\n");
 
-    return res.send(rewritten);
+    // Embed a session marker as a custom, harmless #EXT-X- tag (any
+    // spec-compliant HLS parser, hls.js included, safely ignores tags it
+    // doesn't recognize) — combines this broadcast's liveStartedAtMs with
+    // the shared transcode-restart counter, so LivePlayer.jsx can detect a
+    // real discontinuity (a fresh session OR any of live_capped/720p/480p
+    // restarting mid-broadcast) on its OWN manifest-polling cadence
+    // (roughly every segment duration) rather than depending on the
+    // frontend's separate, much slower external poll (App.jsx's
+    // setInterval(fetchStreams, 3000)) to notice and remount the player.
+    // That external poll is what encoderGeneration/liveStartedAtMs already
+    // feed — this is the same signal, just delivered fast enough to
+    // actually win the race against hls.js's own internal polling instead
+    // of losing it, which is what let a real discontinuity slip through as
+    // a bufferAppendError even after the React-level remount fix.
+    const sessionMarker = `#EXT-X-NLM-SESSION:${resolvedLiveStartedAtMs || 0}-${
+      bitrateCapEncoderGeneration.get(streamKey) || 0
+    }`;
+    const finalManifest = rewritten.replace(
+      /^#EXTM3U/,
+      `#EXTM3U\n${sessionMarker}`,
+    );
+
+    return res.send(finalManifest);
   } catch (err) {
     console.error("[HLS PROXY FAILED]", {
       name: err.name,
@@ -9435,10 +9581,21 @@ app.post("/api/srs/on_publish", async (req, res) => {
       [streamKey],
     );
 
+    // New broadcast session — bump the shared generation so any OLD retry
+    // chain still in-flight for this stream_key (bitrate cap OR ABR
+    // transcode, e.g. from a brief encoder reconnect blip) recognizes it's
+    // been superseded and abandons itself, instead of racing this new
+    // attempt to publish to the same output names.
+    const generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
+    bitrateCapGeneration.set(streamKey, generation);
+    bitrateCapRetryCount.delete(streamKey); // fresh session, fresh retry budget
+    transcodeRetryCount.delete(`${streamKey}:720p`);
+    transcodeRetryCount.delete(`${streamKey}:480p`);
+
     // 4. Auto-transcode if plan allows
     if (plan.transcoding_enabled) {
       // Small delay so SRS stream is stable before FFmpeg connects
-      setTimeout(() => autoTranscodeStream(streamKey), 3000);
+      setTimeout(() => autoTranscodeStream(streamKey, generation), 3000);
     }
 
     // 4b. Hard bitrate cap — spawns a transcode that forces this stream's
@@ -9448,14 +9605,6 @@ app.post("/api/srs/on_publish", async (req, res) => {
     getOrgMaxBitrateKbps(channel.org_id)
       .then((capKbps) => {
         if (capKbps) {
-          // New broadcast session — bump the generation so any OLD retry
-          // chain still in-flight for this stream_key (e.g. from a brief
-          // encoder reconnect blip) recognizes it's been superseded and
-          // abandons itself, instead of racing this new attempt to
-          // publish to the same live_capped/{streamKey} name.
-          const generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
-          bitrateCapGeneration.set(streamKey, generation);
-          bitrateCapRetryCount.delete(streamKey); // fresh session, fresh retry budget
           setTimeout(
             () => autoCapBitrateStream(streamKey, capKbps, generation),
             3000,
