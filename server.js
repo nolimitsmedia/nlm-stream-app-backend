@@ -899,8 +899,14 @@ const ensureOrganizationTables = async () => {
     ADD COLUMN IF NOT EXISTS bunny_storage_zone_password TEXT,
     ADD COLUMN IF NOT EXISTS bunny_recordings_pull_zone_id VARCHAR(40),
     ADD COLUMN IF NOT EXISTS bunny_recordings_cdn_url VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS bunny_provisioned_at TIMESTAMPTZ
+    ADD COLUMN IF NOT EXISTS bunny_provisioned_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS transcoding_override BOOLEAN
   `);
+  // transcoding_override: NULL (default) means "use the plan's default";
+  // TRUE/FALSE lets a specific org be opted in or out of ABR/transcoding
+  // independent of its plan — for staging a rollout to one or two willing
+  // orgs before widening it to every Deluxe/Premium org at once, without
+  // needing to change anything about their actual plan/billing.
 
   const defaultOrgResult = await pool.query(`
     INSERT INTO organizations (name, slug, primary_color, subscription_plan)
@@ -3234,6 +3240,59 @@ app.put(
         message: "Failed to update organization settings",
         error: error.message,
       });
+    }
+  },
+);
+
+// Lets a super_admin opt one specific org into (or out of) ABR/transcoding
+// independent of its plan — for staging a rollout to a willing test org
+// before widening transcoding_enabled to every Deluxe/Premium org at once.
+// override: true/false pins it explicitly; null clears it back to
+// following the plan's default (see transcoding_override column).
+app.patch(
+  "/api/admin/organizations/:id/transcoding-override",
+  authenticateAdmin,
+  async (req, res) => {
+    if (req.admin.role !== "super_admin") {
+      return res.status(403).json({
+        ok: false,
+        message: "Only super admins can set a per-org transcoding override",
+      });
+    }
+
+    const { id } = req.params;
+    const { override } = req.body;
+
+    if (override !== null && typeof override !== "boolean") {
+      return res.status(400).json({
+        ok: false,
+        message:
+          "override must be true, false, or null (null clears it and falls back to the plan default)",
+      });
+    }
+
+    try {
+      const result = await pool.query(
+        `UPDATE organizations SET transcoding_override = $1, updated_at = NOW()
+         WHERE id = $2 RETURNING id, name, transcoding_override`,
+        [override, id],
+      );
+
+      if (!result.rows[0]) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Organization not found" });
+      }
+
+      console.log(
+        `[ADMIN] transcoding_override for org ${result.rows[0].name} (${id}) set to ${
+          override === null ? "null (plan default)" : override
+        } by ${req.admin.email || req.admin.id}`,
+      );
+
+      res.json({ ok: true, organization: result.rows[0] });
+    } catch (err) {
+      res.status(500).json({ ok: false, message: err.message });
     }
   },
 );
@@ -6018,7 +6077,8 @@ const getPublicWatchStatus = async (streamKey) => {
     try {
       const planFlagsResult = await pool.query(
         `
-        SELECT p.reduced_latency_enabled, p.transcoding_enabled
+        SELECT p.reduced_latency_enabled,
+               COALESCE(o.transcoding_override, p.transcoding_enabled) AS transcoding_enabled
         FROM organizations o
         LEFT JOIN subscriptions s ON s.organization_id = o.id
         JOIN plans p ON p.plan_key = COALESCE(s.plan_key, o.subscription_plan, 'starter')
@@ -8142,7 +8202,7 @@ async function getOrgStreamingPlan(organizationId) {
       `
       SELECT
         COALESCE(s.plan_key, o.subscription_plan, 'starter') AS plan_key,
-        p.transcoding_enabled,
+        COALESCE(o.transcoding_override, p.transcoding_enabled) AS transcoding_enabled,
         p.max_channels,
         p.max_channels AS max_concurrent_streams
       FROM organizations o
@@ -8192,6 +8252,32 @@ const MAX_TRANSCODE_RETRIES = 3;
 // but are only ever referenced here from inside function bodies invoked at
 // runtime (never at module-load time), so by the time any of these actually
 // run, every top-level const below has already been initialized.
+// Writes the FULL captured stderr for a crashed ffmpeg process to a file,
+// for real root-cause diagnosis of the recurring "Input/output error"
+// crashes — the previous approach only ever logged the last ~4000 chars,
+// which for a quick crash (~10-30s, per observed logs) is mostly just the
+// libx264 encoder stats dump printed right before exit, very likely
+// pushing the actual first error line (which appears EARLIER in ffmpeg's
+// output) out of that window entirely. Returns the file path so the
+// caller can log a pointer to it instead of the whole thing.
+const FFMPEG_CRASH_LOG_DIR = "/tmp/ffmpeg-crash-logs";
+const dumpFfmpegCrashLog = (label, streamKey, fullStderr) => {
+  try {
+    if (!fs.existsSync(FFMPEG_CRASH_LOG_DIR)) {
+      fs.mkdirSync(FFMPEG_CRASH_LOG_DIR, { recursive: true });
+    }
+    const filePath = `${FFMPEG_CRASH_LOG_DIR}/${label}-${streamKey}-${Date.now()}.log`;
+    fs.writeFileSync(filePath, fullStderr);
+    return filePath;
+  } catch (err) {
+    console.error(
+      `[FFMPEG-CRASH-LOG] Failed to write full stderr dump for ${label}/${streamKey}:`,
+      err.message,
+    );
+    return null;
+  }
+};
+
 const spawnFfmpegVariant = (label, streamKey, args, generation) => {
   // Same supersession guard as autoCapBitrateStream — abandon if a newer
   // broadcast session has started since this call was scheduled, rather
@@ -8234,10 +8320,13 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
     (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
   );
 
+  // Bounded rolling buffer (50KB, up from the original 4000 chars) — large
+  // enough to capture the real error line even on a fast crash, without
+  // growing unbounded for a long healthy stream.
   let stderrTail = "";
   proc.stderr.on("data", (chunk) => {
     stderrTail += chunk.toString();
-    if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+    if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
   });
 
   proc.on("error", (err) => {
@@ -8258,8 +8347,13 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
     // quiet, this exit is expected (superseded), not a real failure.
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
+    const crashLogPath = dumpFfmpegCrashLog(label, streamKey, stderrTail);
     console.error(
-      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- ffmpeg stderr (last ~4000 chars) ---\n${stderrTail}`,
+      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}` +
+        (crashLogPath
+          ? ` — full stderr (${stderrTail.length} chars) written to ${crashLogPath}`
+          : "") +
+        `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
     );
 
     // Only retry if the raw source is STILL actually live — same guard as
@@ -8628,13 +8722,13 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
   );
 
-  // Keep only a bounded tail of stderr for diagnostics on failure —
-  // deliberately self-limited (unlike exec()'s buffer, this is just for
-  // our own logging, not something that can kill the process).
+  // Bounded rolling buffer (50KB, up from the original 4000 chars) — large
+  // enough to capture the real error line even on a fast crash, without
+  // growing unbounded for a long healthy stream.
   let stderrTail = "";
   ffmpegProcess.stderr.on("data", (chunk) => {
     stderrTail += chunk.toString();
-    if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+    if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
   });
 
   ffmpegProcess.on("error", (err) => {
@@ -8659,8 +8753,17 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     // failure worth logging or retrying over.
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
+    const crashLogPath = dumpFfmpegCrashLog(
+      "BITRATE-CAP",
+      streamKey,
+      stderrTail,
+    );
     console.error(
-      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}\n--- ffmpeg stderr (last ~4000 chars) ---\n${stderrTail}`,
+      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}` +
+        (crashLogPath
+          ? ` — full stderr (${stderrTail.length} chars) written to ${crashLogPath}`
+          : "") +
+        `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
     );
 
     // Only retry if the raw source is STILL actually live — if the
