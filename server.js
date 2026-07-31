@@ -8317,6 +8317,12 @@ function autoTranscodeStream(streamKey, generation) {
   // "Input/output error" crash rate on the bitrate-cap transcode reading
   // this exact same RTMP source. Applied here too since these two
   // processes hit the identical risk reading from the raw live app.
+  // +genpts/discardcorrupt and avoid_negative_ts guard against timestamp
+  // irregularities inherited from OBS/the RTMP input that could otherwise
+  // produce a genuine MSE bufferAppendError downstream with no encoder
+  // restart involved at all — a real gap identified when we found
+  // bufferAppendError occurrences with zero corresponding ffmpeg
+  // crash/restart in the logs.
   const inputResilienceFlags = [
     "-analyzeduration",
     "10000000",
@@ -8324,6 +8330,27 @@ function autoTranscodeStream(streamKey, generation) {
     "10000000",
     "-rw_timeout",
     "10000000",
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-avoid_negative_ts",
+    "make_zero",
+  ];
+
+  // Forces a keyframe exactly every 2 real-time seconds, matching SRS's
+  // hls_fragment 2 setting, so segment boundaries land on predictable
+  // keyframes instead of drifting. Deliberately timestamp-based
+  // (gte(t,...)) rather than a frame-count based -g/-keyint_min value —
+  // a fixed frame-count GOP would need to match the SOURCE's actual frame
+  // rate (e.g. -g 60 for 30fps, -g 120 for 60fps), which we don't reliably
+  // know per-client; a wrong assumption there would silently misalign
+  // keyframes instead of fixing anything. sc_threshold 0 disables
+  // scene-cut-triggered keyframes so only these forced ones apply,
+  // keeping the interval exact rather than approximate.
+  const keyframeAlignmentFlags = [
+    "-force_key_frames",
+    "expr:gte(t,n_forced*2)",
+    "-sc_threshold",
+    "0",
   ];
 
   spawnFfmpegVariant(
@@ -8342,6 +8369,7 @@ function autoTranscodeStream(streamKey, generation) {
       "libx264",
       "-preset",
       "veryfast",
+      ...keyframeAlignmentFlags,
       "-b:v",
       "2500k",
       "-s",
@@ -8373,6 +8401,7 @@ function autoTranscodeStream(streamKey, generation) {
       "libx264",
       "-preset",
       "veryfast",
+      ...keyframeAlignmentFlags,
       "-b:v",
       "1200k",
       "-s",
@@ -8543,12 +8572,23 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     // worse, not better — confirmed via live logs showing every
     // attempt failing instantly with that exact message. Keeping only
     // analyzeduration/probesize/rw_timeout, which were NOT rejected.
+    // fflags/avoid_negative_ts added later, guarding against timestamp
+    // irregularities that could cause a genuine downstream MSE
+    // bufferAppendError with no encoder restart involved — these are
+    // generic libavformat-level options (not RTMP-protocol-specific like
+    // -reconnect* above), so they're expected to be safe for this build,
+    // but that's not yet confirmed against a real run — verify no
+    // "Option ... not found" errors appear after deploying this.
     "-analyzeduration",
     "10000000",
     "-probesize",
     "10000000",
     "-rw_timeout",
     "10000000",
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-avoid_negative_ts",
+    "make_zero",
     "-i",
     input,
     "-map",
@@ -8559,6 +8599,13 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     "libx264",
     "-preset",
     "veryfast",
+    // Same frame-rate-agnostic forced-keyframe alignment used on the ABR
+    // renditions — see keyframeAlignmentFlags in autoTranscodeStream for
+    // the full reasoning (timestamp-based, not a hardcoded -g value).
+    "-force_key_frames",
+    "expr:gte(t,n_forced*2)",
+    "-sc_threshold",
+    "0",
     "-b:v",
     `${capKbps}k`,
     "-maxrate",
