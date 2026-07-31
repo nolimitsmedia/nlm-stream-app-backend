@@ -9193,6 +9193,39 @@ setInterval(() => {
   }
 }, 30000).unref();
 
+// Lightweight, SRS-free session-info endpoint — purely for
+// LivePlayer.jsx's fast discontinuity-detection poll (see
+// SESSION_MARKER_POLL_MS there). Deliberately does NOT touch SRS or the
+// manifest proxy at all: an earlier version of this fix had LivePlayer
+// re-fetch the actual .m3u8 manifest every 1.5s to check this, but that
+// created a genuinely new problem — each of those fetches was an
+// anonymous, session-less request indistinguishable from a real new HLS
+// viewer connecting and immediately disconnecting, confirmed via a flood
+// of on_stop events in the SRS logs every ~1.5-10s for the entire
+// broadcast. This endpoint answers directly from in-memory state instead,
+// so polling it has zero effect on SRS, zero effect on viewer/session
+// tracking, and is far cheaper besides.
+app.get("/api/hls/session/:streamKey", async (req, res) => {
+  try {
+    const { streamKey } = req.params;
+
+    const result = await pool.query(
+      `SELECT live_started_at FROM channels WHERE stream_key = $1`,
+      [streamKey],
+    );
+
+    const liveStartedAtMs = result.rows[0]?.live_started_at
+      ? new Date(result.rows[0].live_started_at).getTime()
+      : 0;
+    const encoderGeneration = bitrateCapEncoderGeneration.get(streamKey) || 0;
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, liveStartedAtMs, encoderGeneration });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
 
@@ -9416,29 +9449,7 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       })
       .join("\n");
 
-    // Embed a session marker as a custom, harmless #EXT-X- tag (any
-    // spec-compliant HLS parser, hls.js included, safely ignores tags it
-    // doesn't recognize) — combines this broadcast's liveStartedAtMs with
-    // the shared transcode-restart counter, so LivePlayer.jsx can detect a
-    // real discontinuity (a fresh session OR any of live_capped/720p/480p
-    // restarting mid-broadcast) on its OWN manifest-polling cadence
-    // (roughly every segment duration) rather than depending on the
-    // frontend's separate, much slower external poll (App.jsx's
-    // setInterval(fetchStreams, 3000)) to notice and remount the player.
-    // That external poll is what encoderGeneration/liveStartedAtMs already
-    // feed — this is the same signal, just delivered fast enough to
-    // actually win the race against hls.js's own internal polling instead
-    // of losing it, which is what let a real discontinuity slip through as
-    // a bufferAppendError even after the React-level remount fix.
-    const sessionMarker = `#EXT-X-NLM-SESSION:${resolvedLiveStartedAtMs || 0}-${
-      bitrateCapEncoderGeneration.get(streamKey) || 0
-    }`;
-    const finalManifest = rewritten.replace(
-      /^#EXTM3U/,
-      `#EXTM3U\n${sessionMarker}`,
-    );
-
-    return res.send(finalManifest);
+    return res.send(rewritten);
   } catch (err) {
     console.error("[HLS PROXY FAILED]", {
       name: err.name,
