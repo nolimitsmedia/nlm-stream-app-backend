@@ -9801,8 +9801,17 @@ app.post("/api/srs/on_publish", async (req, res) => {
 
     // 4. Auto-transcode if plan allows
     if (plan.transcoding_enabled) {
-      // Small delay so SRS stream is stable before FFmpeg connects
-      setTimeout(() => autoTranscodeStream(streamKey, generation), 3000);
+      // Delay so SRS's source object is stable before FFmpeg connects.
+      // Bumped from 3000ms to 7000ms while investigating an intermittent
+      // race where our own ffmpeg-as-RTMP-consumer occasionally receives
+      // zero messages for its entire connected lifetime and times out —
+      // confirmed via SRS logs to be a real, if intermittent, condition
+      // distinct from the (already-fixed) queue_length/pacing issues.
+      // Three SRS-side tunables (min_latency, mw_latency, mw_msgs) were
+      // tested and ruled out as the sole cause; this tests whether the
+      // race is instead sensitive to how soon after on_publish our own
+      // consumer attaches, rather than anything in SRS's play{} config.
+      setTimeout(() => autoTranscodeStream(streamKey, generation), 7000);
     }
 
     // 4b. Hard bitrate cap — spawns a transcode that forces this stream's
@@ -9814,7 +9823,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
         if (capKbps) {
           setTimeout(
             () => autoCapBitrateStream(streamKey, capKbps, generation),
-            3000,
+            7000,
           );
         }
       })
