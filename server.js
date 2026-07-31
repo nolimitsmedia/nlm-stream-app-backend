@@ -9205,6 +9205,52 @@ setInterval(() => {
 // broadcast. This endpoint answers directly from in-memory state instead,
 // so polling it has zero effect on SRS, zero effect on viewer/session
 // tracking, and is far cheaper besides.
+// Viewer-side HLS error reporting — see LivePlayer.jsx's reportPlayerError.
+// Turns any real playback error (bufferAppendError and friends) into a
+// server-side log entry automatically, for any viewer, on any org, at any
+// time — previously the ONLY way to see one of these was someone happening
+// to have DevTools open at the exact moment it happened. Deliberately just
+// logs (no new DB table) to match the existing BITRATE-CAP/Transcode]
+// logging pattern, and is de-duped per stream+error type so a persistent
+// issue doesn't flood the logs — but always logs immediately on a fatal
+// error, since those are rare enough to want zero delay on.
+const lastPlayerErrorLoggedAt = new Map(); // key: `${streamKey}:${errorType}`
+const PLAYER_ERROR_DEDUPE_MS = 10000;
+
+app.post("/api/player/error-report", (req, res) => {
+  try {
+    const { streamKey, errorType, details, fatal, sessionInfo, playerKind } =
+      req.body || {};
+
+    if (!streamKey || !errorType) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "streamKey and errorType are required" });
+    }
+
+    const dedupeKey = `${streamKey}:${errorType}`;
+    const now = Date.now();
+    const lastLoggedAt = lastPlayerErrorLoggedAt.get(dedupeKey) || 0;
+    const shouldLog = fatal || now - lastLoggedAt > PLAYER_ERROR_DEDUPE_MS;
+
+    if (shouldLog) {
+      lastPlayerErrorLoggedAt.set(dedupeKey, now);
+      console.error(
+        `[PLAYER-ERROR] ${errorType} for ${streamKey} (fatal: ${Boolean(fatal)}, page: ${playerKind || "unknown"})`,
+        JSON.stringify({ details, sessionInfo }),
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(
+      "[PLAYER-ERROR] Failed to process error report:",
+      err.message,
+    );
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.get("/api/hls/session/:streamKey", async (req, res) => {
   try {
     const { streamKey } = req.params;
