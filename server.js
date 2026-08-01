@@ -8428,7 +8428,7 @@ function autoTranscodeStream(streamKey, generation) {
     "-probesize",
     "10000000",
     "-rw_timeout",
-    "10000000",
+    "30000000",
     "-fflags",
     "+genpts+discardcorrupt",
     "-avoid_negative_ts",
@@ -8685,7 +8685,7 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     "-probesize",
     "10000000",
     "-rw_timeout",
-    "10000000",
+    "30000000",
     "-fflags",
     "+genpts+discardcorrupt",
     "-avoid_negative_ts",
@@ -8721,6 +8721,10 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     "flv",
     output,
   ];
+
+  console.log(
+    `[BITRATE-CAP] Starting FFmpeg for ${streamKey}: ffmpeg ${ffmpegArgs.join(" ")}`,
+  );
 
   const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
   activeBitrateCapProcesses.set(streamKey, ffmpegProcess);
