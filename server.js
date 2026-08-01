@@ -69,13 +69,12 @@ const WHMCS_POLL_INTERVAL_MS = Number(
   process.env.WHMCS_POLL_INTERVAL_MS || 2 * 60 * 1000,
 );
 
-// ══════════════════════════════════════════
 // SUPER ADMIN — recent error log (in-memory ring buffer)
 // Captures console.error calls so the super-admin dashboard can show
 // recent server-side errors without needing external log tooling.
 // Resets on server restart — this is a lightweight recent-activity
 // view, not a durable audit log.
-// ══════════════════════════════════════════
+
 const RECENT_ERROR_LOG_LIMIT = 100;
 const recentErrorLog = [];
 const originalConsoleError = console.error.bind(console);
