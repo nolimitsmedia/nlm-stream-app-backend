@@ -8400,9 +8400,14 @@ function autoTranscodeStream(streamKey, generation) {
     return;
   }
 
-  const input = `rtmp://localhost/live/${streamKey}`;
-  const out720 = `rtmp://localhost/live/${streamKey}_720p`;
-  const out480 = `rtmp://localhost/live/${streamKey}_480p`;
+  // Using 127.0.0.1 explicitly rather than "localhost" — a packet capture
+  // during the SRS consumer-race investigation confirmed "localhost" was
+  // resolving to IPv6 (::1) for these connections. Forcing IPv4 loopback
+  // removes that as a variable while the underlying SRS-side race (see
+  // autoCapBitrateStream's comments) is still being tracked upstream.
+  const input = `rtmp://127.0.0.1/live/${streamKey}`;
+  const out720 = `rtmp://127.0.0.1/live/${streamKey}_720p`;
+  const out480 = `rtmp://127.0.0.1/live/${streamKey}_480p`;
 
   console.log(`[Transcode] Starting 720p + 480p for: ${streamKey}`);
 
@@ -8637,8 +8642,10 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     return;
   }
 
-  const input = `rtmp://localhost/live/${streamKey}`;
-  const output = `rtmp://localhost/live_capped/${streamKey}`;
+  // Using 127.0.0.1 explicitly rather than "localhost" — see the same
+  // note in autoTranscodeStream above.
+  const input = `rtmp://127.0.0.1/live/${streamKey}`;
+  const output = `rtmp://127.0.0.1/live_capped/${streamKey}`;
 
   console.log(
     `[BITRATE-CAP] Starting hard cap at ${capKbps}kbps for: ${streamKey}`,
@@ -8772,7 +8779,7 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
     // pointless transcode with no input.
     try {
       const liveCheck = await pool.query(
-        `SELECT is_live FROM channels WHERE stream_key = $1`,
+        `SELECT is_live, live_started_at FROM channels WHERE stream_key = $1`,
         [streamKey],
       );
 
@@ -8783,8 +8790,52 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
 
       if (attempts > MAX_BITRATE_CAP_RETRIES) {
         console.error(
-          `[BITRATE-CAP] Giving up on ${streamKey} after ${attempts} failed attempts — it will stay on the uncapped fallback for the rest of this broadcast.`,
+          `[BITRATE-CAP] Giving up on ${streamKey} after ${attempts} failed attempts — switching viewers to the uncapped fallback for the rest of this broadcast.`,
         );
+
+        // The log line above used to be aspirational, not actual — nothing
+        // here ever touched stickyHlsApp, so any viewer already committed
+        // to live_capped (see the HLS proxy's stickyValid logic) stayed
+        // stuck requesting that now-dead app for the rest of the
+        // broadcast, since sticky only ever tries ONE app once valid.
+        // Explicitly flipping it to "live" here means the very next
+        // manifest request resolves straight to the real fallback instead
+        // of failing (502/404) until a brand new broadcast session starts.
+        const liveStartedAtMs = liveCheck.rows[0]?.live_started_at
+          ? new Date(liveCheck.rows[0].live_started_at).getTime()
+          : null;
+
+        if (liveStartedAtMs) {
+          stickyHlsApp.set(streamKey, { app: "live", liveStartedAtMs });
+        } else {
+          // Unexpected (is_live true but no live_started_at) — don't leave
+          // a stale live_capped entry sitting in the map. Not strictly
+          // required for correctness (the proxy's own stickyValid check
+          // independently invalidates on a falsy liveStartedAtMs too), but
+          // cheap and avoids a confusing stale entry lingering in memory.
+          stickyHlsApp.delete(streamKey);
+        }
+
+        // Manifest cache TTL is only ~1s, but without this, a manifest
+        // request landing in that narrow window right after the fallback
+        // decision could still be served one last cached live_capped
+        // response before the switch takes effect — closing that gap so
+        // the generation-triggered remount can't land on stale data.
+        for (const key of manifestCache.keys()) {
+          if (key === streamKey || key.startsWith(`${streamKey}?`)) {
+            manifestCache.delete(key);
+          }
+        }
+
+        // Bump the shared generation so LivePlayer proactively remounts
+        // (via its session poll) the moment this happens, rather than
+        // waiting to reactively discover the dead source via a segment
+        // 404 first.
+        bitrateCapEncoderGeneration.set(
+          streamKey,
+          (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
+        );
+
         return;
       }
 
@@ -14519,9 +14570,11 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
       });
     }
 
-    const input = `rtmp://localhost/live/${stream}`;
-    const output720 = `rtmp://localhost/live/${stream}_720p`;
-    const output480 = `rtmp://localhost/live/${stream}_480p`;
+    // Using 127.0.0.1 explicitly rather than "localhost" — see the note
+    // in autoTranscodeStream/autoCapBitrateStream for why.
+    const input = `rtmp://127.0.0.1/live/${stream}`;
+    const output720 = `rtmp://127.0.0.1/live/${stream}_720p`;
+    const output480 = `rtmp://127.0.0.1/live/${stream}_480p`;
 
     const command720 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 2500k -s 1280x720 -c:a aac -b:a 128k -f flv "${output720}"`;
 
