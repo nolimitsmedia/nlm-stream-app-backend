@@ -8348,10 +8348,10 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
     const crashLogPath = dumpFfmpegCrashLog(label, streamKey, stderrTail);
-    console.error(
-      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}` +
+    console.warn(
+      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — retrying` +
         (crashLogPath
-          ? ` — full stderr (${stderrTail.length} chars) written to ${crashLogPath}`
+          ? ` (full stderr, ${stderrTail.length} chars, written to ${crashLogPath})`
           : "") +
         `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
     );
@@ -8769,10 +8769,10 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
       streamKey,
       stderrTail,
     );
-    console.error(
-      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey}` +
+    console.warn(
+      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — retrying` +
         (crashLogPath
-          ? ` — full stderr (${stderrTail.length} chars) written to ${crashLogPath}`
+          ? ` (full stderr, ${stderrTail.length} chars, written to ${crashLogPath})`
           : "") +
         `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
     );
