@@ -109,6 +109,28 @@ console.error = (...args) => {
   originalConsoleError(...args);
 };
 
+// ══════════════════════════════════════════
+// SLACK ALERTS — for terminal (give-up) failures only, not retryable warns.
+// No-op if SLACK_ALERT_WEBHOOK_URL isn't set. Never throws — a failed
+// Slack post must never break the actual error-handling path that called it.
+// ══════════════════════════════════════════
+async function notifySlack(message, context = {}) {
+  const webhookUrl = process.env.SLACK_ALERT_WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: `:warning: *${message}*\n\`\`\`${JSON.stringify(context, null, 2)}\`\`\``,
+      }),
+    });
+  } catch (err) {
+    console.warn("[SLACK] Alert failed to send:", err.message);
+  }
+}
+
 const corsOptions = {
   origin(origin, callback) {
     if (!origin || CORS_ORIGINS.includes(origin)) {
@@ -8373,6 +8395,12 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
         console.error(
           `[Transcode] Giving up on ${label} for ${streamKey} after ${attempts} failed attempts — that rendition will be unavailable for the rest of this broadcast.`,
         );
+        notifySlack(`ffmpeg gave up on ABR transcode (${label})`, {
+          streamKey,
+          label,
+          attempts,
+          timestamp: new Date().toISOString(),
+        });
         return;
       }
 
@@ -8796,6 +8824,12 @@ function autoCapBitrateStream(streamKey, capKbps, generation) {
         console.error(
           `[BITRATE-CAP] Giving up on ${streamKey} after ${attempts} failed attempts — switching viewers to the uncapped fallback for the rest of this broadcast.`,
         );
+        notifySlack("ffmpeg gave up on bitrate-cap transcode", {
+          streamKey,
+          attempts,
+          capKbps,
+          timestamp: new Date().toISOString(),
+        });
 
         // The log line above used to be aspirational, not actual — nothing
         // here ever touched stickyHlsApp, so any viewer already committed
