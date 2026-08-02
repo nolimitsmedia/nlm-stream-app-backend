@@ -14709,7 +14709,36 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 // SRS URL directly (see master.m3u8 route below) pending a proper fix
 // that actually follows the redirect. This route only covers 720p/480p.
 // ══════════════════════════════════════════
-const ABR_VALID_RENDITIONS = new Set(["720p", "480p"]);
+const ABR_VALID_RENDITIONS = new Set(["original", "720p", "480p"]);
+
+// SRS's raw/native HLS output (confirmed via live testing 2026-08-02) uses
+// a one-level session-context redirect: the first request to a manifest
+// returns a tiny single-variant stub (#EXTM3U + one #EXT-X-STREAM-INF
+// pointing back to the same path with a fresh ?hls_ctx=... appended),
+// and the REAL media playlist (with #EXT-X-TARGETDURATION and segments)
+// only appears once that's followed. hls.js already follows this
+// correctly on its own when a manifest URL is the TOP-LEVEL src it loads
+// directly (which is why /api/hls/:streamKey.m3u8 has always worked
+// standalone) — but it does NOT recursively resolve a nested "master-
+// style" redirect found inside one variant slot of an already-parsed
+// master playlist (our own /api/abr/master.m3u8), so embedding the raw
+// redirect URL there produced an immediate, permanent "Missing Target
+// Duration" failure for real viewers. This helper follows that one level
+// server-side, so by the time hls.js sees this route's response, it's
+// always the real flat manifest, regardless of rendition.
+const isSessionRedirectStub = (text) =>
+  text.includes("#EXT-X-STREAM-INF") && !text.includes("#EXT-X-TARGETDURATION");
+
+const extractRedirectUri = (text) => {
+  const lines = text.split("\n").map((l) => l.trim());
+  const infIndex = lines.findIndex((l) => l.startsWith("#EXT-X-STREAM-INF"));
+  if (infIndex === -1) return null;
+  // The URI is the next non-empty, non-comment line after the STREAM-INF tag.
+  for (let i = infIndex + 1; i < lines.length; i++) {
+    if (lines[i] && !lines[i].startsWith("#")) return lines[i];
+  }
+  return null;
+};
 
 // SRS writes rendition manifests with bare relative segment filenames
 // (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
@@ -14754,7 +14783,6 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     }
   };
 
-  const originalUrl = `${baseUrl}/${stream}.m3u8`;
   const url720 = `${baseUrl}/${stream}_720p.m3u8`;
   const url480 = `${baseUrl}/${stream}_480p.m3u8`;
 
@@ -14763,20 +14791,8 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
-  // REVERTED same-day: SRS serves the raw source stream's manifest via a
-  // session-context redirect (first request returns a tiny self-
-  // referencing stub with a ?hls_ctx=... query string; the real manifest
-  // with segments/#EXT-X-TARGETDURATION only appears once that's
-  // followed) — a behavior specific to this stream type that the 720p/
-  // 480p rendition proxy's single-fetch validity check doesn't handle.
-  // Routing Original through that proxy made every request hit the same
-  // stub and 503 forever (a permanent break, not the transient blip the
-  // proxy was built for) — real viewers stuck on "loading" confirmed
-  // this live. Reverted to the raw URL pending a proper fix that follows
-  // the hls_ctx redirect; 720p/480p's proxy is unaffected and still
-  // working as intended.
   masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-${originalUrl}
+/api/abr/${stream}/original.m3u8
 `;
 
   if (await checkPlaylist(url720)) {
@@ -14820,29 +14836,52 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     return res.status(404).send("Unknown rendition");
   }
 
-  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
+  // "original" has no _suffix on its SRS filename (it's the raw source
+  // publish, not a transcoded rendition) — 720p/480p match SRS's actual
+  // ffmpeg-output naming exactly.
+  const upstreamFilename =
+    rendition === "original" ? stream : `${stream}_${rendition}`;
+  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${upstreamFilename}.m3u8`;
+
+  const fetchOpts = {
+    signal: AbortSignal.timeout(4000),
+    headers: {
+      "ngrok-skip-browser-warning": "1",
+      "User-Agent": "NLM-Streaming-Backend/1.0",
+      Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+    },
+  };
 
   try {
-    const response = await fetch(upstreamUrl, {
-      signal: AbortSignal.timeout(4000),
-      headers: {
-        "ngrok-skip-browser-warning": "1",
-        "User-Agent": "NLM-Streaming-Backend/1.0",
-        Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-      },
-    });
+    let response = await fetch(upstreamUrl, fetchOpts);
+    let text = response.ok ? await response.text() : null;
 
-    if (response.ok) {
-      const text = await response.text();
-      // "Missing Target Duration" (the exact real-world symptom that
-      // triggered this fix) means SRS returned a playlist stub before
-      // ffmpeg had written a real one yet, or mid-restart — check for
-      // both markers, not just #EXTM3U, before trusting it.
-      if (text.includes("#EXTM3U") && text.includes("#EXT-X-TARGETDURATION")) {
-        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store");
-        return res.send(rewriteRelativeSegmentUris(text));
+    // Follow exactly one level of SRS's session-context redirect, if
+    // present (see isSessionRedirectStub comment above) — real-world
+    // testing showed Original always needs this; 720p/480p never have on
+    // account of being genuine ffmpeg output, but the check is harmless
+    // either way since it only triggers on the specific stub shape.
+    if (text && isSessionRedirectStub(text)) {
+      const redirectUri = extractRedirectUri(text);
+      if (redirectUri) {
+        const resolvedUrl = redirectUri.startsWith("http")
+          ? redirectUri
+          : `${SRS_HLS_ORIGIN}${redirectUri.startsWith("/") ? "" : "/"}${redirectUri}`;
+        const redirected = await fetch(resolvedUrl, fetchOpts);
+        text = redirected.ok ? await redirected.text() : null;
+      } else {
+        text = null;
       }
+    }
+
+    if (
+      text &&
+      text.includes("#EXTM3U") &&
+      text.includes("#EXT-X-TARGETDURATION")
+    ) {
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-store");
+      return res.send(rewriteRelativeSegmentUris(text));
     }
   } catch {
     // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
