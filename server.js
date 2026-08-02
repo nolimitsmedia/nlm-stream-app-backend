@@ -14728,6 +14728,58 @@ const rewriteRelativeSegmentUris = (manifestText) =>
     })
     .join("\n");
 
+app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
+  const { stream } = req.params;
+  const baseUrl = `${HLS_BASE_URL}/live`;
+
+  const checkPlaylist = async (url) => {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return false;
+
+      const text = await response.text();
+      return text.includes("#EXTM3U");
+    } catch {
+      return false;
+    }
+  };
+
+  const originalUrl = `${baseUrl}/${stream}.m3u8`;
+  const url720 = `${baseUrl}/${stream}_720p.m3u8`;
+  const url480 = `${baseUrl}/${stream}_480p.m3u8`;
+
+  let masterPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-INDEPENDENT-SEGMENTS
+`;
+
+  masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
+${originalUrl}
+`;
+
+  if (await checkPlaylist(url720)) {
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"
+/api/abr/${stream}/720p.m3u8
+`;
+  }
+
+  if (await checkPlaylist(url480)) {
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,NAME="480p"
+/api/abr/${stream}/480p.m3u8
+`;
+  }
+
+  res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(masterPlaylist);
+});
+
+// NOTE: this route MUST be registered after the /master.m3u8 route above.
+// Express matches routes in registration order, and :rendition is a
+// wildcard param — a request for .../master.m3u8 would otherwise match
+// THIS route first (rendition="master"), get rejected by the
+// ABR_VALID_RENDITIONS check, and never reach the real master route below.
+// (Real regression hit and fixed same-day: 2026-08-02.)
 app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
   const { stream, rendition } = req.params;
 
@@ -14778,52 +14830,6 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
   res
     .status(503)
     .send("Rendition temporarily unavailable, please retry shortly");
-});
-
-app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
-  const { stream } = req.params;
-  const baseUrl = `${HLS_BASE_URL}/live`;
-
-  const checkPlaylist = async (url) => {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) return false;
-
-      const text = await response.text();
-      return text.includes("#EXTM3U");
-    } catch {
-      return false;
-    }
-  };
-
-  const originalUrl = `${baseUrl}/${stream}.m3u8`;
-  const url720 = `${baseUrl}/${stream}_720p.m3u8`;
-  const url480 = `${baseUrl}/${stream}_480p.m3u8`;
-
-  let masterPlaylist = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-INDEPENDENT-SEGMENTS
-`;
-
-  masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-${originalUrl}
-`;
-
-  if (await checkPlaylist(url720)) {
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"
-/api/abr/${stream}/720p.m3u8
-`;
-  }
-
-  if (await checkPlaylist(url480)) {
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,NAME="480p"
-/api/abr/${stream}/480p.m3u8
-`;
-  }
-
-  res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-  res.setHeader("Cache-Control", "no-store");
-  res.send(masterPlaylist);
 });
 
 app.get(
