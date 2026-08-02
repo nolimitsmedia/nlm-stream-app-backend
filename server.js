@@ -14686,20 +14686,19 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 // directly at SRS's raw HLS output with zero retry-tolerance, so viewers
 // on that rendition hit the raw, transiently-invalid manifest immediately
 // (hls.js levelParsingError: "Missing Target Duration") instead of the
-// blip being absorbed server-side the way it always has been elsewhere.
+// blip being absorbed the way it always has been elsewhere.
 //
-// This proxy retries a transiently-invalid rendition manifest for up to
-// ABR_RENDITION_RETRY_TOLERANCE_MS before giving up — matching
-// HLS_CAPPED_STARTUP_GRACE_MS's already-tuned 20s window, since both
-// exist to ride out the same underlying ffmpeg retry-chain duration on
-// this box. On timeout, returns 503 (a normal, expected "retry shortly"
-// signal to hls.js) rather than ever passing through invalid content.
+// First attempt at this fix (same day) held the HTTP connection open,
+// polling upstream for up to 20s before responding — wrong shape, since
+// hls.js's own client-side manifest-load timeout is well under 20s, so
+// it gave up and retried before the server-side poll ever finished
+// (repeated non-fatal levelLoadTimeOut). Corrected to match the already-
+// proven pattern used by the bitrate-cap path: decide instantly (one
+// quick upstream attempt, short timeout), serve if valid, otherwise 503
+// — the CLIENT does the retrying on its own cadence, the server never
+// blocks a response waiting things out.
 // ══════════════════════════════════════════
-const ABR_RENDITION_RETRY_TOLERANCE_MS = 20 * 1000;
-const ABR_RENDITION_POLL_INTERVAL_MS = 1000;
 const ABR_VALID_RENDITIONS = new Set(["720p", "480p"]);
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // SRS writes rendition manifests with bare relative segment filenames
 // (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
@@ -14780,6 +14779,17 @@ ${originalUrl}
 // THIS route first (rendition="master"), get rejected by the
 // ABR_VALID_RENDITIONS check, and never reach the real master route below.
 // (Real regression hit and fixed same-day: 2026-08-02.)
+//
+// Also fixed same-day: this originally held the HTTP connection open,
+// polling upstream for up to ABR_RENDITION_RETRY_TOLERANCE_MS (20s)
+// before responding. That's the wrong shape — hls.js's own client-side
+// manifest-load timeout is well under 20s, so it gave up and retried
+// BEFORE our server-side poll loop ever finished, producing repeated
+// non-fatal levelLoadTimeOut churn. The already-proven pattern elsewhere
+// in this file (/api/hls/:streamKey.m3u8's live_capped handling) never
+// blocks a response either — it decides instantly (serve, or 503) and
+// lets the CLIENT retry on its own cadence. This route now matches that:
+// one quick upstream attempt, instant decision, no internal poll loop.
 app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
   const { stream, rendition } = req.params;
 
@@ -14788,45 +14798,37 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
   }
 
   const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
-  const startedAt = Date.now();
 
-  while (Date.now() - startedAt < ABR_RENDITION_RETRY_TOLERANCE_MS) {
-    try {
-      const response = await fetch(upstreamUrl, {
-        signal: AbortSignal.timeout(5000),
-        headers: {
-          "ngrok-skip-browser-warning": "1",
-          "User-Agent": "NLM-Streaming-Backend/1.0",
-          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-        },
-      });
+  try {
+    const response = await fetch(upstreamUrl, {
+      signal: AbortSignal.timeout(4000),
+      headers: {
+        "ngrok-skip-browser-warning": "1",
+        "User-Agent": "NLM-Streaming-Backend/1.0",
+        Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+      },
+    });
 
-      if (response.ok) {
-        const text = await response.text();
-        // "Missing Target Duration" (the exact real-world symptom that
-        // triggered this fix) means SRS returned a playlist stub before
-        // ffmpeg had written a real one yet, or mid-restart — check for
-        // both markers, not just #EXTM3U, before trusting it.
-        if (
-          text.includes("#EXTM3U") &&
-          text.includes("#EXT-X-TARGETDURATION")
-        ) {
-          res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-          res.setHeader("Cache-Control", "no-store");
-          return res.send(rewriteRelativeSegmentUris(text));
-        }
+    if (response.ok) {
+      const text = await response.text();
+      // "Missing Target Duration" (the exact real-world symptom that
+      // triggered this fix) means SRS returned a playlist stub before
+      // ffmpeg had written a real one yet, or mid-restart — check for
+      // both markers, not just #EXTM3U, before trusting it.
+      if (text.includes("#EXTM3U") && text.includes("#EXT-X-TARGETDURATION")) {
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        res.setHeader("Cache-Control", "no-store");
+        return res.send(rewriteRelativeSegmentUris(text));
       }
-    } catch {
-      // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
-      // serving this stream) — fall through to retry below.
     }
-
-    await sleep(ABR_RENDITION_POLL_INTERVAL_MS);
+  } catch {
+    // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
+    // serving this stream) — fall through to the 503 below, same as an
+    // invalid-content response. Either way, hls.js retries this level's
+    // manifest on its own short cadence; we just never hand it broken
+    // content in the meantime.
   }
 
-  console.warn(
-    `[ABR-RENDITION] ${rendition} for ${stream} still invalid after ${ABR_RENDITION_RETRY_TOLERANCE_MS}ms — asking player to retry shortly instead of serving broken content`,
-  );
   res
     .status(503)
     .send("Rendition temporarily unavailable, please retry shortly");
