@@ -14698,13 +14698,18 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 // — the CLIENT does the retrying on its own cadence, the server never
 // blocks a response waiting things out.
 //
-// Extended same-day to also cover the "Original" (source-resolution)
-// rendition, which was initially left out of scope — until live evidence
-// (a levelParsingError hitting raw /hls/live/ directly, same "Missing
-// Target Duration" signature, same underlying transient race) confirmed
-// it needed the identical protection, not just 720p/480p.
+// Attempted same-day to extend this to the "Original" (source) rendition
+// too, based on live evidence it hit the same-looking error signature —
+// reverted almost immediately when it turned out SRS serves Original's
+// manifest via a session-context redirect (a stub response with
+// ?hls_ctx=... that must be followed to reach the real manifest), which
+// this proxy's single-fetch validity check doesn't handle. That mismatch
+// made every request 503 permanently (not transient), leaving real
+// viewers stuck on "loading" indefinitely. Original is back on the raw
+// SRS URL directly (see master.m3u8 route below) pending a proper fix
+// that actually follows the redirect. This route only covers 720p/480p.
 // ══════════════════════════════════════════
-const ABR_VALID_RENDITIONS = new Set(["original", "720p", "480p"]);
+const ABR_VALID_RENDITIONS = new Set(["720p", "480p"]);
 
 // SRS writes rendition manifests with bare relative segment filenames
 // (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
@@ -14749,6 +14754,7 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     }
   };
 
+  const originalUrl = `${baseUrl}/${stream}.m3u8`;
   const url720 = `${baseUrl}/${stream}_720p.m3u8`;
   const url480 = `${baseUrl}/${stream}_480p.m3u8`;
 
@@ -14757,8 +14763,20 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
+  // REVERTED same-day: SRS serves the raw source stream's manifest via a
+  // session-context redirect (first request returns a tiny self-
+  // referencing stub with a ?hls_ctx=... query string; the real manifest
+  // with segments/#EXT-X-TARGETDURATION only appears once that's
+  // followed) — a behavior specific to this stream type that the 720p/
+  // 480p rendition proxy's single-fetch validity check doesn't handle.
+  // Routing Original through that proxy made every request hit the same
+  // stub and 503 forever (a permanent break, not the transient blip the
+  // proxy was built for) — real viewers stuck on "loading" confirmed
+  // this live. Reverted to the raw URL pending a proper fix that follows
+  // the hls_ctx redirect; 720p/480p's proxy is unaffected and still
+  // working as intended.
   masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-/api/abr/${stream}/original.m3u8
+${originalUrl}
 `;
 
   if (await checkPlaylist(url720)) {
@@ -14802,12 +14820,7 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     return res.status(404).send("Unknown rendition");
   }
 
-  // "original" has no _suffix on its SRS filename (it's the raw source
-  // publish, not a transcoded rendition) — every other value in
-  // ABR_VALID_RENDITIONS matches SRS's actual naming exactly.
-  const upstreamFilename =
-    rendition === "original" ? stream : `${stream}_${rendition}`;
-  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${upstreamFilename}.m3u8`;
+  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
 
   try {
     const response = await fetch(upstreamUrl, {
