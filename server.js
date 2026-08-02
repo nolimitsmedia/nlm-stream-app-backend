@@ -10224,6 +10224,25 @@ app.post(
 );
 
 // ══════════════════════════════════════════
+// TEMPORARY — Slack alert webhook test route. Hit once to confirm
+// SLACK_ALERT_WEBHOOK_URL is wired correctly, then remove this route
+// in a follow-up deploy. Does not touch any stream, org, or ffmpeg
+// process — purely a notifySlack() smoke test.
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/test-slack-alert",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    await notifySlack("Test alert — Slack webhook wiring check", {
+      triggeredBy: req.admin?.email || "unknown",
+      timestamp: new Date().toISOString(),
+    });
+    res.json({ ok: true, message: "Test alert sent (check Slack channel)" });
+  },
+);
+
+// ══════════════════════════════════════════
 // SUPER ADMIN DASHBOARD — per-organization force refresh
 // Reconciles this org's channels/social destinations against the actual
 // state of SRS and our own ffmpeg process table. Does NOT restart anything
