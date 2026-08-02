@@ -14673,6 +14673,113 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 |--------------------------------------------------------------------------
 */
 
+// ══════════════════════════════════════════
+// ABR rendition manifest proxy — gives 720p/480p the same viewer-facing
+// protection the bitrate-cap path has always had (see /api/hls/:streamKey.m3u8
+// above), for a completely different underlying failure mode.
+//
+// Real incident (2026-08-02): Maranatha's 480p transcode hit the
+// already-characterized transient SRS-internal race (ffmpeg exits,
+// auto-retries within its normal MAX_TRANSCODE_RETRIES budget, recovers)
+// — the exact same harmless blip long since proven contained on the
+// bitrate-cap path. But /api/abr/master.m3u8 was pointing renditions
+// directly at SRS's raw HLS output with zero retry-tolerance, so viewers
+// on that rendition hit the raw, transiently-invalid manifest immediately
+// (hls.js levelParsingError: "Missing Target Duration") instead of the
+// blip being absorbed server-side the way it always has been elsewhere.
+//
+// This proxy retries a transiently-invalid rendition manifest for up to
+// ABR_RENDITION_RETRY_TOLERANCE_MS before giving up — matching
+// HLS_CAPPED_STARTUP_GRACE_MS's already-tuned 20s window, since both
+// exist to ride out the same underlying ffmpeg retry-chain duration on
+// this box. On timeout, returns 503 (a normal, expected "retry shortly"
+// signal to hls.js) rather than ever passing through invalid content.
+// ══════════════════════════════════════════
+const ABR_RENDITION_RETRY_TOLERANCE_MS = 20 * 1000;
+const ABR_RENDITION_POLL_INTERVAL_MS = 1000;
+const ABR_VALID_RENDITIONS = new Set(["720p", "480p"]);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// SRS writes rendition manifests with bare relative segment filenames
+// (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
+// is fetched from /live/ (matching nginx's existing ^/live/(.*\.ts)$
+// block). Serving that same manifest text from /api/abr/ instead would
+// silently break every segment fetch — hls.js would resolve them against
+// /api/abr/:stream/ instead of /live/. Rewrite any line that isn't a
+// #-comment and isn't already absolute (http/https/leading slash) to be
+// rooted at /live/ instead, so segments keep resolving correctly
+// regardless of which path served the manifest.
+const rewriteRelativeSegmentUris = (manifestText) =>
+  manifestText
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (
+        !trimmed ||
+        trimmed.startsWith("#") ||
+        trimmed.startsWith("http://") ||
+        trimmed.startsWith("https://") ||
+        trimmed.startsWith("/")
+      ) {
+        return line;
+      }
+      return `/live/${trimmed}`;
+    })
+    .join("\n");
+
+app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
+  const { stream, rendition } = req.params;
+
+  if (!ABR_VALID_RENDITIONS.has(rendition)) {
+    return res.status(404).send("Unknown rendition");
+  }
+
+  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < ABR_RENDITION_RETRY_TOLERANCE_MS) {
+    try {
+      const response = await fetch(upstreamUrl, {
+        signal: AbortSignal.timeout(5000),
+        headers: {
+          "ngrok-skip-browser-warning": "1",
+          "User-Agent": "NLM-Streaming-Backend/1.0",
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        },
+      });
+
+      if (response.ok) {
+        const text = await response.text();
+        // "Missing Target Duration" (the exact real-world symptom that
+        // triggered this fix) means SRS returned a playlist stub before
+        // ffmpeg had written a real one yet, or mid-restart — check for
+        // both markers, not just #EXTM3U, before trusting it.
+        if (
+          text.includes("#EXTM3U") &&
+          text.includes("#EXT-X-TARGETDURATION")
+        ) {
+          res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+          res.setHeader("Cache-Control", "no-store");
+          return res.send(rewriteRelativeSegmentUris(text));
+        }
+      }
+    } catch {
+      // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
+      // serving this stream) — fall through to retry below.
+    }
+
+    await sleep(ABR_RENDITION_POLL_INTERVAL_MS);
+  }
+
+  console.warn(
+    `[ABR-RENDITION] ${rendition} for ${stream} still invalid after ${ABR_RENDITION_RETRY_TOLERANCE_MS}ms — asking player to retry shortly instead of serving broken content`,
+  );
+  res
+    .status(503)
+    .send("Rendition temporarily unavailable, please retry shortly");
+});
+
 app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
   const { stream } = req.params;
   const baseUrl = `${HLS_BASE_URL}/live`;
@@ -14704,13 +14811,13 @@ ${originalUrl}
 
   if (await checkPlaylist(url720)) {
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"
-${url720}
+/api/abr/${stream}/720p.m3u8
 `;
   }
 
   if (await checkPlaylist(url480)) {
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,NAME="480p"
-${url480}
+/api/abr/${stream}/480p.m3u8
 `;
   }
 
