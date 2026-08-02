@@ -14697,8 +14697,14 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 // quick upstream attempt, short timeout), serve if valid, otherwise 503
 // — the CLIENT does the retrying on its own cadence, the server never
 // blocks a response waiting things out.
+//
+// Extended same-day to also cover the "Original" (source-resolution)
+// rendition, which was initially left out of scope — until live evidence
+// (a levelParsingError hitting raw /hls/live/ directly, same "Missing
+// Target Duration" signature, same underlying transient race) confirmed
+// it needed the identical protection, not just 720p/480p.
 // ══════════════════════════════════════════
-const ABR_VALID_RENDITIONS = new Set(["720p", "480p"]);
+const ABR_VALID_RENDITIONS = new Set(["original", "720p", "480p"]);
 
 // SRS writes rendition manifests with bare relative segment filenames
 // (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
@@ -14743,7 +14749,6 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     }
   };
 
-  const originalUrl = `${baseUrl}/${stream}.m3u8`;
   const url720 = `${baseUrl}/${stream}_720p.m3u8`;
   const url480 = `${baseUrl}/${stream}_480p.m3u8`;
 
@@ -14753,7 +14758,7 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 `;
 
   masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-${originalUrl}
+/api/abr/${stream}/original.m3u8
 `;
 
   if (await checkPlaylist(url720)) {
@@ -14797,7 +14802,12 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     return res.status(404).send("Unknown rendition");
   }
 
-  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
+  // "original" has no _suffix on its SRS filename (it's the raw source
+  // publish, not a transcoded rendition) — every other value in
+  // ABR_VALID_RENDITIONS matches SRS's actual naming exactly.
+  const upstreamFilename =
+    rendition === "original" ? stream : `${stream}_${rendition}`;
+  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${upstreamFilename}.m3u8`;
 
   try {
     const response = await fetch(upstreamUrl, {
