@@ -62,6 +62,17 @@ const BUNNY_STORAGE_HOSTNAME = process.env.BUNNY_STORAGE_HOSTNAME || "";
 const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
 const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 
+// Dedicated Bunny pull zone for HLS/ABR delivery ONLY (separate from
+// whatever fronts the general /api/* surface) — Bunny's Token
+// Authentication is zone-wide (blocks every unsigned request through a
+// zone), so it can't be turned on for a zone that also carries unrelated,
+// unsigned API traffic like login/admin. See bunny-signed-urls.md.
+const HLS_CDN_HOSTNAME = process.env.HLS_CDN_HOSTNAME || "";
+const BUNNY_HLS_TOKEN_KEY = process.env.BUNNY_HLS_TOKEN_KEY || "";
+const HLS_TOKEN_TTL_SECONDS = 6 * 60 * 60; // not a hard security boundary —
+// bounds how long a dead broadcast's old links keep working; real access
+// control is still whatever gates who receives a playbackUrl at all.
+
 // Billing now runs through WHMCS (see whmcs_client.js) — WHMCS_* env vars
 // are read directly by that module. Stripe has been fully retired: no
 // Stripe keys, webhook, or SDK client remain in this file.
@@ -6192,17 +6203,41 @@ const getPublicWatchStatus = async (streamKey) => {
   // logic either way (it's origin-agnostic), just a different front door.
   // null here means "use the shared default", which the frontend already
   // falls back to.
-  let hlsBaseUrl = null;
+  // hlsBaseUrl: where HLS/ABR playback URLs are built against. Defaults to
+  // the shared dedicated HLS_CDN_HOSTNAME zone (Token Authentication lives
+  // here); an org with its OWN dedicated Bunny zone overrides it.
+  //
+  // rtcBaseUrl: WHEP (WebRTC) signaling base — deliberately NOT defaulted
+  // to HLS_CDN_HOSTNAME. That zone has Token Authentication on, and WHEP's
+  // POST to /rtc/v1/whep/ isn't signed (out of scope for this pass) — if
+  // WhepPlayer inherited the HLS zone's hostname, its signaling requests
+  // would start getting 403'd by Bunny. null here means "frontend falls
+  // back to the general API host", same as hlsBaseUrl always used to.
+  let hlsBaseUrl = HLS_CDN_HOSTNAME ? `https://${HLS_CDN_HOSTNAME}` : null;
+  let rtcBaseUrl = null;
   try {
     const orgZoneResult = await pool.query(
       `SELECT bunny_pull_zone_hostname FROM organizations WHERE id = $1`,
       [organizationId],
     );
     const hostname = orgZoneResult.rows[0]?.bunny_pull_zone_hostname;
-    if (hostname) hlsBaseUrl = `https://${hostname}`;
+    if (hostname) {
+      hlsBaseUrl = `https://${hostname}`;
+      rtcBaseUrl = `https://${hostname}`;
+    }
   } catch (zoneErr) {
     console.error("Watch status zone lookup error:", zoneErr.message);
   }
+
+  // Signed query string for the TOP-LEVEL manifest URL the frontend builds
+  // (WatchPage.jsx appends this to /api/hls/:streamKey.m3u8 or
+  // /api/abr/:streamKey/master.m3u8) — everything downstream of that
+  // request (nested manifests, segments) is signed by the manifest-rewrite
+  // logic in the proxy routes themselves, not here.
+  const hlsUrlPath = transcodingEnabled
+    ? `/api/abr/${streamKey}/master.m3u8`
+    : `/api/hls/${streamKey}.m3u8`;
+  const hlsAuthQs = appendBunnyToken(hlsUrlPath);
 
   return {
     organization_id: organizationId,
@@ -6214,6 +6249,8 @@ const getPublicWatchStatus = async (streamKey) => {
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
     hlsBaseUrl,
+    rtcBaseUrl,
+    hlsAuthQs,
     reducedLatencyEnabled,
     transcodingEnabled,
   };
@@ -9403,6 +9440,45 @@ const SEGMENT_CACHE_TTL_MS = 15000;
 const manifestCache = new Map(); // streamKey -> { text, cachedAt }
 const MANIFEST_CACHE_TTL_MS = 1000;
 
+// ══════════════════════════════════════════
+// BUNNY SIGNED PLAYBACK URLS — Advanced (HMAC-SHA256) token auth on the
+// dedicated HLS_CDN_HOSTNAME pull zone only (never the general API zone).
+// Algorithm per Bunny's current docs (docs.bunny.net/cdn/security/
+// token-authentication/advanced):
+//   token = "HS256-" + base64url(HMAC-SHA256(security_key,
+//              url_path + expires + "token_ignore_params=true"))
+// We always sign with token_ignore_params=true so the signed message never
+// depends on which OTHER query params happen to be on a given URL (e.g.
+// our own `_s` session tag on segment URLs) — one consistent formula for
+// every path, regardless of what else gets appended to it now or later.
+// No-op (returns input unchanged) whenever BUNNY_HLS_TOKEN_KEY isn't set,
+// so this is safe to deploy before the Bunny zone/key exist.
+// ══════════════════════════════════════════
+function signBunnyUrlPath(urlPath, expiresUnix) {
+  const message = `${urlPath}${expiresUnix}token_ignore_params=true`;
+  const hmac = crypto
+    .createHmac("sha256", BUNNY_HLS_TOKEN_KEY)
+    .update(message)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+  return `HS256-${hmac}`;
+}
+
+// urlPath must be the exact request path Bunny will see (leading slash,
+// no domain, no query string) — e.g. "/api/hls/mystream.m3u8" or
+// "/live/mystream_720p-0042.ts". Returns a query-string fragment
+// ("?token=...&expires=...&token_ignore_params=true" or "&token=..." if
+// existingQs already has a "?") to append to that path.
+function appendBunnyToken(urlPath, existingQs = "") {
+  if (!BUNNY_HLS_TOKEN_KEY) return existingQs;
+  const expires = Math.floor(Date.now() / 1000) + HLS_TOKEN_TTL_SECONDS;
+  const token = signBunnyUrlPath(urlPath, expires);
+  const sep = existingQs ? "&" : "?";
+  return `${existingQs}${sep}token=${encodeURIComponent(token)}&expires=${expires}&token_ignore_params=true`;
+}
+
 // Once a broadcast has successfully resolved to either live_capped or
 // live, stick with that SAME app for the rest of that broadcast rather
 // than re-deciding on every poll. Silently flipping between the two apps
@@ -9716,9 +9792,11 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
             ? `${suffix}&_s=${sessionToken}`
             : `?_s=${sessionToken}`;
 
-          return `/api/hls/seg/${encodeURIComponent(resolvedApp)}/${encodeURIComponent(
+          const segPath = `/api/hls/seg/${encodeURIComponent(resolvedApp)}/${encodeURIComponent(
             streamKey,
-          )}/${encodeURIComponent(segmentName)}${sessionSuffix}`;
+          )}/${encodeURIComponent(segmentName)}`;
+
+          return `${segPath}${appendBunnyToken(segPath, sessionSuffix)}`;
         }
 
         if (pathPart.endsWith(".m3u8")) {
@@ -9726,7 +9804,9 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
           const variantKey = fileName.replace(/\.m3u8$/i, "");
 
-          return `/api/hls/${encodeURIComponent(variantKey)}.m3u8${suffix}`;
+          const subManifestPath = `/api/hls/${encodeURIComponent(variantKey)}.m3u8`;
+
+          return `${subManifestPath}${appendBunnyToken(subManifestPath, suffix)}`;
         }
 
         return line;
@@ -14761,9 +14841,15 @@ const rewriteRelativeSegmentUris = (manifestText) =>
         trimmed.startsWith("https://") ||
         trimmed.startsWith("/")
       ) {
+        // NOTE: a segment SRS ever emits as already-absolute (leading "/")
+        // would fall through here unsigned. Not observed in testing so far
+        // (SRS emits bare relative filenames for these renditions), but
+        // worth confirming with a live curl if 480p/720p ever 403 after
+        // this deploy — see bunny-signed-urls.md test plan.
         return line;
       }
-      return `/live/${trimmed}`;
+      const segPath = `/live/${trimmed}`;
+      return `${segPath}${appendBunnyToken(segPath)}`;
     })
     .join("\n");
 
@@ -14791,19 +14877,22 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
+  const originalPath = `/api/abr/${stream}/original.m3u8`;
   masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-/api/abr/${stream}/original.m3u8
+${originalPath}${appendBunnyToken(originalPath)}
 `;
 
   if (await checkPlaylist(url720)) {
+    const path720 = `/api/abr/${stream}/720p.m3u8`;
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"
-/api/abr/${stream}/720p.m3u8
+${path720}${appendBunnyToken(path720)}
 `;
   }
 
   if (await checkPlaylist(url480)) {
+    const path480 = `/api/abr/${stream}/480p.m3u8`;
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,NAME="480p"
-/api/abr/${stream}/480p.m3u8
+${path480}${appendBunnyToken(path480)}
 `;
   }
 
