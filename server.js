@@ -14848,8 +14848,21 @@ const rewriteRelativeSegmentUris = (manifestText) =>
         // this deploy — see bunny-signed-urls.md test plan.
         return line;
       }
-      const segPath = `/live/${trimmed}`;
-      return `${segPath}${appendBunnyToken(segPath)}`;
+
+      // SRS's "Original" rendition segments can carry their own query
+      // string (a per-segment ?hls_ctx=... session-context marker) — real
+      // incident (2026-08-02): signing the whole line (path + hls_ctx) as
+      // one "path" produced a wrong signature AND a malformed double-"?"
+      // URL once our own token/expires were appended on top. Split off any
+      // existing query string first, sign ONLY the actual path, then
+      // re-merge with a single correctly-placed separator.
+      const questionIndex = trimmed.indexOf("?");
+      const bareFilename =
+        questionIndex >= 0 ? trimmed.slice(0, questionIndex) : trimmed;
+      const existingQs = questionIndex >= 0 ? trimmed.slice(questionIndex) : "";
+
+      const segPath = `/live/${bareFilename}`;
+      return `${segPath}${appendBunnyToken(segPath, existingQs)}`;
     })
     .join("\n");
 
