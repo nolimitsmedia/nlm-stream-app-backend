@@ -54,6 +54,8 @@ const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
 // rw_timeout, while the same source was verified stable over HTTP-FLV.
 const SRS_HTTP_FLV_BASE_URL =
   process.env.SRS_HTTP_FLV_BASE_URL || "http://127.0.0.1:8080";
+const SRS_INTERNAL_HLS_BASE_URL =
+  process.env.SRS_INTERNAL_HLS_BASE_URL || "http://127.0.0.1:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
 const RECORDINGS_ROOT = process.env.RECORDINGS_ROOT || "C:/nlm-srs/recordings";
 const RECORDINGS_LIVE_ROOT = path.join(RECORDINGS_ROOT, "live");
@@ -14858,6 +14860,79 @@ const extractRedirectUri = (text) => {
   return null;
 };
 
+const fetchInitializedHlsPlaylist = async (
+  initialUrl,
+  { timeoutMs = 4000 } = {},
+) => {
+  const fetchOnce = async (playlistUrl) => {
+    const response = await fetch(playlistUrl, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: {
+        "ngrok-skip-browser-warning": "1",
+        "User-Agent": "NLM-Streaming-Backend/1.0",
+        Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+      },
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        text: "",
+        finalUrl: playlistUrl,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      text: await response.text(),
+      finalUrl: response.url || playlistUrl,
+    };
+  };
+
+  const first = await fetchOnce(initialUrl);
+  if (!first.ok) return first;
+
+  let playlistText = first.text;
+  let playlistUrl = first.finalUrl;
+
+  // SRS 6 can return a session bootstrap manifest whose only media URI
+  // points back to the same playlist with ?hls_ctx=<session>. Follow that
+  // URI exactly once to retrieve the actual media playlist.
+  if (isSessionRedirectStub(playlistText)) {
+    const redirectUri = extractRedirectUri(playlistText);
+
+    if (!redirectUri) {
+      return {
+        ok: false,
+        status: 502,
+        text: "",
+        finalUrl: playlistUrl,
+      };
+    }
+
+    const redirectUrl = new URL(redirectUri, playlistUrl).toString();
+    const second = await fetchOnce(redirectUrl);
+    if (!second.ok) return second;
+
+    playlistText = second.text;
+    playlistUrl = second.finalUrl;
+  }
+
+  const initialized =
+    playlistText.trimStart().startsWith("#EXTM3U") &&
+    playlistText.includes("#EXT-X-TARGETDURATION") &&
+    (playlistText.includes("#EXTINF:") || playlistText.includes("#EXT-X-MAP:"));
+
+  return {
+    ok: initialized,
+    status: initialized ? 200 : 503,
+    text: playlistText,
+    finalUrl: playlistUrl,
+  };
+};
+
 // SRS writes rendition manifests with bare relative segment filenames
 // (e.g. "streamkey_720p-0042.ts"), correct only when the manifest itself
 // is fetched from /live/ (matching nginx's existing ^/live/(.*\.ts)$
@@ -14903,29 +14978,17 @@ const rewriteRelativeSegmentUris = (manifestText, streamKey) =>
 
 app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
   const { stream } = req.params;
-  const baseUrl = `${HLS_BASE_URL}/live`;
+  const baseUrl = `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live`;
 
   const checkPlaylist = async (url) => {
     try {
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(4000),
-        headers: {
-          "ngrok-skip-browser-warning": "1",
-          "User-Agent": "NLM-Streaming-Backend/1.0",
-          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-        },
-      });
-      if (!response.ok) return false;
-
-      const text = await response.text();
-      // A bare #EXTM3U response is not a playable rendition. Only advertise
-      // levels whose upstream media playlist is actually initialized.
-      return (
-        text.trimStart().startsWith("#EXTM3U") &&
-        text.includes("#EXT-X-TARGETDURATION") &&
-        (text.includes("#EXTINF:") || text.includes("#EXT-X-MAP:"))
+      const result = await fetchInitializedHlsPlaylist(url);
+      return result.ok;
+    } catch (error) {
+      console.warn(
+        `[ABR] Playlist readiness check failed for ${url}:`,
+        error.message,
       );
-    } catch {
       return false;
     }
   };
@@ -15016,43 +15079,30 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     return res.status(404).send("Unknown rendition");
   }
 
-  // Every rendition (including "top") is now genuine ffmpeg output
-  // publishing to live/{stream}_{label} — no more raw-source special case,
-  // so no more need to follow SRS's session-redirect stub (that was only
-  // ever a property of the raw passthrough this route used to also serve
-  // as "original", which is retired — see the PLAN-DRIVEN ABR RENDITION
-  // LADDER comment near getRenditionPlanForOrg).
-  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
-
-  const fetchOpts = {
-    signal: AbortSignal.timeout(4000),
-    headers: {
-      "ngrok-skip-browser-warning": "1",
-      "User-Agent": "NLM-Streaming-Backend/1.0",
-      Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-    },
-  };
+  // Query SRS directly. SRS 6 may return a session bootstrap manifest
+  // containing a same-playlist URI with ?hls_ctx=<session>; follow that
+  // once server-side so hls.js always receives the real media playlist.
+  const upstreamUrl =
+    `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(stream)}_${encodeURIComponent(rendition)}.m3u8`;
 
   try {
-    const response = await fetch(upstreamUrl, fetchOpts);
-    const text = response.ok ? await response.text() : null;
+    const result = await fetchInitializedHlsPlaylist(upstreamUrl);
 
-    if (
-      text &&
-      text.includes("#EXTM3U") &&
-      text.includes("#EXT-X-TARGETDURATION")
-    ) {
+    if (result.ok) {
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-store");
       return res.send(
-        rewriteRelativeSegmentUris(text, `${stream}_${rendition}`),
+        rewriteRelativeSegmentUris(result.text, `${stream}_${rendition}`),
       );
     }
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[ABR] Rendition playlist fetch failed for ${stream}_${rendition}:`,
+      error.message,
+    );
     // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
-    // serving this stream) — fall through to the 503 below. Either way,
-    // hls.js retries this level's manifest on its own short cadence; we
-    // just never hand it broken content in the meantime.
+    // serving this stream) — fall through to the 503 below.
   }
 
   res
