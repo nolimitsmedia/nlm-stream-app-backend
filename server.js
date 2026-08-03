@@ -49,6 +49,12 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
+// Internal live-source URL used by FFmpeg consumers. HTTP-FLV is used
+// instead of RTMP playback because this SRS 6.0.184 deployment accepts
+// RTMP play handshakes but intermittently delivers no media until
+// rw_timeout, while the same source was verified stable over HTTP-FLV.
+const SRS_HTTP_FLV_BASE_URL =
+  process.env.SRS_HTTP_FLV_BASE_URL || "http://127.0.0.1:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
 const RECORDINGS_ROOT = process.env.RECORDINGS_ROOT || "C:/nlm-srs/recordings";
 const RECORDINGS_LIVE_ROOT = path.join(RECORDINGS_ROOT, "live");
@@ -8808,11 +8814,19 @@ function buildRenditionFfmpegArgs(
   ];
 }
 
+function getInternalHttpFlvSourceUrl(streamKey) {
+  return (
+    `${SRS_HTTP_FLV_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(streamKey)}.flv`
+  );
+}
+
 function spawnRenditionsForStream(streamKey, renditions, generation) {
-  // Using 127.0.0.1 explicitly rather than "localhost" — a packet capture
-  // during the SRS consumer-race investigation confirmed "localhost" was
-  // resolving to IPv6 (::1) for these connections.
-  const input = `rtmp://127.0.0.1/live/${streamKey}`;
+  // The source is consumed over SRS HTTP-FLV. Manual production testing
+  // confirmed this path immediately exposes H.264/AAC media and remains
+  // stable, whereas the equivalent local RTMP PLAY request intermittently
+  // stalls until FFmpeg's rw_timeout and exits with Input/output error.
+  const input = getInternalHttpFlvSourceUrl(streamKey);
 
   for (const rendition of renditions) {
     const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
@@ -11101,7 +11115,7 @@ app.post(
 
       const platformConfig = SOCIAL_PLATFORMS[destination.platform];
       const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
-      const sourceUrl = `rtmp://127.0.0.1/live/${channel.stream_key}`;
+      const sourceUrl = getInternalHttpFlvSourceUrl(channel.stream_key);
 
       const proc = spawn("ffmpeg", [
         "-i",
@@ -11271,7 +11285,7 @@ app.post(
           .json({ ok: false, message: "Connected account not found" });
       }
 
-      const sourceUrl = `rtmp://127.0.0.1/live/${channel.stream_key}`;
+      const sourceUrl = getInternalHttpFlvSourceUrl(channel.stream_key);
       let destinationUrl, platformBroadcastId, platformStreamId;
 
       if (destination.platform === "facebook") {
@@ -14732,9 +14746,8 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Using 127.0.0.1 explicitly rather than "localhost" — see the note
-    // in autoTranscodeStream/autoCapBitrateStream for why.
-    const input = `rtmp://127.0.0.1/live/${stream}`;
+    // Use the same verified HTTP-FLV source path as automatic ABR.
+    const input = getInternalHttpFlvSourceUrl(stream);
     const output720 = `rtmp://127.0.0.1/live/${stream}_720p`;
     const output480 = `rtmp://127.0.0.1/live/${stream}_480p`;
 
