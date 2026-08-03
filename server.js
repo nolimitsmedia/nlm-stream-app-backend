@@ -9543,23 +9543,6 @@ app.get("/api/hls/session/:streamKey", async (req, res) => {
   }
 });
 
-// Accept only manifests that hls.js can actually play. SRS may briefly
-// return a header-only #EXTM3U response while a stream or rendition is
-// starting; returning that response with HTTP 200 causes hls.js to raise
-// a fatal "no levels found in manifest" parsing error instead of retrying.
-const isUsableHlsPlaylist = (text) => {
-  if (typeof text !== "string" || !text.trimStart().startsWith("#EXTM3U")) {
-    return false;
-  }
-
-  const isMaster = text.includes("#EXT-X-STREAM-INF");
-  const isMedia =
-    text.includes("#EXT-X-TARGETDURATION") &&
-    (text.includes("#EXTINF:") || text.includes("#EXT-X-MAP:"));
-
-  return isMaster || isMedia;
-};
-
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
 
@@ -9575,18 +9558,11 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
     let resolvedApp;
     let resolvedLiveStartedAtMs;
 
-    if (
-      cached &&
-      Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS &&
-      isUsableHlsPlaylist(cached.text)
-    ) {
+    if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
       text = cached.text;
       resolvedApp = cached.resolvedApp;
       resolvedLiveStartedAtMs = cached.liveStartedAtMs;
     } else {
-      // Never keep an incomplete startup manifest in cache. A header-only
-      // #EXTM3U response is not playable and must be retried upstream.
-      if (cached) manifestCache.delete(cacheKey);
       const channelResult = await pool.query(
         `SELECT live_started_at FROM channels WHERE stream_key = $1`,
         [streamKey],
@@ -9677,6 +9653,11 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         return res.status(502).send("HLS unavailable");
       }
 
+      // Commit to this app for the rest of the broadcast.
+      if (liveStartedAtMs) {
+        stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
+      }
+
       resolvedLiveStartedAtMs = liveStartedAtMs;
 
       console.log("[HLS RESPONSE]", {
@@ -9687,11 +9668,26 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       text = await upstream.text();
 
-      if (!isUsableHlsPlaylist(text)) {
-        manifestCache.delete(cacheKey);
-        console.warn("[HLS PLAYLIST NOT READY]", {
+      const normalizedManifest = text.trimStart();
+      const isMasterPlaylist =
+        normalizedManifest.startsWith("#EXTM3U") &&
+        normalizedManifest.includes("#EXT-X-STREAM-INF");
+      const isMediaPlaylist =
+        normalizedManifest.startsWith("#EXTM3U") &&
+        normalizedManifest.includes("#EXT-X-TARGETDURATION") &&
+        (normalizedManifest.includes("#EXTINF:") ||
+          normalizedManifest.includes("#EXT-X-MAP:"));
+
+      // SRS may briefly answer 200 with an incomplete playlist while a
+      // publish/session is being established or torn down. Returning that
+      // body as a successful manifest makes hls.js fail fatally with
+      // "no levels found in manifest". Treat it as transient instead so the
+      // player's normal manifest retry path can recover cleanly.
+      if (!isMasterPlaylist && !isMediaPlaylist) {
+        console.warn("[INCOMPLETE HLS PLAYLIST]", {
           streamKey,
           resolvedApp,
+          finalUrl: upstream.url,
           preview: text.substring(0, 500),
         });
         res.setHeader("Retry-After", "2");
@@ -9700,17 +9696,33 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
           .send("HLS playlist is not ready yet, please retry shortly");
       }
 
-      // Commit only after receiving a genuinely playable manifest.
-      if (liveStartedAtMs) {
-        stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
-      }
-
       manifestCache.set(cacheKey, {
         text,
         resolvedApp,
         liveStartedAtMs: resolvedLiveStartedAtMs,
         cachedAt: Date.now(),
       });
+    }
+
+    // Revalidate cached manifests too. This prevents a transient incomplete
+    // 200 response captured just before this deploy (or during a race inside
+    // the cache TTL) from being served repeatedly as a valid playlist.
+    const normalizedManifest = text.trimStart();
+    const isMasterPlaylist =
+      normalizedManifest.startsWith("#EXTM3U") &&
+      normalizedManifest.includes("#EXT-X-STREAM-INF");
+    const isMediaPlaylist =
+      normalizedManifest.startsWith("#EXTM3U") &&
+      normalizedManifest.includes("#EXT-X-TARGETDURATION") &&
+      (normalizedManifest.includes("#EXTINF:") ||
+        normalizedManifest.includes("#EXT-X-MAP:"));
+
+    if (!isMasterPlaylist && !isMediaPlaylist) {
+      manifestCache.delete(cacheKey);
+      res.setHeader("Retry-After", "2");
+      return res
+        .status(503)
+        .send("HLS playlist is not ready yet, please retry shortly");
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -9814,8 +9826,16 @@ app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
         signal: AbortSignal.timeout(10000),
       },
     );
-    if (!upstream.ok)
+    if (!upstream.ok) {
+      console.error("[HLS SEGMENT UPSTREAM ERROR]", {
+        app,
+        streamKey,
+        segment,
+        status: upstream.status,
+        upstreamUrl: `${SRS_HLS_ORIGIN}/${app}/${segment}${upstreamQs}`,
+      });
       return res.status(upstream.status).send("Segment unavailable");
+    }
     const contentType = "video/mp2t";
     res.setHeader("Content-Type", contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -14760,40 +14780,37 @@ const extractRedirectUri = (text) => {
 // #-comment and isn't already absolute (http/https/leading slash) to be
 // rooted at /live/ instead, so segments keep resolving correctly
 // regardless of which path served the manifest.
-const rewriteRelativeSegmentUris = (manifestText) =>
+const rewriteRelativeSegmentUris = (manifestText, streamKey) =>
   manifestText
     .split("\n")
     .map((line) => {
       const trimmed = line.trim();
-      if (
-        !trimmed ||
-        trimmed.startsWith("#") ||
-        trimmed.startsWith("http://") ||
-        trimmed.startsWith("https://") ||
-        trimmed.startsWith("/")
-      ) {
-        // NOTE: a segment SRS ever emits as already-absolute (leading "/")
-        // would fall through here unsigned. Not observed in testing so far
-        // (SRS emits bare relative filenames for these renditions), but
-        // worth confirming with a live curl if 480p/720p ever 403 after
-        // this deploy — see bunny-signed-urls.md test plan.
+
+      if (!trimmed || trimmed.startsWith("#")) {
         return line;
       }
 
-      // SRS's "Original" rendition segments can carry their own query
-      // string (a per-segment ?hls_ctx=... session-context marker) — real
-      // incident (2026-08-02): signing the whole line (path + hls_ctx) as
-      // one "path" produced a wrong signature AND a malformed double-"?"
-      // URL once our own token/expires were appended on top. Split off any
-      // existing query string first, sign ONLY the actual path, then
-      // re-merge with a single correctly-placed separator.
       const questionIndex = trimmed.indexOf("?");
-      const bareFilename =
+      const uriPart =
         questionIndex >= 0 ? trimmed.slice(0, questionIndex) : trimmed;
       const existingQs = questionIndex >= 0 ? trimmed.slice(questionIndex) : "";
+      const filename = uriPart.split("/").pop();
 
-      const segPath = `/live/${bareFilename}`;
-      return `${segPath}${appendBunnyToken(segPath, existingQs)}`;
+      // Route every ABR media fragment through the same backend segment
+      // proxy used by the raw HLS path. The previous implementation emitted
+      // direct /live/*.ts URLs on the Bunny hostname; dedicated pull zones
+      // do not consistently expose that path and real viewers received 404
+      // fragLoadError responses even though SRS had the segment locally.
+      if (filename && filename.toLowerCase().endsWith(".ts")) {
+        const segPath = `/api/hls/seg/live/${encodeURIComponent(
+          streamKey,
+        )}/${encodeURIComponent(filename)}`;
+        return `${segPath}${appendBunnyToken(segPath, existingQs)}`;
+      }
+
+      // Leave uncommon absolute/non-TS URIs untouched. Current SRS ABR
+      // output is MPEG-TS, so these are not expected in the normal path.
+      return line;
     })
     .join("\n");
 
@@ -14806,6 +14823,7 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(4000),
         headers: {
+          "ngrok-skip-browser-warning": "1",
           "User-Agent": "NLM-Streaming-Backend/1.0",
           Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
         },
@@ -14813,8 +14831,8 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
       if (!response.ok) return false;
 
       const text = await response.text();
-      // A rendition is ready only when SRS exposes a real media playlist,
-      // not merely a header-only #EXTM3U startup response.
+      // A bare #EXTM3U response is not a playable rendition. Only advertise
+      // levels whose upstream media playlist is actually initialized.
       return (
         text.trimStart().startsWith("#EXTM3U") &&
         text.includes("#EXT-X-TARGETDURATION") &&
@@ -14853,7 +14871,7 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
-  let readyRenditionCount = 0;
+  let availableRenditions = 0;
 
   for (const rendition of renditionPlan) {
     const upstreamUrl = `${baseUrl}/${stream}_${rendition.label}.m3u8`;
@@ -14863,16 +14881,23 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${rendition.bitrateKbps * 1000},RESOLUTION=${rendition.resolution},NAME="${rendition.label}"
 ${path}${appendBunnyToken(path)}
 `;
-    readyRenditionCount += 1;
+    availableRenditions += 1;
   }
 
-  if (readyRenditionCount === 0) {
-    console.warn(`[ABR] No playable renditions ready for ${stream}`);
+  // Never return a syntactically header-only master playlist with HTTP 200.
+  // hls.js interprets that as a fatal parse error: "no levels found in
+  // manifest". A 503 correctly represents the temporary condition and lets
+  // its configured manifest retry logic wait for ffmpeg/SRS to recover.
+  if (availableRenditions === 0) {
+    console.warn("[ABR] No initialized renditions available", {
+      stream,
+      planned: renditionPlan.map((rendition) => rendition.label),
+    });
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Retry-After", "2");
     return res
       .status(503)
-      .send("ABR renditions are not ready yet, please retry shortly");
+      .send("No ABR renditions are ready yet, please retry shortly");
   }
 
   res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -14932,7 +14957,9 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     ) {
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-store");
-      return res.send(rewriteRelativeSegmentUris(text));
+      return res.send(
+        rewriteRelativeSegmentUris(text, `${stream}_${rendition}`),
+      );
     }
   } catch {
     // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
