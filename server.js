@@ -9410,18 +9410,19 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       const stickyValid =
         sticky && liveStartedAtMs && sticky.liveStartedAtMs === liveStartedAtMs;
 
-      // Once committed to an app for THIS broadcast, only ever try that
-      // one — never silently re-route to the other app mid-session, even
-      // on a transient failure (a real player-facing HLS discontinuity
-      // bug came from exactly that). A fresh broadcast (no valid sticky
-      // entry yet) tries live_capped first, same as before.
-      const candidateApps = stickyValid
-        ? [sticky.app]
-        : ["live_capped", "live"];
+      // live_capped is fully retired (2026-08-03 ABR-fold) — nothing
+      // publishes to it anymore, so there's no second app to race
+      // against here. Real bug found live (2026-08-03): this block used
+      // to also check bitrateCapRetryCount/MAX_BITRATE_CAP_RETRIES to
+      // decide whether live_capped had "given up" yet — both were deleted
+      // when autoCapBitrateStream was retired, so that check threw a
+      // ReferenceError on nearly every request through this route
+      // (crashing the whole HLS proxy for any org still on this fallback
+      // path). Simplified to just resolving directly to "live".
+      const candidateApps = ["live"];
 
       let upstream = null;
       let upstreamUrl = null;
-      let cappedFailed = false;
 
       for (const app of candidateApps) {
         const candidateUrl = `${SRS_HLS_ORIGIN}/${app}/${streamKey}.m3u8${qs}`;
@@ -9443,47 +9444,10 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
             upstreamUrl = candidateUrl;
             resolvedApp = app;
             break;
-          } else if (app === "live_capped") {
-            cappedFailed = true;
           }
         } catch {
-          if (app === "live_capped") {
-            cappedFailed = true;
-          }
-          // try the next candidate app
-        }
-      }
-
-      // A fresh (non-sticky) resolution where live_capped failed but the
-      // raw "live" fallback succeeded is NOT necessarily a real cap
-      // failure — live_capped's own ffmpeg can be alive and publishing but
-      // simply hasn't written its first HLS segment yet (confirmed via
-      // real logs: a viewer's first manifest request landing ~4s after
-      // on_publish, well inside live_capped's own startup lag, was enough
-      // to permanently commit that whole broadcast to the uncapped
-      // fallback). Only accept the "live" fallback here once the cap has
-      // definitively given up (its retry budget is exhausted) or its
-      // startup grace window has actually elapsed — otherwise ask the
-      // player to retry shortly, same as the both-failed case below, so
-      // live_capped gets a fair chance to come online first.
-      if (
-        upstream &&
-        resolvedApp === "live" &&
-        !stickyValid &&
-        cappedFailed &&
-        liveStartedAtMs
-      ) {
-        const cappedGaveUp =
-          (bitrateCapRetryCount.get(streamKey) || 0) > MAX_BITRATE_CAP_RETRIES;
-        const pastGraceWindow =
-          Date.now() - liveStartedAtMs >= HLS_CAPPED_STARTUP_GRACE_MS;
-
-        if (!cappedGaveUp && !pastGraceWindow) {
-          console.log(
-            "[HLS] live_capped not ready yet and hasn't given up — asking player to retry shortly instead of committing to raw fallback",
-            { streamKey },
-          );
-          return res.status(503).send("Stream starting, please retry shortly");
+          // try the next candidate app (none left now, but keeps the loop
+          // shape intact in case a second candidate is ever reintroduced)
         }
       }
 
