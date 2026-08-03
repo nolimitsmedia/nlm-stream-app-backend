@@ -8336,7 +8336,7 @@ async function getActiveLiveCount(organizationId) {
 // identical flaw, so it's fixed here at the same time.
 const activeTranscodeProcesses = new Map(); // key: `${streamKey}:${label}`
 const transcodeRetryCount = new Map(); // key: `${streamKey}:${label}`
-const MAX_TRANSCODE_RETRIES = 3;
+const MAX_TRANSCODE_RETRIES = 10;
 
 // NOTE: bitrateCapGeneration, bitrateCapEncoderGeneration, and
 // isServerLoadTooHighForNewTranscode are declared further down this file
@@ -8635,7 +8635,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       );
       setTimeout(
         () => spawnFfmpegVariant(label, streamKey, args, generation),
-        5000,
+        3000,
       );
     } catch (err) {
       console.error(
@@ -8648,18 +8648,29 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
 
 // Same input-side resilience flags already proven to reduce (not fully
 // eliminate — see MAX_TRANSCODE_RETRIES above for the rest) the
-// "Input/output error" crash rate reading this exact RTMP source.
+// HTTP-FLV startup reliability for FFmpeg consumers.
 // +genpts/discardcorrupt and avoid_negative_ts guard against timestamp
 // irregularities inherited from OBS/the RTMP input that could otherwise
 // produce a genuine MSE bufferAppendError downstream with no encoder
 // restart involved at all.
 const inputResilienceFlags = [
+  // SRS HTTP-FLV is an endless live stream, not a seekable file.
+  // Prevent FFmpeg from issuing byte-range/seek behavior against it.
+  "-seekable",
+  "0",
+
+  // Identify the H.264/AAC streams quickly without holding startup for
+  // an unnecessarily large 10 MB / 10 second probe.
   "-analyzeduration",
-  "10000000",
+  "3000000",
   "-probesize",
-  "10000000",
+  "1000000",
+
+  // A genuinely stalled attempt should fail promptly so the retry chain
+  // can recover instead of leaving viewers waiting for two minutes.
   "-rw_timeout",
-  "120000000",
+  "30000000",
+
   "-fflags",
   "+genpts+discardcorrupt",
   "-avoid_negative_ts",
@@ -9973,14 +9984,14 @@ app.post("/api/srs/on_publish", async (req, res) => {
 
     // 4. Spawn whatever rendition ladder this org's plan calls for — see
     // getRenditionPlanForOrg/spawnRenditionsForStream above. Same startup
-    // delay as before, letting SRS's source object stabilize before
+    // delay, letting SRS's source object and HTTP-FLV mount stabilize before
     // ffmpeg connects.
     getRenditionPlanForOrg(channel.org_id)
       .then((renditions) => {
         if (!renditions.length) return;
         setTimeout(
           () => spawnRenditionsForStream(streamKey, renditions, generation),
-          7000,
+          12000,
         );
       })
       .catch((err) =>
