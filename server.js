@@ -8336,33 +8336,112 @@ const MAX_TRANSCODE_RETRIES = 3;
 // but are only ever referenced here from inside function bodies invoked at
 // runtime (never at module-load time), so by the time any of these actually
 // run, every top-level const below has already been initialized.
-// Writes the FULL captured stderr for a crashed ffmpeg process to a file,
-// for real root-cause diagnosis of the recurring "Input/output error"
-// crashes — the previous approach only ever logged the last ~4000 chars,
-// which for a quick crash (~10-30s, per observed logs) is mostly just the
-// libx264 encoder stats dump printed right before exit, very likely
-// pushing the actual first error line (which appears EARLIER in ffmpeg's
-// output) out of that window entirely. Returns the file path so the
-// caller can log a pointer to it instead of the whole thing.
+// Real bug found via ChatGPT review (2026-08-03): this was called a "full"
+// crash dump, but it only ever received `stderrTail` — already capped to
+// 50KB in spawnFfmpegVariant below — so on a fast crash it could still
+// miss ffmpeg's actual first error line if a lot of encoder-stats output
+// came before it. Replaced with a real streaming-to-disk approach: every
+// byte ffmpeg writes to stderr is written to this file AS IT ARRIVES, not
+// reconstructed from an in-memory tail afterward.
 const FFMPEG_CRASH_LOG_DIR = "/tmp/ffmpeg-crash-logs";
-const dumpFfmpegCrashLog = (label, streamKey, fullStderr) => {
+
+const createFfmpegLogFile = (label, streamKey) => {
   try {
-    if (!fs.existsSync(FFMPEG_CRASH_LOG_DIR)) {
-      fs.mkdirSync(FFMPEG_CRASH_LOG_DIR, { recursive: true });
-    }
-    const filePath = `${FFMPEG_CRASH_LOG_DIR}/${label}-${streamKey}-${Date.now()}.log`;
-    fs.writeFileSync(filePath, fullStderr);
-    return filePath;
+    fs.mkdirSync(FFMPEG_CRASH_LOG_DIR, { recursive: true });
+    const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const safeStreamKey = String(streamKey).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const filePath = path.join(
+      FFMPEG_CRASH_LOG_DIR,
+      `${safeLabel}-${safeStreamKey}-${Date.now()}.log`,
+    );
+    return { filePath, stream: fs.createWriteStream(filePath, { flags: "a" }) };
   } catch (err) {
     console.error(
-      `[FFMPEG-CRASH-LOG] Failed to write full stderr dump for ${label}/${streamKey}:`,
+      `[FFMPEG-LOG] Unable to create log file for ${label}/${streamKey}:`,
       err.message,
     );
-    return null;
+    return { filePath: null, stream: null };
   }
 };
 
-const spawnFfmpegVariant = (label, streamKey, args, generation) => {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ══════════════════════════════════════════
+// SRS SOURCE READINESS GATE (added 2026-08-03, per ChatGPT review)
+// Real gap found: retry decisions only ever checked `channels.is_live` in
+// our own DB — which stays true through brief encoder reconnects, SRS
+// source-setup delays, and other states where the raw stream isn't
+// actually readable yet. That's a plausible contributor to ffmpeg's
+// "Input/output error" crashes on this input — spawning against a source
+// that LOOKS live in our DB but isn't actually delivering media yet.
+// This asks SRS itself, not our DB, whether the raw stream is genuinely
+// active and has actually received media before we spawn/retry ffmpeg
+// against it.
+// ══════════════════════════════════════════
+async function getSrsRawStream(streamKey) {
+  const response = await fetch(`${SRS_API_URL}/api/v1/streams/`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) {
+    throw new Error(`SRS streams API returned HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  return (data.streams || []).find(
+    (stream) =>
+      stream.name === streamKey &&
+      (!stream.app || stream.app === "live") &&
+      stream.publish?.active,
+  );
+}
+
+async function waitForSrsRawStreamReady(
+  streamKey,
+  generation,
+  { timeoutMs = 20000, pollMs = 1000 } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastReason = "stream not found";
+
+  while (Date.now() < deadline) {
+    if (bitrateCapGeneration.get(streamKey) !== generation) {
+      return {
+        ready: false,
+        superseded: true,
+        reason: "broadcast generation was superseded",
+      };
+    }
+
+    try {
+      const stream = await getSrsRawStream(streamKey);
+      if (!stream) {
+        lastReason = "raw stream is not actively published in SRS";
+      } else {
+        const frames = Number(stream.frames || 0);
+        const receivedBytes = Number(
+          stream.recv_bytes ?? stream.recvBytes ?? stream.bytes?.recv ?? 0,
+        );
+        // SRS field names vary slightly by version — accept any of these
+        // as evidence the source is genuinely delivering media, not just
+        // registered as "active" with nothing flowing yet.
+        const hasMedia =
+          frames >= 1 ||
+          receivedBytes > 0 ||
+          Number(stream.publish?.active_age || 0) >= 2;
+
+        if (hasMedia) return { ready: true, stream };
+        lastReason = `SRS source is active but no media yet (frames=${frames}, receivedBytes=${receivedBytes})`;
+      }
+    } catch (err) {
+      lastReason = err.message;
+    }
+
+    await sleep(pollMs);
+  }
+
+  return { ready: false, superseded: false, reason: lastReason };
+}
+
+const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   // Same supersession guard as autoCapBitrateStream — abandon if a newer
   // broadcast session has started since this call was scheduled, rather
   // than risk racing a fresh attempt to publish to the same output name.
@@ -8370,6 +8449,16 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
     console.log(
       `[Transcode] Skipping superseded ${label} session for ${streamKey} (a newer broadcast session has since started).`,
     );
+    return;
+  }
+
+  const readiness = await waitForSrsRawStreamReady(streamKey, generation);
+  if (!readiness.ready) {
+    if (!readiness.superseded) {
+      console.error(
+        `[Transcode] ${label} not started for ${streamKey}: raw SRS source never became ready — ${readiness.reason}`,
+      );
+    }
     return;
   }
 
@@ -8404,13 +8493,27 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
     (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
   );
 
-  // Bounded rolling buffer (50KB, up from the original 4000 chars) — large
-  // enough to capture the real error line even on a fast crash, without
-  // growing unbounded for a long healthy stream.
+  const { filePath: ffmpegLogPath, stream: ffmpegLogStream } =
+    createFfmpegLogFile(label, streamKey);
+
+  // Bounded rolling buffer (50KB) — still kept for the quick pointer in
+  // PM2 logs; the FULL stderr now goes to ffmpegLogStream above as it
+  // arrives, so a crash's earliest lines are never lost to this cap.
   let stderrTail = "";
   proc.stderr.on("data", (chunk) => {
-    stderrTail += chunk.toString();
+    const text = chunk.toString();
+    if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
+      ffmpegLogStream.write(text);
+    }
+    stderrTail += text;
     if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
+  });
+
+  proc.stderr.on("error", (err) => {
+    console.error(
+      `[FFMPEG-LOG] stderr read failed for ${label}/${streamKey}:`,
+      err.message,
+    );
   });
 
   proc.on("error", (err) => {
@@ -8421,34 +8524,50 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
   });
 
   proc.on("exit", async (code, signal) => {
+    if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
+      ffmpegLogStream.end();
+    }
+
     if (activeTranscodeProcesses.get(retryKey) === proc) {
       activeTranscodeProcesses.delete(retryKey);
     }
 
-    if (code === 0 || code === null) return; // clean exit — nothing to retry
+    if (code === 0 || code === null) {
+      // Clean exit — nothing to retry. Delete the (empty/uninteresting)
+      // log rather than letting healthy-stream logs accumulate forever.
+      if (ffmpegLogPath) fs.promises.unlink(ffmpegLogPath).catch(() => {});
+      return;
+    }
 
     // A newer session has started since THIS process was spawned — stay
     // quiet, this exit is expected (superseded), not a real failure.
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
-    const crashLogPath = dumpFfmpegCrashLog(label, streamKey, stderrTail);
     console.warn(
       `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — retrying` +
-        (crashLogPath
-          ? ` (full stderr, ${stderrTail.length} chars, written to ${crashLogPath})`
-          : "") +
+        (ffmpegLogPath ? ` (full stderr written to ${ffmpegLogPath})` : "") +
         `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
     );
 
-    // Only retry if the raw source is STILL actually live — same guard as
-    // the bitrate-cap retry chain, for the same reason.
+    // Only retry if SRS itself still sees the raw source as genuinely
+    // active — replaces the old DB-only `is_live` check (ChatGPT review
+    // finding: `is_live` can stay true through states where the raw
+    // stream isn't actually consumable yet, e.g. a brief reconnect gap).
     try {
-      const liveCheck = await pool.query(
-        `SELECT is_live FROM channels WHERE stream_key = $1`,
-        [streamKey],
+      const readinessForRetry = await waitForSrsRawStreamReady(
+        streamKey,
+        generation,
+        { timeoutMs: 15000, pollMs: 1000 },
       );
 
-      if (!liveCheck.rows[0]?.is_live) return;
+      if (!readinessForRetry.ready) {
+        if (!readinessForRetry.superseded) {
+          console.warn(
+            `[Transcode] Not retrying ${label} for ${streamKey}: raw source unavailable in SRS — ${readinessForRetry.reason}`,
+          );
+        }
+        return;
+      }
 
       const attempts = (transcodeRetryCount.get(retryKey) || 0) + 1;
       transcodeRetryCount.set(retryKey, attempts);
@@ -8475,7 +8594,7 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
       );
     } catch (err) {
       console.error(
-        `[Transcode] Failed to check live status for ${streamKey} before retrying ${label}:`,
+        `[Transcode] Failed readiness check for ${streamKey} before retrying ${label}:`,
         err.message,
       );
     }
@@ -8587,9 +8706,36 @@ async function getRenditionPlanForOrg(organizationId) {
   return []; // no plan/cap resolved — nothing to spawn
 }
 
-function buildRenditionFfmpegArgs(input, output, { bitrateKbps, resolution }) {
+// Diagnostic logging (added 2026-08-03, per ChatGPT review): verbose by
+// default (cheap, no packet-level spam via -nostats), full debug only for
+// streams explicitly listed in FFMPEG_DEBUG_STREAMS (comma-separated
+// stream keys) — set via .env + `pm2 restart <name> --update-env`, not
+// left on globally, since debug-level ffmpeg output is heavy for a
+// long-running healthy stream.
+function getFfmpegLogLevel(streamKey) {
+  const debugStreams = new Set(
+    String(process.env.FFMPEG_DEBUG_STREAMS || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  return debugStreams.has(streamKey)
+    ? "repeat+level+debug"
+    : "repeat+level+verbose";
+}
+
+function buildRenditionFfmpegArgs(
+  streamKey,
+  input,
+  output,
+  { bitrateKbps, resolution },
+) {
   return [
     "-y",
+    "-hide_banner",
+    "-nostats",
+    "-loglevel",
+    getFfmpegLogLevel(streamKey),
     ...inputResilienceFlags,
     "-i",
     input,
@@ -8632,7 +8778,7 @@ function spawnRenditionsForStream(streamKey, renditions, generation) {
 
   for (const rendition of renditions) {
     const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
-    const args = buildRenditionFfmpegArgs(input, output, rendition);
+    const args = buildRenditionFfmpegArgs(streamKey, input, output, rendition);
     console.log(
       `[ABR] Starting ${rendition.label} (${rendition.bitrateKbps}kbps, ${rendition.resolution}) for: ${streamKey}`,
     );
