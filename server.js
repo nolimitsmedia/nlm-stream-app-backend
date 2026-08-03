@@ -8491,6 +8491,24 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     return;
   }
 
+  // Close the final readiness-to-spawn race. The source may unpublish after
+  // waitForSrsRawStreamReady() succeeds but before ffmpeg is actually spawned.
+  // Re-check both SRS and the broadcast generation immediately before spawn.
+  const sourceStillLive = await getSrsRawStream(streamKey).catch((err) => {
+    console.warn(
+      `[Transcode] Final SRS source check failed for ${label}/${streamKey}:`,
+      err.message,
+    );
+    return null;
+  });
+
+  if (!sourceStillLive || bitrateCapGeneration.get(streamKey) !== generation) {
+    console.warn(
+      `[Transcode] Aborting ${label} startup for ${streamKey}: source disappeared or broadcast was superseded before ffmpeg spawn.`,
+    );
+    return;
+  }
+
   const proc = spawn("ffmpeg", args);
   activeTranscodeProcesses.set(retryKey, proc);
 
@@ -9992,6 +10010,65 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
   }
 
   try {
+    // Invalidate every delayed startup and retry that belongs to the broadcast
+    // which just ended. A pending 7-second startup timer may otherwise spawn
+    // ffmpeg after SRS has already removed the raw source.
+    const endedGeneration = (bitrateCapGeneration.get(streamKey) || 0) + 1;
+    bitrateCapGeneration.set(streamKey, endedGeneration);
+
+    // Clear all retry budgets for this source stream.
+    for (const key of transcodeRetryCount.keys()) {
+      if (key.startsWith(`${streamKey}:`)) {
+        transcodeRetryCount.delete(key);
+      }
+    }
+
+    // Stop any active rendition process that is still consuming this source.
+    for (const [key, proc] of activeTranscodeProcesses.entries()) {
+      if (!key.startsWith(`${streamKey}:`)) continue;
+
+      if (proc && proc.exitCode === null) {
+        console.log(
+          `[Transcode] Stopping ${key} because raw source ${streamKey} unpublished.`,
+        );
+
+        proc.kill("SIGTERM");
+
+        const forceKillTimer = setTimeout(() => {
+          if (proc.exitCode === null) {
+            console.warn(
+              `[Transcode] Force-killing ${key} after graceful shutdown timeout.`,
+            );
+            proc.kill("SIGKILL");
+          }
+        }, 5000);
+        forceKillTimer.unref();
+      }
+
+      activeTranscodeProcesses.delete(key);
+    }
+
+    // Remove every manifest/segment cache entry tied to the ended source or
+    // one of its suffixed ABR rendition streams. This prevents stale manifests
+    // from referencing SRS segment files that were already deleted.
+    stickyHlsApp.delete(streamKey);
+
+    for (const key of manifestCache.keys()) {
+      if (
+        key === streamKey ||
+        key.startsWith(`${streamKey}?`) ||
+        key.startsWith(`${streamKey}_`)
+      ) {
+        manifestCache.delete(key);
+      }
+    }
+
+    for (const key of segmentCache.keys()) {
+      if (key.includes(`/${streamKey}/`) || key.includes(`/${streamKey}_`)) {
+        segmentCache.delete(key);
+      }
+    }
+
     // Mark channel offline
     const channelResult = await pool.query(
       `UPDATE channels SET is_live = FALSE, live_started_at = NULL
@@ -10014,8 +10091,6 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     if (orgId) {
       autoSyncRecordingsDelayed(orgId, 8000);
     }
-
-    stickyHlsApp.delete(streamKey);
 
     console.log(`[SRS] Stream offline: ${streamKey}`);
     res.json({ code: 0 });
