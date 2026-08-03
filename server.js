@@ -2263,6 +2263,22 @@ const recordBitrateViolation = async ({
   );
 };
 
+// Real bug found and fixed 2026-08-03: the three call sites below each
+// hardcoded a check for streamKey.endsWith("_720p")/"_480p" specifically —
+// when the bitrate-cap fold introduced a THIRD rendition label ("top"),
+// none of them were updated, so ffmpeg's own republish of the "top"
+// rendition fell through to normal on_publish validation, found no
+// matching channel row for "{streamKey}_top", and got REJECTED (403) by
+// our own webhook — meaning it could never actually start, so
+// master.m3u8's checkPlaylist never found it and viewers got a manifest
+// with zero levels ("no levels found in manifest", confirmed live via an
+// Essential-tier org). Centralizing this check in one place so adding or
+// renaming a rendition label in the future can't silently break this
+// again the same way.
+const ABR_RENDITION_SUFFIX_PATTERN = /_(top|720p|480p)$/;
+const isAbrRenditionStreamKey = (streamKey) =>
+  ABR_RENDITION_SUFFIX_PATTERN.test(streamKey || "");
+
 const pollBitrateCompliance = async () => {
   try {
     const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
@@ -2271,15 +2287,15 @@ const pollBitrateCompliance = async () => {
     const data = await response.json();
     const activeStreams = (data.streams || []).filter((s) => {
       if (!s.publish?.active) return false;
-      // Only check the raw ingest app — live_capped (the new hard-cap
-      // transcode output) and the existing _720p/_480p ABR variants all
-      // re-publish under the same base stream name and would otherwise
-      // be double-counted or confuse which bitrate is "real". NOTE: the
-      // exact field SRS uses for app name in this response (`s.app`)
-      // isn't confirmed against a live payload — if this ever silently
-      // stops catching real streams, check the actual field name here.
+      // Only check the raw ingest app — live_capped (retired) and the
+      // ABR rendition variants (top/720p/480p) all re-publish under the
+      // same base stream name and would otherwise be double-counted or
+      // confuse which bitrate is "real". NOTE: the exact field SRS uses
+      // for app name in this response (`s.app`) isn't confirmed against a
+      // live payload — if this ever silently stops catching real streams,
+      // check the actual field name here.
       if (s.app && s.app !== "live") return false;
-      if (s.name?.endsWith("_720p") || s.name?.endsWith("_480p")) return false;
+      if (isAbrRenditionStreamKey(s.name)) return false;
       return true;
     });
 
@@ -9669,17 +9685,12 @@ app.post("/api/srs/on_publish", async (req, res) => {
   );
 
   // Skip transcoded variant streams (they re-publish to SRS too) — this
-  // includes the existing _720p/_480p ABR variants AND our own
-  // bitrate-capping transcode's republish into the live_capped app. Both
-  // are internal re-publishes of an already-validated stream, not a new
-  // broadcaster connecting — running the full validation/capping logic
-  // again here would at best be redundant and at worst spawn a duplicate
-  // (or recursive) transcode of an already-capped stream.
-  if (
-    streamKey.endsWith("_720p") ||
-    streamKey.endsWith("_480p") ||
-    publishApp === "live_capped"
-  ) {
+  // is any of our own ABR rendition outputs (top/720p/480p), an internal
+  // re-publish of an already-validated stream, not a new broadcaster
+  // connecting — running the full validation/plan-resolution logic again
+  // here would at best be redundant and at worst spawn a duplicate (or
+  // recursive) transcode.
+  if (isAbrRenditionStreamKey(streamKey)) {
     return res.json({ code: 0 });
   }
 
@@ -9795,11 +9806,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     `[SRS] on_unpublish — app: ${publishApp}, stream key: ${streamKey}`,
   );
 
-  if (
-    streamKey.endsWith("_720p") ||
-    streamKey.endsWith("_480p") ||
-    publishApp === "live_capped"
-  ) {
+  if (isAbrRenditionStreamKey(streamKey)) {
     return res.json({ code: 0 });
   }
 
