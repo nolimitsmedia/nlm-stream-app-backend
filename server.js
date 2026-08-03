@@ -6124,6 +6124,16 @@ const getPublicWatchStatus = async (streamKey) => {
       transcodingEnabled = Boolean(
         planFlagsResult.rows[0]?.transcoding_enabled,
       );
+      // Essential-tier orgs don't have the `transcoding_enabled` plan flag
+      // set, but as of the ABR-rendition-ladder fold (2026-08-03) they DO
+      // get a real single-rung rendition (see getRenditionPlanForOrg) —
+      // route them through /api/abr/ same as Deluxe/Premium rather than
+      // the plain /api/hls/ path, which no longer has anything special
+      // publishing to it for a plan'd org.
+      if (!transcodingEnabled) {
+        const capKbps = await getOrgMaxBitrateKbps(organizationId);
+        transcodingEnabled = Boolean(capKbps);
+      }
     } catch (planErr) {
       console.error("Watch status plan flags lookup error:", planErr.message);
     }
@@ -8456,129 +8466,162 @@ const spawnFfmpegVariant = (label, streamKey, args, generation) => {
   });
 };
 
-function autoTranscodeStream(streamKey, generation) {
-  if (bitrateCapGeneration.get(streamKey) !== generation) {
-    console.log(
-      `[Transcode] Skipping superseded session for ${streamKey} (a newer broadcast session has since started).`,
-    );
-    return;
+// Same input-side resilience flags already proven to reduce (not fully
+// eliminate — see MAX_TRANSCODE_RETRIES above for the rest) the
+// "Input/output error" crash rate reading this exact RTMP source.
+// +genpts/discardcorrupt and avoid_negative_ts guard against timestamp
+// irregularities inherited from OBS/the RTMP input that could otherwise
+// produce a genuine MSE bufferAppendError downstream with no encoder
+// restart involved at all.
+const inputResilienceFlags = [
+  "-analyzeduration",
+  "10000000",
+  "-probesize",
+  "10000000",
+  "-rw_timeout",
+  "30000000",
+  "-fflags",
+  "+genpts+discardcorrupt",
+  "-avoid_negative_ts",
+  "make_zero",
+];
+
+// Forces a keyframe exactly every 2 real-time seconds, matching SRS's
+// hls_fragment 2 setting, so segment boundaries land on predictable
+// keyframes instead of drifting. Deliberately timestamp-based (gte(t,...))
+// rather than a frame-count based -g/-keyint_min value — a fixed
+// frame-count GOP would need to match the SOURCE's actual frame rate,
+// which we don't reliably know per-client. sc_threshold 0 disables
+// scene-cut-triggered keyframes so only these forced ones apply.
+const keyframeAlignmentFlags = [
+  "-force_key_frames",
+  "expr:gte(t,n_forced*2)",
+  "-sc_threshold",
+  "0",
+];
+
+// ══════════════════════════════════════════
+// PLAN-DRIVEN ABR RENDITION LADDER (2026-08-03)
+// Replaces the old split between autoTranscodeStream (fixed 720p/480p,
+// Deluxe/Premium only) and autoCapBitrateStream (a separate bespoke hard-
+// cap ffmpeg process for Essential, republishing to a distinct
+// "live_capped" app). That split was also the single largest source of
+// incidents in this codebase's history (crash-loop investigation, the
+// sticky-app-not-resetting bug, the race-tolerance tuning all traced back
+// to the bespoke bitrate-cap process specifically).
+//
+// Every plan now gets a real, bitrate-BOUNDED (-maxrate/-bufsize, not just
+// -b:v) rendition ladder built from the exact same proven
+// spawnFfmpegVariant path, deliberately matching how Wowza's own
+// Transcoder works (every rung is a genuine encode at a paired
+// resolution+bitrate) rather than the old "unbounded raw passthrough as
+// top rendition" behavior, which also silently didn't enforce the
+// bitrate ceilings advertised on the pricing page for Deluxe/Premium.
+// Deliberately NO raw/unbounded fallback rendition for any plan — if
+// every rendition's ffmpeg process dies at once (has happened — see the
+// 2026-08-02 incident notes), that stream is briefly unavailable until
+// they recover, same as Wowza, rather than quietly falling back to an
+// unbounded stream that undercuts the whole point of a bitrate ceiling.
+// ══════════════════════════════════════════
+
+// Essential-tier's single rendition downscales resolution to match its
+// bitrate ceiling (rather than keeping full source resolution at a
+// starved bitrate) — deliberate choice, matches how a real ABR rung
+// pairs resolution+bitrate together instead of the old bitrate-cap
+// behavior of capping bitrate alone at whatever resolution the source
+// happened to be.
+function pickResolutionForBitrate(bitrateKbps) {
+  if (bitrateKbps >= 6000) return "1920x1080";
+  if (bitrateKbps >= 1800) return "1280x720";
+  return "854x480";
+}
+
+async function getRenditionPlanForOrg(organizationId) {
+  const plan = await getOrgStreamingPlan(organizationId);
+  const capKbps = await getOrgMaxBitrateKbps(organizationId);
+
+  if (plan.transcoding_enabled) {
+    // Deluxe/Premium: full 3-rung ladder. Top rung is now bounded at the
+    // org's actual plan bitrate ceiling (10Mb Deluxe / 15Mb Premium)
+    // instead of being an unbounded raw passthrough; 720p/480p stay at
+    // their existing fixed presets underneath it.
+    return [
+      {
+        label: "top",
+        bitrateKbps: capKbps || 3500,
+        resolution: "1920x1080",
+      },
+      { label: "720p", bitrateKbps: 2500, resolution: "1280x720" },
+      { label: "480p", bitrateKbps: 1200, resolution: "854x480" },
+    ];
   }
 
+  if (capKbps) {
+    // Essential: single rendition, resolution matched to its bitrate
+    // ceiling — a one-rung ABR ladder rather than a separate mechanism.
+    return [
+      {
+        label: "top",
+        bitrateKbps: capKbps,
+        resolution: pickResolutionForBitrate(capKbps),
+      },
+    ];
+  }
+
+  return []; // no plan/cap resolved — nothing to spawn
+}
+
+function buildRenditionFfmpegArgs(input, output, { bitrateKbps, resolution }) {
+  return [
+    "-y",
+    ...inputResilienceFlags,
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    ...keyframeAlignmentFlags,
+    "-b:v",
+    `${bitrateKbps}k`,
+    // -maxrate/-bufsize make this a genuine HARD ceiling, not just a
+    // target — this is what the old bitrate-cap process did that the
+    // original 720p/480p renditions didn't; applying it uniformly here
+    // means every rung's advertised bitrate is now actually enforced.
+    "-maxrate",
+    `${bitrateKbps}k`,
+    "-bufsize",
+    `${bitrateKbps * 2}k`,
+    "-s",
+    resolution,
+    "-c:a",
+    "aac",
+    "-b:a",
+    bitrateKbps >= 2000 ? "128k" : "96k",
+    "-f",
+    "flv",
+    output,
+  ];
+}
+
+function spawnRenditionsForStream(streamKey, renditions, generation) {
   // Using 127.0.0.1 explicitly rather than "localhost" — a packet capture
   // during the SRS consumer-race investigation confirmed "localhost" was
-  // resolving to IPv6 (::1) for these connections. Forcing IPv4 loopback
-  // removes that as a variable while the underlying SRS-side race (see
-  // autoCapBitrateStream's comments) is still being tracked upstream.
+  // resolving to IPv6 (::1) for these connections.
   const input = `rtmp://127.0.0.1/live/${streamKey}`;
-  const out720 = `rtmp://127.0.0.1/live/${streamKey}_720p`;
-  const out480 = `rtmp://127.0.0.1/live/${streamKey}_480p`;
 
-  console.log(`[Transcode] Starting 720p + 480p for: ${streamKey}`);
-
-  // Same input-side resilience flags already proven to reduce (not fully
-  // eliminate — see MAX_TRANSCODE_RETRIES above for the rest) the
-  // "Input/output error" crash rate on the bitrate-cap transcode reading
-  // this exact same RTMP source. Applied here too since these two
-  // processes hit the identical risk reading from the raw live app.
-  // +genpts/discardcorrupt and avoid_negative_ts guard against timestamp
-  // irregularities inherited from OBS/the RTMP input that could otherwise
-  // produce a genuine MSE bufferAppendError downstream with no encoder
-  // restart involved at all — a real gap identified when we found
-  // bufferAppendError occurrences with zero corresponding ffmpeg
-  // crash/restart in the logs.
-  const inputResilienceFlags = [
-    "-analyzeduration",
-    "10000000",
-    "-probesize",
-    "10000000",
-    "-rw_timeout",
-    "30000000",
-    "-fflags",
-    "+genpts+discardcorrupt",
-    "-avoid_negative_ts",
-    "make_zero",
-  ];
-
-  // Forces a keyframe exactly every 2 real-time seconds, matching SRS's
-  // hls_fragment 2 setting, so segment boundaries land on predictable
-  // keyframes instead of drifting. Deliberately timestamp-based
-  // (gte(t,...)) rather than a frame-count based -g/-keyint_min value —
-  // a fixed frame-count GOP would need to match the SOURCE's actual frame
-  // rate (e.g. -g 60 for 30fps, -g 120 for 60fps), which we don't reliably
-  // know per-client; a wrong assumption there would silently misalign
-  // keyframes instead of fixing anything. sc_threshold 0 disables
-  // scene-cut-triggered keyframes so only these forced ones apply,
-  // keeping the interval exact rather than approximate.
-  const keyframeAlignmentFlags = [
-    "-force_key_frames",
-    "expr:gte(t,n_forced*2)",
-    "-sc_threshold",
-    "0",
-  ];
-
-  spawnFfmpegVariant(
-    "720p",
-    streamKey,
-    [
-      "-y",
-      ...inputResilienceFlags,
-      "-i",
-      input,
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a:0?",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      ...keyframeAlignmentFlags,
-      "-b:v",
-      "2500k",
-      "-s",
-      "1280x720",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-      "-f",
-      "flv",
-      out720,
-    ],
-    generation,
-  );
-
-  spawnFfmpegVariant(
-    "480p",
-    streamKey,
-    [
-      "-y",
-      ...inputResilienceFlags,
-      "-i",
-      input,
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a:0?",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      ...keyframeAlignmentFlags,
-      "-b:v",
-      "1200k",
-      "-s",
-      "854x480",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "96k",
-      "-f",
-      "flv",
-      out480,
-    ],
-    generation,
-  );
+  for (const rendition of renditions) {
+    const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
+    const args = buildRenditionFfmpegArgs(input, output, rendition);
+    console.log(
+      `[ABR] Starting ${rendition.label} (${rendition.bitrateKbps}kbps, ${rendition.resolution}) for: ${streamKey}`,
+    );
+    spawnFfmpegVariant(rendition.label, streamKey, args, generation);
+  }
 }
 
 // ══════════════════════════════════════════
@@ -8633,301 +8676,33 @@ const getOrgMaxBitrateKbps = async (organizationId) => {
   return Number(result.rows[0]?.max_bitrate_kbps || 0);
 };
 
-// Retry bookkeeping for the bitrate-cap transcode — keyed by stream_key,
-// reset whenever a fresh on_publish starts a new broadcast session (see
-// the on_publish handler). Caps retries so a persistently-broken
-// encode (e.g. an incompatible source format) doesn't loop forever
-// burning CPU — after MAX_BITRATE_CAP_RETRIES, the stream just stays on
-// the uncapped fallback for the rest of that session.
-const bitrateCapRetryCount = new Map();
+// ══════════════════════════════════════════
+// Shared generation counters, used by every rendition (regardless of
+// plan/label) spawned via spawnFfmpegVariant above.
+// ══════════════════════════════════════════
+
 // Tracks which "broadcast session" is current for a given stream_key. A
 // fresh on_publish bumps this; any retry chain from a PRIOR session
 // checks this before acting and abandons itself if superseded. Without
 // this, a brief encoder reconnect (a new on_publish) while an old failed
 // transcode's retry chain is still in-flight would let both chains spawn
-// ffmpeg processes publishing to the same live_capped/{streamKey} name
-// concurrently — a real race that was actually happening (evidenced by
-// the same stream logging "giving up" at both attempt 4 AND attempt 5,
-// meaning two independent chains were both writing to the same counter).
+// ffmpeg processes publishing to the same output name concurrently — a
+// real race that was actually happening (evidenced by the same stream
+// logging "giving up" at both attempt 4 AND attempt 5, meaning two
+// independent chains were both writing to the same counter).
 const bitrateCapGeneration = new Map();
-// Tracks the currently-alive ffmpeg ChildProcess per stream_key. The
-// generation counter above stops a STALE retry chain from spawning a NEW
-// process, but does nothing about an OLD process that's still alive and
-// still trying to publish — confirmed via real logs showing two
-// "on_publish — app: live_capped" events back-to-back with no
-// on_unpublish between them, meaning two ffmpeg instances were both
-// actively fighting over the same output connection. Explicitly killing
-// the previous instance before starting a new one guarantees at most one
-// can ever be alive for a given stream_key at a time.
-const activeBitrateCapProcesses = new Map();
-const MAX_BITRATE_CAP_RETRIES = 3;
-// Bumped every time a NEW ffmpeg process actually spawns for a stream_key's
-// bitrate cap (a crash+retry within the SAME broadcast counts — this is
-// deliberately NOT the same thing as bitrateCapGeneration above, which only
-// changes on a fresh on_publish). A restart here means the underlying
-// encoded video has a genuine cut — new keyframe timing/GOP structure —
-// that SRS's HLS output has no way to mark as EXT-X-DISCONTINUITY, so
-// hls.js has no warning before it tries (and fails) to append across it.
-// Exposed to the frontend via /api/public/watch and /api/srs/streams so a
-// live_capped viewer's player can proactively remount (fresh MediaSource)
-// instead of hitting a bufferAppendError reactively.
+// Bumped every time a NEW ffmpeg process actually spawns for ANY of a
+// stream_key's renditions (a crash+retry within the SAME broadcast
+// counts — this is deliberately NOT the same thing as bitrateCapGeneration
+// above, which only changes on a fresh on_publish). A restart here means
+// the underlying encoded video has a genuine cut — new keyframe
+// timing/GOP structure — that SRS's HLS output has no way to mark as
+// EXT-X-DISCONTINUITY, so hls.js has no warning before it tries (and
+// fails) to append across it. Exposed to the frontend via
+// /api/public/watch and /api/srs/streams so a viewer's player can
+// proactively remount (fresh MediaSource) instead of hitting a
+// bufferAppendError reactively.
 const bitrateCapEncoderGeneration = new Map();
-
-function autoCapBitrateStream(streamKey, capKbps, generation) {
-  if (!capKbps) return;
-
-  // If a newer broadcast session has since started for this stream_key
-  // (a fresh on_publish bumped the generation), this call belongs to a
-  // stale, already-superseded session — abandon it rather than risk two
-  // concurrent ffmpeg processes racing to publish the same output name.
-  if (bitrateCapGeneration.get(streamKey) !== generation) {
-    console.log(
-      `[BITRATE-CAP] Skipping superseded session for ${streamKey} (a newer broadcast session has since started).`,
-    );
-    return;
-  }
-
-  // Explicitly kill any prior instance still alive for this stream_key
-  // before starting a new one — see the comment on
-  // activeBitrateCapProcesses above for why the generation check alone
-  // isn't sufficient to prevent two ffmpeg processes colliding.
-  const priorProcess = activeBitrateCapProcesses.get(streamKey);
-  if (priorProcess && priorProcess.exitCode === null && !priorProcess.killed) {
-    console.warn(
-      `[BITRATE-CAP] Killing still-alive prior ffmpeg instance for ${streamKey} before starting a new one.`,
-    );
-    priorProcess.kill("SIGKILL");
-  }
-
-  if (isServerLoadTooHighForNewTranscode()) {
-    console.warn(
-      `[BITRATE-CAP] Server load too high — skipping cap for ${streamKey}, serving uncapped raw stream instead.`,
-    );
-    return;
-  }
-
-  // Using 127.0.0.1 explicitly rather than "localhost" — see the same
-  // note in autoTranscodeStream above.
-  const input = `rtmp://127.0.0.1/live/${streamKey}`;
-  const output = `rtmp://127.0.0.1/live_capped/${streamKey}`;
-
-  console.log(
-    `[BITRATE-CAP] Starting hard cap at ${capKbps}kbps for: ${streamKey}`,
-  );
-
-  // Using spawn() here, NOT exec() — this is the actual root cause of the
-  // "Conversion failed!" crashes: exec() buffers all stdout/stderr in
-  // memory and KILLS the child process once that buffer fills (~1MB by
-  // default) — fine for a short command, fatal for ffmpeg, which prints a
-  // continuous stream of progress lines for as long as it runs. Any real
-  // (non-trivial-length) broadcast would eventually hit that limit and
-  // get silently killed. spawn() streams output instead of buffering it,
-  // so there's no such limit — confirmed via a manual run on the server
-  // that this exact ffmpeg command encodes correctly on its own; the bug
-  // was purely in how Node was invoking it, not the command itself.
-  const ffmpegArgs = [
-    "-y",
-    // Input-side resilience flags — added after observing intermittent
-    // "Input/output error" crashes reading from the raw 'live' RTMP
-    // input. NOTE: -reconnect/-reconnect_at_eof/-reconnect_streamed/
-    // -reconnect_delay_max were tried here and REMOVED — this ffmpeg
-    // build (5.1.10) rejects them for this input with "Option
-    // reconnect not found.", causing ffmpeg to exit immediately on
-    // every single invocation. That made the crash rate dramatically
-    // worse, not better — confirmed via live logs showing every
-    // attempt failing instantly with that exact message. Keeping only
-    // analyzeduration/probesize/rw_timeout, which were NOT rejected.
-    // fflags/avoid_negative_ts added later, guarding against timestamp
-    // irregularities that could cause a genuine downstream MSE
-    // bufferAppendError with no encoder restart involved — these are
-    // generic libavformat-level options (not RTMP-protocol-specific like
-    // -reconnect* above), so they're expected to be safe for this build,
-    // but that's not yet confirmed against a real run — verify no
-    // "Option ... not found" errors appear after deploying this.
-    "-analyzeduration",
-    "10000000",
-    "-probesize",
-    "10000000",
-    "-rw_timeout",
-    "30000000",
-    "-fflags",
-    "+genpts+discardcorrupt",
-    "-avoid_negative_ts",
-    "make_zero",
-    "-i",
-    input,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a:0?",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    // Same frame-rate-agnostic forced-keyframe alignment used on the ABR
-    // renditions — see keyframeAlignmentFlags in autoTranscodeStream for
-    // the full reasoning (timestamp-based, not a hardcoded -g value).
-    "-force_key_frames",
-    "expr:gte(t,n_forced*2)",
-    "-sc_threshold",
-    "0",
-    "-b:v",
-    `${capKbps}k`,
-    "-maxrate",
-    `${capKbps}k`,
-    "-bufsize",
-    `${capKbps * 2}k`,
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    "-f",
-    "flv",
-    output,
-  ];
-
-  console.log(
-    `[BITRATE-CAP] Starting FFmpeg for ${streamKey}: ffmpeg ${ffmpegArgs.join(" ")}`,
-  );
-
-  const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
-  activeBitrateCapProcesses.set(streamKey, ffmpegProcess);
-  bitrateCapEncoderGeneration.set(
-    streamKey,
-    (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
-  );
-
-  // Bounded rolling buffer (50KB, up from the original 4000 chars) — large
-  // enough to capture the real error line even on a fast crash, without
-  // growing unbounded for a long healthy stream.
-  let stderrTail = "";
-  ffmpegProcess.stderr.on("data", (chunk) => {
-    stderrTail += chunk.toString();
-    if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
-  });
-
-  ffmpegProcess.on("error", (err) => {
-    console.error(
-      `[BITRATE-CAP] Failed to spawn ffmpeg for ${streamKey}:`,
-      err.message,
-    );
-  });
-
-  ffmpegProcess.on("exit", async (code, signal) => {
-    // Only clear the tracking entry if THIS process is still the one
-    // recorded — if a newer spawn already overwrote it, leave that one
-    // alone.
-    if (activeBitrateCapProcesses.get(streamKey) === ffmpegProcess) {
-      activeBitrateCapProcesses.delete(streamKey);
-    }
-
-    if (code === 0 || code === null) return; // clean exit (e.g. source ended normally) — nothing to retry
-
-    // If a newer session has started since THIS process was spawned,
-    // stay quiet — this exit is expected (superseded), not a real
-    // failure worth logging or retrying over.
-    if (bitrateCapGeneration.get(streamKey) !== generation) return;
-
-    const crashLogPath = dumpFfmpegCrashLog(
-      "BITRATE-CAP",
-      streamKey,
-      stderrTail,
-    );
-    console.warn(
-      `[BITRATE-CAP] ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — retrying` +
-        (crashLogPath
-          ? ` (full stderr, ${stderrTail.length} chars, written to ${crashLogPath})`
-          : "") +
-        `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
-    );
-
-    // Only retry if the raw source is STILL actually live — if the
-    // broadcaster simply stopped streaming, this exit is expected and
-    // on_unpublish already handles cleanup; retrying would just spawn a
-    // pointless transcode with no input.
-    try {
-      const liveCheck = await pool.query(
-        `SELECT is_live, live_started_at FROM channels WHERE stream_key = $1`,
-        [streamKey],
-      );
-
-      if (!liveCheck.rows[0]?.is_live) return;
-
-      const attempts = (bitrateCapRetryCount.get(streamKey) || 0) + 1;
-      bitrateCapRetryCount.set(streamKey, attempts);
-
-      if (attempts > MAX_BITRATE_CAP_RETRIES) {
-        console.error(
-          `[BITRATE-CAP] Giving up on ${streamKey} after ${attempts} failed attempts — switching viewers to the uncapped fallback for the rest of this broadcast.`,
-        );
-        notifySlack("ffmpeg gave up on bitrate-cap transcode", {
-          streamKey,
-          attempts,
-          capKbps,
-          timestamp: new Date().toISOString(),
-        });
-
-        // The log line above used to be aspirational, not actual — nothing
-        // here ever touched stickyHlsApp, so any viewer already committed
-        // to live_capped (see the HLS proxy's stickyValid logic) stayed
-        // stuck requesting that now-dead app for the rest of the
-        // broadcast, since sticky only ever tries ONE app once valid.
-        // Explicitly flipping it to "live" here means the very next
-        // manifest request resolves straight to the real fallback instead
-        // of failing (502/404) until a brand new broadcast session starts.
-        const liveStartedAtMs = liveCheck.rows[0]?.live_started_at
-          ? new Date(liveCheck.rows[0].live_started_at).getTime()
-          : null;
-
-        if (liveStartedAtMs) {
-          stickyHlsApp.set(streamKey, { app: "live", liveStartedAtMs });
-        } else {
-          // Unexpected (is_live true but no live_started_at) — don't leave
-          // a stale live_capped entry sitting in the map. Not strictly
-          // required for correctness (the proxy's own stickyValid check
-          // independently invalidates on a falsy liveStartedAtMs too), but
-          // cheap and avoids a confusing stale entry lingering in memory.
-          stickyHlsApp.delete(streamKey);
-        }
-
-        // Manifest cache TTL is only ~1s, but without this, a manifest
-        // request landing in that narrow window right after the fallback
-        // decision could still be served one last cached live_capped
-        // response before the switch takes effect — closing that gap so
-        // the generation-triggered remount can't land on stale data.
-        for (const key of manifestCache.keys()) {
-          if (key === streamKey || key.startsWith(`${streamKey}?`)) {
-            manifestCache.delete(key);
-          }
-        }
-
-        // Bump the shared generation so LivePlayer proactively remounts
-        // (via its session poll) the moment this happens, rather than
-        // waiting to reactively discover the dead source via a segment
-        // 404 first.
-        bitrateCapEncoderGeneration.set(
-          streamKey,
-          (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
-        );
-
-        return;
-      }
-
-      console.warn(
-        `[BITRATE-CAP] Transcode ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_BITRATE_CAP_RETRIES}) for ${streamKey}`,
-      );
-      setTimeout(
-        () => autoCapBitrateStream(streamKey, capKbps, generation),
-        5000,
-      );
-    } catch (checkErr) {
-      console.error(
-        `[BITRATE-CAP] Failed to check live status for retry decision on ${streamKey}:`,
-        checkErr.message,
-      );
-    }
-  });
-}
 
 // ── Helper: auto-sync recordings after stream ends ────────────────
 // ══════════════════════════════════════════
@@ -9963,41 +9738,29 @@ app.post("/api/srs/on_publish", async (req, res) => {
     // attempt to publish to the same output names.
     const generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
     bitrateCapGeneration.set(streamKey, generation);
-    bitrateCapRetryCount.delete(streamKey); // fresh session, fresh retry budget
-    transcodeRetryCount.delete(`${streamKey}:720p`);
-    transcodeRetryCount.delete(`${streamKey}:480p`);
-
-    // 4. Auto-transcode if plan allows
-    if (plan.transcoding_enabled) {
-      // Delay so SRS's source object is stable before FFmpeg connects.
-      // Bumped from 3000ms to 7000ms while investigating an intermittent
-      // race where our own ffmpeg-as-RTMP-consumer occasionally receives
-      // zero messages for its entire connected lifetime and times out —
-      // confirmed via SRS logs to be a real, if intermittent, condition
-      // distinct from the (already-fixed) queue_length/pacing issues.
-      // Three SRS-side tunables (min_latency, mw_latency, mw_msgs) were
-      // tested and ruled out as the sole cause; this tests whether the
-      // race is instead sensitive to how soon after on_publish our own
-      // consumer attaches, rather than anything in SRS's play{} config.
-      setTimeout(() => autoTranscodeStream(streamKey, generation), 7000);
+    // Fresh broadcast session — clear retry budgets for every rendition
+    // label that might be in flight for this stream_key (labels are now
+    // plan-driven, not a fixed "720p"/"480p" pair, so this clears by
+    // prefix rather than a hardcoded list).
+    for (const key of transcodeRetryCount.keys()) {
+      if (key.startsWith(`${streamKey}:`)) transcodeRetryCount.delete(key);
     }
 
-    // 4b. Hard bitrate cap — spawns a transcode that forces this stream's
-    // output down to the org's plan bitrate ceiling, regardless of what
-    // the source encoder pushes. Same startup delay as the ABR transcode
-    // above, for the same reason (let the raw stream stabilize first).
-    getOrgMaxBitrateKbps(channel.org_id)
-      .then((capKbps) => {
-        if (capKbps) {
-          setTimeout(
-            () => autoCapBitrateStream(streamKey, capKbps, generation),
-            7000,
-          );
-        }
+    // 4. Spawn whatever rendition ladder this org's plan calls for — see
+    // getRenditionPlanForOrg/spawnRenditionsForStream above. Same startup
+    // delay as before, letting SRS's source object stabilize before
+    // ffmpeg connects.
+    getRenditionPlanForOrg(channel.org_id)
+      .then((renditions) => {
+        if (!renditions.length) return;
+        setTimeout(
+          () => spawnRenditionsForStream(streamKey, renditions, generation),
+          7000,
+        );
       })
       .catch((err) =>
         console.error(
-          `[BITRATE-CAP] Failed to look up bitrate cap for org ${channel.org_id}:`,
+          `[ABR] Failed to resolve rendition plan for org ${channel.org_id}:`,
           err.message,
         ),
       );
@@ -14789,7 +14552,7 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
 // SRS URL directly (see master.m3u8 route below) pending a proper fix
 // that actually follows the redirect. This route only covers 720p/480p.
 // ══════════════════════════════════════════
-const ABR_VALID_RENDITIONS = new Set(["original", "720p", "480p"]);
+const ABR_VALID_RENDITIONS = new Set(["top", "720p", "480p"]);
 
 // SRS's raw/native HLS output (confirmed via live testing 2026-08-02) uses
 // a one-level session-context redirect: the first request to a manifest
@@ -14882,30 +14645,41 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     }
   };
 
-  const url720 = `${baseUrl}/${stream}_720p.m3u8`;
-  const url480 = `${baseUrl}/${stream}_480p.m3u8`;
+  // Rendition ladder is now entirely plan-driven (see
+  // getRenditionPlanForOrg) — no more hardcoded 720p/480p bitrates or an
+  // unconditional "Original" entry. Every rung, including the top one, is
+  // checked for actual availability before being listed; deliberately no
+  // raw/unbounded fallback rung (see the PLAN-DRIVEN ABR RENDITION LADDER
+  // comment near getRenditionPlanForOrg for why).
+  let renditionPlan = [];
+  try {
+    const channelResult = await pool.query(
+      `SELECT organization_id FROM channels WHERE stream_key = $1`,
+      [stream],
+    );
+    const organizationId = channelResult.rows[0]?.organization_id;
+    if (organizationId) {
+      renditionPlan = await getRenditionPlanForOrg(organizationId);
+    }
+  } catch (err) {
+    console.error(
+      `[ABR] Failed to resolve rendition plan for ${stream}:`,
+      err.message,
+    );
+  }
 
   let masterPlaylist = `#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
-  const originalPath = `/api/abr/${stream}/original.m3u8`;
-  masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080,NAME="Original"
-${originalPath}${appendBunnyToken(originalPath)}
-`;
+  for (const rendition of renditionPlan) {
+    const upstreamUrl = `${baseUrl}/${stream}_${rendition.label}.m3u8`;
+    if (!(await checkPlaylist(upstreamUrl))) continue;
 
-  if (await checkPlaylist(url720)) {
-    const path720 = `/api/abr/${stream}/720p.m3u8`;
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"
-${path720}${appendBunnyToken(path720)}
-`;
-  }
-
-  if (await checkPlaylist(url480)) {
-    const path480 = `/api/abr/${stream}/480p.m3u8`;
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,NAME="480p"
-${path480}${appendBunnyToken(path480)}
+    const path = `/api/abr/${stream}/${rendition.label}.m3u8`;
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${rendition.bitrateKbps * 1000},RESOLUTION=${rendition.resolution},NAME="${rendition.label}"
+${path}${appendBunnyToken(path)}
 `;
   }
 
@@ -14938,12 +14712,13 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     return res.status(404).send("Unknown rendition");
   }
 
-  // "original" has no _suffix on its SRS filename (it's the raw source
-  // publish, not a transcoded rendition) — 720p/480p match SRS's actual
-  // ffmpeg-output naming exactly.
-  const upstreamFilename =
-    rendition === "original" ? stream : `${stream}_${rendition}`;
-  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${upstreamFilename}.m3u8`;
+  // Every rendition (including "top") is now genuine ffmpeg output
+  // publishing to live/{stream}_{label} — no more raw-source special case,
+  // so no more need to follow SRS's session-redirect stub (that was only
+  // ever a property of the raw passthrough this route used to also serve
+  // as "original", which is retired — see the PLAN-DRIVEN ABR RENDITION
+  // LADDER comment near getRenditionPlanForOrg).
+  const upstreamUrl = `${SRS_HLS_ORIGIN}/live/${stream}_${rendition}.m3u8`;
 
   const fetchOpts = {
     signal: AbortSignal.timeout(4000),
@@ -14955,26 +14730,8 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
   };
 
   try {
-    let response = await fetch(upstreamUrl, fetchOpts);
-    let text = response.ok ? await response.text() : null;
-
-    // Follow exactly one level of SRS's session-context redirect, if
-    // present (see isSessionRedirectStub comment above) — real-world
-    // testing showed Original always needs this; 720p/480p never have on
-    // account of being genuine ffmpeg output, but the check is harmless
-    // either way since it only triggers on the specific stub shape.
-    if (text && isSessionRedirectStub(text)) {
-      const redirectUri = extractRedirectUri(text);
-      if (redirectUri) {
-        const resolvedUrl = redirectUri.startsWith("http")
-          ? redirectUri
-          : `${SRS_HLS_ORIGIN}${redirectUri.startsWith("/") ? "" : "/"}${redirectUri}`;
-        const redirected = await fetch(resolvedUrl, fetchOpts);
-        text = redirected.ok ? await redirected.text() : null;
-      } else {
-        text = null;
-      }
-    }
+    const response = await fetch(upstreamUrl, fetchOpts);
+    const text = response.ok ? await response.text() : null;
 
     if (
       text &&
@@ -14987,10 +14744,9 @@ app.get("/api/abr/:stream/:rendition.m3u8", async (req, res) => {
     }
   } catch {
     // Upstream unreachable (ffmpeg mid-restart, SRS momentarily not
-    // serving this stream) — fall through to the 503 below, same as an
-    // invalid-content response. Either way, hls.js retries this level's
-    // manifest on its own short cadence; we just never hand it broken
-    // content in the meantime.
+    // serving this stream) — fall through to the 503 below. Either way,
+    // hls.js retries this level's manifest on its own short cadence; we
+    // just never hand it broken content in the meantime.
   }
 
   res
