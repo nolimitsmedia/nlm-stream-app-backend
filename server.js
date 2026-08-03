@@ -8416,20 +8416,32 @@ async function waitForSrsRawStreamReady(
       if (!stream) {
         lastReason = "raw stream is not actively published in SRS";
       } else {
-        const frames = Number(stream.frames || 0);
-        const receivedBytes = Number(
-          stream.recv_bytes ?? stream.recvBytes ?? stream.bytes?.recv ?? 0,
+        // Real bug found via live testing (2026-08-03): frames/recv_bytes
+        // are CUMULATIVE counters (SRS's total since the connection was
+        // established), not current-rate figures — once a stream has ever
+        // sent any data, these never go back to signaling "stalled",
+        // making this check nearly a no-op for the one case it was built
+        // to catch (a source that's connected but not CURRENTLY
+        // delivering media). Confirmed live: a stalled OBS connection
+        // still showed frames=0/recv_30s=0 for the current window, while
+        // recv_bytes stayed a large positive cumulative total from
+        // earlier — the old check would have called that "ready".
+        // kbps.recv_30s is SRS's own rolling recent-throughput figure —
+        // the correct field for "is this genuinely active right now".
+        const recv30s = Number(
+          stream.kbps?.recv_30s ?? stream.kbps?.recv30s ?? 0,
         );
-        // SRS field names vary slightly by version — accept any of these
-        // as evidence the source is genuinely delivering media, not just
-        // registered as "active" with nothing flowing yet.
+        const activeAge = Number(stream.publish?.active_age || 0);
+        // Brief grace for a source that JUST connected — recv_30s can
+        // still legitimately read 0 for the first couple seconds before
+        // SRS's own rolling window has anything to average, even though
+        // real data is already flowing (frames/recv_bytes catch that
+        // narrow window; recv_30s alone is the ongoing-stall signal).
         const hasMedia =
-          frames >= 1 ||
-          receivedBytes > 0 ||
-          Number(stream.publish?.active_age || 0) >= 2;
+          recv30s > 0 || Number(stream.frames || 0) >= 1 || activeAge < 3;
 
         if (hasMedia) return { ready: true, stream };
-        lastReason = `SRS source is active but no media yet (frames=${frames}, receivedBytes=${receivedBytes})`;
+        lastReason = `SRS source is active but not currently delivering media (recv_30s=${recv30s}kbps, active_age=${activeAge}s)`;
       }
     } catch (err) {
       lastReason = err.message;
