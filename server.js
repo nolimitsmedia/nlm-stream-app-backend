@@ -9543,6 +9543,23 @@ app.get("/api/hls/session/:streamKey", async (req, res) => {
   }
 });
 
+// Accept only manifests that hls.js can actually play. SRS may briefly
+// return a header-only #EXTM3U response while a stream or rendition is
+// starting; returning that response with HTTP 200 causes hls.js to raise
+// a fatal "no levels found in manifest" parsing error instead of retrying.
+const isUsableHlsPlaylist = (text) => {
+  if (typeof text !== "string" || !text.trimStart().startsWith("#EXTM3U")) {
+    return false;
+  }
+
+  const isMaster = text.includes("#EXT-X-STREAM-INF");
+  const isMedia =
+    text.includes("#EXT-X-TARGETDURATION") &&
+    (text.includes("#EXTINF:") || text.includes("#EXT-X-MAP:"));
+
+  return isMaster || isMedia;
+};
+
 app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
   const { streamKey } = req.params;
 
@@ -9558,11 +9575,18 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
     let resolvedApp;
     let resolvedLiveStartedAtMs;
 
-    if (cached && Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS) {
+    if (
+      cached &&
+      Date.now() - cached.cachedAt < MANIFEST_CACHE_TTL_MS &&
+      isUsableHlsPlaylist(cached.text)
+    ) {
       text = cached.text;
       resolvedApp = cached.resolvedApp;
       resolvedLiveStartedAtMs = cached.liveStartedAtMs;
     } else {
+      // Never keep an incomplete startup manifest in cache. A header-only
+      // #EXTM3U response is not playable and must be retried upstream.
+      if (cached) manifestCache.delete(cacheKey);
       const channelResult = await pool.query(
         `SELECT live_started_at FROM channels WHERE stream_key = $1`,
         [streamKey],
@@ -9653,11 +9677,6 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
         return res.status(502).send("HLS unavailable");
       }
 
-      // Commit to this app for the rest of the broadcast.
-      if (liveStartedAtMs) {
-        stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
-      }
-
       resolvedLiveStartedAtMs = liveStartedAtMs;
 
       console.log("[HLS RESPONSE]", {
@@ -9668,10 +9687,22 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
 
       text = await upstream.text();
 
-      if (!text.trimStart().startsWith("#EXTM3U")) {
-        console.error("[INVALID HLS RESPONSE]", text.substring(0, 500));
+      if (!isUsableHlsPlaylist(text)) {
+        manifestCache.delete(cacheKey);
+        console.warn("[HLS PLAYLIST NOT READY]", {
+          streamKey,
+          resolvedApp,
+          preview: text.substring(0, 500),
+        });
+        res.setHeader("Retry-After", "2");
+        return res
+          .status(503)
+          .send("HLS playlist is not ready yet, please retry shortly");
+      }
 
-        return res.status(502).send("Invalid HLS playlist received");
+      // Commit only after receiving a genuinely playable manifest.
+      if (liveStartedAtMs) {
+        stickyHlsApp.set(streamKey, { app: resolvedApp, liveStartedAtMs });
       }
 
       manifestCache.set(cacheKey, {
@@ -14772,11 +14803,23 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 
   const checkPlaylist = async (url) => {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(4000),
+        headers: {
+          "User-Agent": "NLM-Streaming-Backend/1.0",
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        },
+      });
       if (!response.ok) return false;
 
       const text = await response.text();
-      return text.includes("#EXTM3U");
+      // A rendition is ready only when SRS exposes a real media playlist,
+      // not merely a header-only #EXTM3U startup response.
+      return (
+        text.trimStart().startsWith("#EXTM3U") &&
+        text.includes("#EXT-X-TARGETDURATION") &&
+        (text.includes("#EXTINF:") || text.includes("#EXT-X-MAP:"))
+      );
     } catch {
       return false;
     }
@@ -14810,6 +14853,8 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
 #EXT-X-INDEPENDENT-SEGMENTS
 `;
 
+  let readyRenditionCount = 0;
+
   for (const rendition of renditionPlan) {
     const upstreamUrl = `${baseUrl}/${stream}_${rendition.label}.m3u8`;
     if (!(await checkPlaylist(upstreamUrl))) continue;
@@ -14818,11 +14863,21 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${rendition.bitrateKbps * 1000},RESOLUTION=${rendition.resolution},NAME="${rendition.label}"
 ${path}${appendBunnyToken(path)}
 `;
+    readyRenditionCount += 1;
+  }
+
+  if (readyRenditionCount === 0) {
+    console.warn(`[ABR] No playable renditions ready for ${stream}`);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Retry-After", "2");
+    return res
+      .status(503)
+      .send("ABR renditions are not ready yet, please retry shortly");
   }
 
   res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
   res.setHeader("Cache-Control", "no-store");
-  res.send(masterPlaylist);
+  return res.send(masterPlaylist);
 });
 
 // NOTE: this route MUST be registered after the /master.m3u8 route above.
