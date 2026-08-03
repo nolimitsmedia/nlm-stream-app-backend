@@ -8523,7 +8523,15 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     );
   });
 
-  proc.on("exit", async (code, signal) => {
+  // Real bug found via live testing (2026-08-03): using 'exit' here meant
+  // ffmpegLogStream.end() could run BEFORE the very last stderr chunk (the
+  // actual "Input/output error" line — the single most diagnostic line in
+  // the whole crash) had been delivered. Node's docs are explicit that
+  // 'exit' can fire before stdio streams finish flushing; 'close' is the
+  // event guaranteed to fire only once stdout/stderr are fully done.
+  // Confirmed via a real captured log that still cut off right before that
+  // line despite the streaming-to-disk fix — this is the actual reason.
+  proc.on("close", async (code, signal) => {
     if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
       ffmpegLogStream.end();
     }
