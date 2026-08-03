@@ -8439,11 +8439,10 @@ async function waitForSrsRawStreamReady(
           stream.kbps?.recv_30s ?? stream.kbps?.recv30s ?? 0,
         );
         const activeAge = Number(stream.publish?.active_age || 0);
-        // Brief grace for a source that JUST connected — recv_30s can
-        // still legitimately read 0 for the first couple seconds before
-        // SRS's own rolling window has anything to average, even though
-        // real data is already flowing (frames/recv_bytes catch that
-        // narrow window; recv_30s alone is the ongoing-stall signal).
+        // This API check is only the preliminary publication gate. The
+        // HTTP-FLV byte probe below is authoritative for actual readability,
+        // because SRS counters can lag or remain cumulative across the
+        // subscriber-startup window.
         const hasMedia =
           recv30s > 0 || Number(stream.frames || 0) >= 1 || activeAge < 3;
 
@@ -8458,6 +8457,87 @@ async function waitForSrsRawStreamReady(
   }
 
   return { ready: false, superseded: false, reason: lastReason };
+}
+
+// SRS's streams API can report a source as active before a newly connected
+// HTTP-FLV subscriber is actually receiving the FLV header and media bytes.
+// Verify the exact URL FFmpeg will consume before starting the encoder.
+async function probeHttpFlvSource(
+  streamKey,
+  { timeoutMs = 8000, minimumBytes = 64 * 1024 } = {},
+) {
+  const sourceUrl = getInternalHttpFlvSourceUrl(streamKey);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(sourceUrl, {
+      signal: controller.signal,
+      cache: "no-store",
+      headers: {
+        Accept: "video/x-flv, */*",
+        "Cache-Control": "no-cache",
+        "User-Agent": "NLM-HTTP-FLV-Probe/1.0",
+      },
+    });
+
+    if (!response.ok || !response.body) {
+      return {
+        ready: false,
+        reason: `HTTP-FLV returned HTTP ${response.status}`,
+      };
+    }
+
+    const contentType = String(response.headers.get("content-type") || "");
+    if (
+      contentType &&
+      !contentType.toLowerCase().includes("video/x-flv") &&
+      !contentType.toLowerCase().includes("application/octet-stream")
+    ) {
+      return {
+        ready: false,
+        reason: `HTTP-FLV returned unexpected content type: ${contentType}`,
+      };
+    }
+
+    const reader = response.body.getReader();
+    let receivedBytes = 0;
+
+    try {
+      while (receivedBytes < minimumBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        receivedBytes += value?.byteLength || 0;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+
+    if (receivedBytes < minimumBytes) {
+      return {
+        ready: false,
+        reason:
+          `HTTP-FLV returned only ${receivedBytes} bytes; ` +
+          `${minimumBytes} bytes are required before FFmpeg startup`,
+      };
+    }
+
+    return {
+      ready: true,
+      receivedBytes,
+      sourceUrl,
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      reason:
+        error?.name === "AbortError"
+          ? `HTTP-FLV did not deliver ${minimumBytes} bytes within ${timeoutMs}ms`
+          : error.message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
@@ -8516,7 +8596,42 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     return;
   }
 
-  const proc = spawn("ffmpeg", args);
+  const httpFlvReadiness = await probeHttpFlvSource(streamKey);
+
+  if (!httpFlvReadiness.ready) {
+    console.warn(
+      `[Transcode] Delaying ${label} for ${streamKey}: ${httpFlvReadiness.reason}`,
+    );
+
+    // This is a source-readiness delay, not an FFmpeg crash, so it must not
+    // consume one of the rendition's finite crash-retry attempts.
+    if (bitrateCapGeneration.get(streamKey) === generation) {
+      const retryTimer = setTimeout(
+        () => spawnFfmpegVariant(label, streamKey, args, generation),
+        3000,
+      );
+      retryTimer.unref?.();
+    }
+
+    return;
+  }
+
+  console.log(
+    `[Transcode] HTTP-FLV ready for ${label}/${streamKey} ` +
+      `(${httpFlvReadiness.receivedBytes} bytes received by probe).`,
+  );
+
+  // Allow SRS to close the short-lived probe subscriber before FFmpeg opens
+  // the real long-running connection.
+  await sleep(250);
+
+  if (bitrateCapGeneration.get(streamKey) !== generation) {
+    return;
+  }
+
+  const proc = spawn("ffmpeg", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
   activeTranscodeProcesses.set(retryKey, proc);
 
   // Shared with the bitrate-cap process's own generation counter — ANY of
@@ -10037,7 +10152,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
 
   try {
     // Invalidate every delayed startup and retry that belongs to the broadcast
-    // which just ended. A pending 7-second startup timer may otherwise spawn
+    // which just ended. A pending startup timer may otherwise spawn
     // ffmpeg after SRS has already removed the raw source.
     const endedGeneration = (bitrateCapGeneration.get(streamKey) || 0) + 1;
     bitrateCapGeneration.set(streamKey, endedGeneration);
