@@ -2388,6 +2388,118 @@ const pollBitrateCompliance = async () => {
   }
 };
 
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing"]);
+
+const requireActiveSubscription = async (req, res, next) => {
+  try {
+    if (!req.organization?.id) {
+      return res.status(400).json({
+        ok: false,
+        code: "ORGANIZATION_REQUIRED",
+        message: "Please select an organization.",
+      });
+    }
+
+    const subscription = await ensureSubscriptionForOrganization(
+      req.organization.id,
+      req.organization.subscription_plan || "starter",
+    );
+
+    if (!subscription) {
+      return res.status(402).json({
+        ok: false,
+        code: "SUBSCRIPTION_REQUIRED",
+        message: "No subscription was found for this organization.",
+      });
+    }
+
+    if (
+      subscription.status &&
+      !ACTIVE_SUBSCRIPTION_STATUSES.has(subscription.status)
+    ) {
+      return res.status(402).json({
+        ok: false,
+        code: "SUBSCRIPTION_INACTIVE",
+        message: "This organization’s subscription is not active.",
+        subscription,
+      });
+    }
+
+    req.subscription = subscription;
+    next();
+  } catch (error) {
+    console.error("Active subscription check error:", error);
+    res.status(500).json({
+      ok: false,
+      code: "SUBSCRIPTION_CHECK_FAILED",
+      message: "Failed to verify the organization subscription.",
+      error: error.message,
+    });
+  }
+};
+
+const requirePlanFeature = (featureKey) => {
+  return async (req, res, next) => {
+    try {
+      if (!req.organization?.id) {
+        return res.status(400).json({
+          ok: false,
+          code: "ORGANIZATION_REQUIRED",
+          message: "Please select an organization.",
+        });
+      }
+
+      const subscription =
+        req.subscription ||
+        (await ensureSubscriptionForOrganization(
+          req.organization.id,
+          req.organization.subscription_plan || "starter",
+        ));
+
+      if (!subscription) {
+        return res.status(402).json({
+          ok: false,
+          code: "SUBSCRIPTION_REQUIRED",
+          message: "No subscription was found for this organization.",
+        });
+      }
+
+      if (
+        subscription.status &&
+        !ACTIVE_SUBSCRIPTION_STATUSES.has(subscription.status)
+      ) {
+        return res.status(402).json({
+          ok: false,
+          code: "SUBSCRIPTION_INACTIVE",
+          message: "This organization’s subscription is not active.",
+          subscription,
+        });
+      }
+
+      if (!subscription[featureKey]) {
+        return res.status(403).json({
+          ok: false,
+          code: "PLAN_FEATURE_REQUIRED",
+          feature: featureKey,
+          message: `Your ${subscription.plan_name} plan does not include this feature.`,
+          subscription,
+        });
+      }
+
+      req.subscription = subscription;
+      next();
+    } catch (error) {
+      console.error(`Plan feature check failed (${featureKey}):`, error);
+      res.status(500).json({
+        ok: false,
+        code: "SUBSCRIPTION_CHECK_FAILED",
+        message: "Failed to verify the plan entitlement.",
+        error: error.message,
+      });
+    }
+  };
+};
+
 const enforceChannelLimit = async (req, res, next) => {
   try {
     const summary = await ensureSubscriptionForOrganization(
@@ -2397,7 +2509,7 @@ const enforceChannelLimit = async (req, res, next) => {
 
     if (!summary) return next();
 
-    if (summary.status && !["active", "trialing"].includes(summary.status)) {
+    if (summary.status && !ACTIVE_SUBSCRIPTION_STATUSES.has(summary.status)) {
       return res.status(402).json({
         ok: false,
         code: "SUBSCRIPTION_INACTIVE",
@@ -3435,6 +3547,53 @@ app.post(
           return res.status(403).json({
             ok: false,
             message: "You do not have permission to manage this team",
+          });
+        }
+      }
+
+      const existingMembership = await pool.query(
+        `SELECT ou.id
+         FROM organization_users ou
+         JOIN admins a ON a.id = ou.admin_id
+         WHERE ou.organization_id = $1
+           AND a.email = $2
+         LIMIT 1`,
+        [id, email],
+      );
+
+      // Role changes for an existing member do not consume another seat.
+      if (!existingMembership.rows[0]) {
+        const organizationResult = await pool.query(
+          `SELECT subscription_plan FROM organizations WHERE id = $1 LIMIT 1`,
+          [id],
+        );
+
+        const subscription = await ensureSubscriptionForOrganization(
+          id,
+          organizationResult.rows[0]?.subscription_plan || "starter",
+        );
+
+        if (
+          subscription?.status &&
+          !ACTIVE_SUBSCRIPTION_STATUSES.has(subscription.status)
+        ) {
+          return res.status(402).json({
+            ok: false,
+            code: "SUBSCRIPTION_INACTIVE",
+            message: "This organization’s subscription is not active.",
+            subscription,
+          });
+        }
+
+        if (
+          Number(subscription?.used_admins || 0) >=
+          Number(subscription?.max_admins || 0)
+        ) {
+          return res.status(402).json({
+            ok: false,
+            code: "ADMIN_LIMIT_REACHED",
+            message: `Your ${subscription?.plan_name || "current"} plan allows ${subscription?.max_admins || 0} organization user(s). Upgrade the plan to add another teammate.`,
+            subscription,
           });
         }
       }
@@ -5611,6 +5770,8 @@ app.get(
   "/api/analytics/summary",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -6024,6 +6185,8 @@ app.get(
   "/api/analytics/export.csv",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -15387,6 +15550,8 @@ app.get(
   "/api/analytics/replays/engagement",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -15482,6 +15647,8 @@ app.get(
   "/api/analytics/replays",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -15636,6 +15803,8 @@ app.get(
   "/api/analytics/replays/retention",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -15728,6 +15897,8 @@ app.get(
   "/api/analytics/members",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
@@ -15813,6 +15984,8 @@ app.get(
   "/api/analytics/replays/export.csv",
   authenticateAdmin,
   resolveOrganizationForRequest,
+  requireActiveSubscription,
+  requirePlanFeature("analytics_enabled"),
   async (req, res) => {
     try {
       if (!requireAnalyticsTenant(req, res)) return;
