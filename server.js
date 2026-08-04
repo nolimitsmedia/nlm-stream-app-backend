@@ -15369,14 +15369,69 @@ app.get("/api/abr/:stream/status", async (req, res) => {
       }
     }
 
-    const isLive = Boolean(channel.is_live);
-    const abrReady = isLive && readyRenditions.length > 0;
+    // Database live state can briefly become stale during encoder reconnects.
+    // Use SRS's active raw publisher as the primary source of truth, matching
+    // Live Monitor and the public watch-status endpoint. A ready rendition is
+    // also sufficient proof that live media is currently available.
+    let srsStreamActive = false;
+
+    try {
+      const srsResponse = await fetch(
+        `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+        { signal: AbortSignal.timeout(5000) },
+      );
+
+      if (srsResponse.ok) {
+        const srsData = await srsResponse.json();
+        srsStreamActive = (srsData.streams || []).some(
+          (item) => item.name === stream && item.publish?.active,
+        );
+      }
+    } catch (error) {
+      // SRS lookup failure must not hide an otherwise healthy initialized
+      // rendition. Keep this at debug level to avoid polluting Recent Errors.
+      console.debug(
+        `[ABR-STATUS] Unable to verify SRS publish state for ${stream}:`,
+        error.message,
+      );
+    }
+
+    const isLive =
+      srsStreamActive || readyRenditions.length > 0 || Boolean(channel.is_live);
+    const abrReady = readyRenditions.length > 0;
+
+    // Self-heal the database marker when SRS proves the raw publisher is live.
+    // This keeps dashboard/API consumers consistent without making playback
+    // depend on the database update succeeding.
+    if (srsStreamActive && !channel.is_live) {
+      pool
+        .query(
+          `UPDATE channels
+           SET is_live = TRUE,
+               live_started_at = COALESCE(live_started_at, NOW())
+           WHERE stream_key = $1`,
+          [stream],
+        )
+        .catch((error) =>
+          console.debug(
+            `[ABR-STATUS] Failed to repair DB live state for ${stream}:`,
+            error.message,
+          ),
+        );
+    }
 
     return res.json({
       ok: true,
       stream,
       isLive,
       abrReady,
+      liveSource: srsStreamActive
+        ? "srs"
+        : readyRenditions.length > 0
+          ? "rendition"
+          : channel.is_live
+            ? "database"
+            : "none",
       liveStartedAtMs: channel.live_started_at
         ? new Date(channel.live_started_at).getTime()
         : 0,
