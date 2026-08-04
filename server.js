@@ -15102,6 +15102,114 @@ const rewriteRelativeSegmentUris = (manifestText, streamKey) =>
     })
     .join("\n");
 
+// Lightweight ABR startup/readiness endpoint.
+//
+// Unlike the actual HLS master route, this endpoint ALWAYS returns HTTP 200.
+// The public Watch page polls this JSON endpoint while FFmpeg/SRS initialize,
+// then mounts hls.js only after at least one planned rendition has a real
+// initialized media playlist. This prevents expected startup 503 responses
+// from appearing as red browser-console errors.
+app.get("/api/abr/:stream/status", async (req, res) => {
+  const { stream } = req.params;
+  const baseUrl = `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live`;
+
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    let renditionPlan = [];
+
+    const channelResult = await pool.query(
+      `SELECT organization_id, is_live, live_started_at
+       FROM channels
+       WHERE stream_key = $1
+       LIMIT 1`,
+      [stream],
+    );
+
+    const channel = channelResult.rows[0] || null;
+
+    if (!channel) {
+      return res.json({
+        ok: true,
+        stream,
+        isLive: false,
+        abrReady: false,
+        plannedRenditions: [],
+        readyRenditions: [],
+        reason: "channel_not_found",
+      });
+    }
+
+    if (channel.organization_id) {
+      renditionPlan = await getRenditionPlanForOrg(channel.organization_id);
+    }
+
+    const readyRenditions = [];
+
+    for (const rendition of renditionPlan) {
+      const upstreamUrl = `${baseUrl}/${stream}_${rendition.label}.m3u8`;
+
+      try {
+        const result = await fetchInitializedHlsPlaylist(upstreamUrl);
+
+        if (result.ok) {
+          readyRenditions.push({
+            label: rendition.label,
+            bitrateKbps: rendition.bitrateKbps,
+            resolution: rendition.resolution,
+          });
+        }
+      } catch (error) {
+        console.debug(
+          `[ABR-STATUS] ${stream}/${rendition.label} not ready:`,
+          error.message,
+        );
+      }
+    }
+
+    const isLive = Boolean(channel.is_live);
+    const abrReady = isLive && readyRenditions.length > 0;
+
+    return res.json({
+      ok: true,
+      stream,
+      isLive,
+      abrReady,
+      liveStartedAtMs: channel.live_started_at
+        ? new Date(channel.live_started_at).getTime()
+        : 0,
+      encoderGeneration: bitrateCapEncoderGeneration.get(stream) || 0,
+      plannedRenditions: renditionPlan.map((rendition) => ({
+        label: rendition.label,
+        bitrateKbps: rendition.bitrateKbps,
+        resolution: rendition.resolution,
+      })),
+      readyRenditions,
+      reason: abrReady
+        ? "ready"
+        : isLive
+          ? "renditions_initializing"
+          : "offline",
+    });
+  } catch (error) {
+    console.error(
+      `[ABR-STATUS] Failed to resolve readiness for ${stream}:`,
+      error.message,
+    );
+
+    return res.json({
+      ok: false,
+      stream,
+      isLive: false,
+      abrReady: false,
+      plannedRenditions: [],
+      readyRenditions: [],
+      reason: "status_check_failed",
+      message: error.message,
+    });
+  }
+});
+
 app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
   const { stream } = req.params;
   const baseUrl = `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live`;
