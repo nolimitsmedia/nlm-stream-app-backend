@@ -37,6 +37,12 @@ const youtubeApi = require("./youtube_api_service");
 const requestContext = new AsyncLocalStorage();
 
 const app = express();
+
+// The API is served behind nginx/Bunny. Trust the first proxy hop so
+// express-rate-limit and request IP handling use the forwarded client IP
+// without raising ERR_ERL_UNEXPECTED_X_FORWARDED_FOR warnings.
+app.set("trust proxy", 1);
+
 const server = http.createServer(app);
 
 const PORT = process.env.PORT || 5000;
@@ -8627,7 +8633,7 @@ async function waitForSrsRawStreamReady(
 // Verify the exact URL FFmpeg will consume before starting the encoder.
 async function probeHttpFlvSource(
   streamKey,
-  { timeoutMs = 8000, minimumBytes = 64 * 1024 } = {},
+  { timeoutMs = 12000, minimumBytes = 4096 } = {},
 ) {
   const sourceUrl = getInternalHttpFlvSourceUrl(streamKey);
   const controller = new AbortController();
@@ -8640,7 +8646,7 @@ async function probeHttpFlvSource(
       headers: {
         Accept: "video/x-flv, */*",
         "Cache-Control": "no-cache",
-        "User-Agent": "NLM-HTTP-FLV-Probe/1.0",
+        "User-Agent": "NLM-HTTP-FLV-Probe/1.1",
       },
     });
 
@@ -8665,15 +8671,37 @@ async function probeHttpFlvSource(
 
     const reader = response.body.getReader();
     let receivedBytes = 0;
+    let firstBytes = Buffer.alloc(0);
 
     try {
       while (receivedBytes < minimumBytes) {
         const { done, value } = await reader.read();
         if (done) break;
-        receivedBytes += value?.byteLength || 0;
+
+        const chunk = Buffer.from(value || []);
+
+        if (firstBytes.length < 3 && chunk.length > 0) {
+          firstBytes = Buffer.concat([firstBytes, chunk]).subarray(0, 3);
+        }
+
+        receivedBytes += chunk.length;
+
+        if (firstBytes.length >= 3 && firstBytes.toString("ascii") !== "FLV") {
+          return {
+            ready: false,
+            reason: "HTTP-FLV response did not begin with a valid FLV header",
+          };
+        }
       }
     } finally {
       await reader.cancel().catch(() => {});
+    }
+
+    if (firstBytes.length < 3 || firstBytes.toString("ascii") !== "FLV") {
+      return {
+        ready: false,
+        reason: "HTTP-FLV response ended before a valid FLV header arrived",
+      };
     }
 
     if (receivedBytes < minimumBytes) {
