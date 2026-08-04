@@ -8792,17 +8792,21 @@ const inputResilienceFlags = [
   "make_zero",
 ];
 
-// Forces a keyframe exactly every 2 real-time seconds, matching SRS's
-// hls_fragment 2 setting, so segment boundaries land on predictable
-// keyframes instead of drifting. Deliberately timestamp-based (gte(t,...))
-// rather than a frame-count based -g/-keyint_min value — a fixed
-// frame-count GOP would need to match the SOURCE's actual frame rate,
-// which we don't reliably know per-client. sc_threshold 0 disables
-// scene-cut-triggered keyframes so only these forced ones apply.
+// Produce a closed, deterministic two-second GOP for the platform's
+// supported 30 fps live-ingest profile. This aligns encoder keyframes with
+// SRS's two-second HLS fragments and avoids DTS/PTS complexity caused by
+// B-frame reordering. The timestamp-based force remains as an additional
+// safeguard if an incoming source briefly drifts.
 const keyframeAlignmentFlags = [
+  "-g",
+  "60",
+  "-keyint_min",
+  "60",
+  "-sc_threshold",
+  "0",
   "-force_key_frames",
   "expr:gte(t,n_forced*2)",
-  "-sc_threshold",
+  "-bf",
   "0",
 ];
 
@@ -8935,6 +8939,19 @@ function buildRenditionFfmpegArgs(
     "aac",
     "-b:a",
     bitrateKbps >= 2000 ? "128k" : "96k",
+
+    // Smooth minor source-clock drift instead of carrying timestamp gaps
+    // into the republished RTMP rendition.
+    "-af",
+    "aresample=async=1:first_pts=0",
+
+    // Keep the output timeline constant at the supported 30 fps profile.
+    // This gives SRS predictable frame timing and segment boundaries.
+    "-fps_mode",
+    "cfr",
+    "-r",
+    "30",
+
     "-f",
     "flv",
     output,
@@ -9647,6 +9664,15 @@ setInterval(() => {
 const lastPlayerErrorLoggedAt = new Map(); // key: `${streamKey}:${errorType}`
 const PLAYER_ERROR_DEDUPE_MS = 10000;
 
+// These are normal hls.js recovery actions, not terminal playback failures.
+// Keep them available as debug telemetry without placing them in the
+// Super Admin Recent Errors ring buffer.
+const INFORMATIONAL_PLAYER_EVENTS = new Set([
+  "bufferStalledError",
+  "bufferNudgeOnStall",
+  "bufferSeekOverHole",
+]);
+
 app.post("/api/player/error-report", (req, res) => {
   try {
     const { streamKey, errorType, details, fatal, sessionInfo, playerKind } =
@@ -9656,6 +9682,19 @@ app.post("/api/player/error-report", (req, res) => {
       return res
         .status(400)
         .json({ ok: false, message: "streamKey and errorType are required" });
+    }
+
+    if (!fatal && INFORMATIONAL_PLAYER_EVENTS.has(errorType)) {
+      console.debug(
+        `[PLAYER-RECOVERY] ${errorType} for ${streamKey}`,
+        JSON.stringify({ details, sessionInfo, playerKind }),
+      );
+
+      return res.json({
+        ok: true,
+        ignored: true,
+        classification: "recoverable_player_event",
+      });
     }
 
     const dedupeKey = `${streamKey}:${errorType}`;
