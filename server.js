@@ -16,6 +16,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const whmcs = require("./whmcs_client");
 const bunny = require("./bunny_client");
+const embedRoutes = require("./embed_routes"); // Phase 1 — embedded player (Copy Embed Code)
 
 let UAParser = null;
 try {
@@ -798,15 +799,38 @@ const slugifyOrganization = (value) => {
   return base || "organization";
 };
 
-// Generates a random, guaranteed-unique stream key based on a human
-// readable base (org name or channel name), so clients never have to
-// pick one themselves or risk a collision with another tenant's key.
-const generateUniqueStreamKey = async (baseText) => {
-  const base = slugifyOrganization(baseText);
+// Generates a cryptographically random, guaranteed-unique stream key.
+//
+// PHASE 2 (secure stream keys): previously this derived the key from the
+// org/channel name (e.g. "one-church-d690c4"), which is predictable —
+// anyone who knows (or guesses) an org's name is most of the way to
+// guessing its ingest credential. Keys are now a random alphanumeric
+// string (letters + numbers only — no dashes/underscores, matching the
+// "sk_<random letters and numbers>" format from the roadmap spec) built
+// from crypto.randomBytes()/crypto.randomInt() and never derived from any
+// human-readable input.
+//
+// Already auto-generated at the moment an account/channel is created — all
+// three existing call sites (public signup, WHMCS/client onboarding, and
+// manual "Create Channel") call this same function immediately when the
+// row is inserted, so no separate "generate after signup" step is needed;
+// this just changes what that automatic generation produces. The
+// `baseText` parameter is kept (but ignored) so those call sites don't
+// need to change.
+const STREAM_KEY_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+const randomAlphanumeric = (length) => {
+  let out = "";
+  for (let i = 0; i < length; i++) {
+    out += STREAM_KEY_ALPHABET[crypto.randomInt(STREAM_KEY_ALPHABET.length)];
+  }
+  return out;
+};
+
+const generateUniqueStreamKey = async (_baseText) => {
   for (let attempt = 0; attempt < 10; attempt++) {
-    const suffix = crypto.randomBytes(3).toString("hex"); // 6 hex chars
-    const candidate = `${base}-${suffix}`;
+    const candidate = `sk_${randomAlphanumeric(32)}`;
 
     const existing = await pool.query(
       `SELECT id FROM channels WHERE stream_key = $1 LIMIT 1`,
@@ -819,8 +843,8 @@ const generateUniqueStreamKey = async (baseText) => {
   }
 
   // Astronomically unlikely to be reached, but fall back to a longer
-  // random suffix rather than ever returning a colliding key.
-  return `${base}-${crypto.randomBytes(6).toString("hex")}`;
+  // random key rather than ever returning a colliding one.
+  return `sk_${randomAlphanumeric(48)}`;
 };
 
 const slugifyRecording = (value) => {
@@ -10767,6 +10791,69 @@ app.delete(
 );
 
 // ══════════════════════════════════════════
+// PHASE 2 — secure stream key rotation.
+// Regenerates a channel's RTMP/SRT ingest key using the same
+// generateUniqueStreamKey() used at creation time. Recordings are keyed by
+// channel_id (not stream_key), so past recordings stay intact and browsable
+// after a rotation — only the live ingest credential changes. Blocked while
+// the channel is currently live so we never rotate out from under an
+// actively-publishing encoder; the client must stop streaming first, update
+// OBS/their encoder with the new key, then go live again.
+// ══════════════════════════════════════════
+app.post(
+  "/api/channels/:id/regenerate-key",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channelResult = await pool.query(
+        `SELECT * FROM channels WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, req.organization.id],
+      );
+      const channel = channelResult.rows[0];
+
+      if (!channel) {
+        return res.status(404).json({
+          ok: false,
+          message: "Channel not found",
+        });
+      }
+
+      if (channel.is_live) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Cannot rotate the stream key while this channel is live. Stop the broadcast first.",
+        });
+      }
+
+      const newStreamKey = await generateUniqueStreamKey();
+
+      await pool.query(`UPDATE channels SET stream_key = $1 WHERE id = $2`, [
+        newStreamKey,
+        channel.id,
+      ]);
+
+      res.json({
+        ok: true,
+        message:
+          "Stream key regenerated. Update OBS/your encoder with the new key before going live again.",
+        stream_key: newStreamKey,
+      });
+    } catch (error) {
+      console.error("Regenerate Stream Key Error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to regenerate stream key",
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
 // SUPPORT TOOL — clear a stuck "live" flag
 // If SRS crashes or the on_unpublish webhook never fires (e.g. the
 // server restarted mid-stream), a channel's is_live/live_started_at
@@ -11372,6 +11459,18 @@ ${errorEntries.map((e) => `- ${e.timestamp || e.created_at || "?"}: ${e.message 
 );
 
 require("./oauth_routes")(app, pool, jwt, {
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole,
+  requireOrganizationRole,
+});
+
+// Phase 1 — embedded player (Copy Embed Code). Registered here (rather than
+// right after getPublicWatchStatus's definition) purely so it sits next to
+// the other feature-module mounts, but it does depend on getPublicWatchStatus
+// already being defined above this line.
+embedRoutes.register(app, pool, {
+  getPublicWatchStatus,
   authenticateAdmin,
   resolveOrganizationForRequest,
   requireRole,
@@ -16794,6 +16893,7 @@ app.delete(
   await ensureNotificationPreferencesTable();
   await ensureSocialOAuthTables(pool);
   await ensureRestartAuditTable();
+  await embedRoutes.ensureEmbedColumns(pool); // Phase 1 — embed_token/embed_settings columns
 })()
   .then(() => {
     server.listen(PORT, () => {
