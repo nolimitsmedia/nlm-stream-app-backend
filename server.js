@@ -10799,18 +10799,19 @@ app.delete(
 // the channel is currently live so we never rotate out from under an
 // actively-publishing encoder; the client must stop streaming first, update
 // OBS/their encoder with the new key, then go live again.
+// super_admin only (matches the /force-offline pattern above) — this is a
+// support/recovery-grade action (e.g. a leaked key), not something an
+// org's own owner/admin/operator can trigger on themselves.
 // ══════════════════════════════════════════
 app.post(
   "/api/channels/:id/regenerate-key",
   authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
+  requireRole("super_admin"),
   async (req, res) => {
     try {
       const channelResult = await pool.query(
-        `SELECT * FROM channels WHERE id = $1 AND organization_id = $2`,
-        [req.params.id, req.organization.id],
+        `SELECT * FROM channels WHERE id = $1`,
+        [req.params.id],
       );
       const channel = channelResult.rows[0];
 
