@@ -54,12 +54,13 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
-// Internal live-source URL used by FFmpeg consumers. HTTP-FLV is used
-// instead of RTMP playback because this SRS 6.0.184 deployment accepts
-// RTMP play handshakes but intermittently delivers no media until
-// rw_timeout, while the same source was verified stable over HTTP-FLV.
-const SRS_HTTP_FLV_BASE_URL =
-  process.env.SRS_HTTP_FLV_BASE_URL || "http://127.0.0.1:8080";
+// Internal live-source URL used by FFmpeg consumers. Local RTMP is the
+// authoritative source path for ABR transcoding. Production testing showed
+// that the first HTTP-FLV subscriber after an SRS/server restart can connect
+// but receive zero bytes until the broadcaster reconnects, while local RTMP
+// delivers H.264/AAC immediately on the first OBS session.
+const SRS_RTMP_BASE_URL =
+  process.env.SRS_RTMP_BASE_URL || "rtmp://127.0.0.1:1935";
 const SRS_INTERNAL_HLS_BASE_URL =
   process.env.SRS_INTERNAL_HLS_BASE_URL || "http://127.0.0.1:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
@@ -8628,108 +8629,11 @@ async function waitForSrsRawStreamReady(
   return { ready: false, superseded: false, reason: lastReason };
 }
 
-// SRS's streams API can report a source as active before a newly connected
-// HTTP-FLV subscriber is actually receiving the FLV header and media bytes.
-// Verify the exact URL FFmpeg will consume before starting the encoder.
-async function probeHttpFlvSource(
-  streamKey,
-  { timeoutMs = 12000, minimumBytes = 4096 } = {},
-) {
-  const sourceUrl = getInternalHttpFlvSourceUrl(streamKey);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(sourceUrl, {
-      signal: controller.signal,
-      cache: "no-store",
-      headers: {
-        Accept: "video/x-flv, */*",
-        "Cache-Control": "no-cache",
-        "User-Agent": "NLM-HTTP-FLV-Probe/1.1",
-      },
-    });
-
-    if (!response.ok || !response.body) {
-      return {
-        ready: false,
-        reason: `HTTP-FLV returned HTTP ${response.status}`,
-      };
-    }
-
-    const contentType = String(response.headers.get("content-type") || "");
-    if (
-      contentType &&
-      !contentType.toLowerCase().includes("video/x-flv") &&
-      !contentType.toLowerCase().includes("application/octet-stream")
-    ) {
-      return {
-        ready: false,
-        reason: `HTTP-FLV returned unexpected content type: ${contentType}`,
-      };
-    }
-
-    const reader = response.body.getReader();
-    let receivedBytes = 0;
-    let firstBytes = Buffer.alloc(0);
-
-    try {
-      while (receivedBytes < minimumBytes) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = Buffer.from(value || []);
-
-        if (firstBytes.length < 3 && chunk.length > 0) {
-          firstBytes = Buffer.concat([firstBytes, chunk]).subarray(0, 3);
-        }
-
-        receivedBytes += chunk.length;
-
-        if (firstBytes.length >= 3 && firstBytes.toString("ascii") !== "FLV") {
-          return {
-            ready: false,
-            reason: "HTTP-FLV response did not begin with a valid FLV header",
-          };
-        }
-      }
-    } finally {
-      await reader.cancel().catch(() => {});
-    }
-
-    if (firstBytes.length < 3 || firstBytes.toString("ascii") !== "FLV") {
-      return {
-        ready: false,
-        reason: "HTTP-FLV response ended before a valid FLV header arrived",
-      };
-    }
-
-    if (receivedBytes < minimumBytes) {
-      return {
-        ready: false,
-        reason:
-          `HTTP-FLV returned only ${receivedBytes} bytes; ` +
-          `${minimumBytes} bytes are required before FFmpeg startup`,
-      };
-    }
-
-    return {
-      ready: true,
-      receivedBytes,
-      sourceUrl,
-    };
-  } catch (error) {
-    return {
-      ready: false,
-      reason:
-        error?.name === "AbortError"
-          ? `HTTP-FLV did not deliver ${minimumBytes} bytes within ${timeoutMs}ms`
-          : error.message,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+// SRS may fire on_publish before codec metadata and the first keyframe are
+// fully available. waitForSrsRawStreamReady() is the startup gate; FFmpeg then
+// reads directly from local RTMP, which was verified to work on the first OBS
+// session after SRS/server restarts. No short-lived HTTP-FLV subscriber probe
+// is used here because that probe itself was the first-start failure mode.
 
 const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   // Same supersession guard as autoCapBitrateStream — abandon if a newer
@@ -8787,34 +8691,10 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     return;
   }
 
-  const httpFlvReadiness = await probeHttpFlvSource(streamKey);
-
-  if (!httpFlvReadiness.ready) {
-    console.warn(
-      `[Transcode] Delaying ${label} for ${streamKey}: ${httpFlvReadiness.reason}`,
-    );
-
-    // This is a source-readiness delay, not an FFmpeg crash, so it must not
-    // consume one of the rendition's finite crash-retry attempts.
-    if (bitrateCapGeneration.get(streamKey) === generation) {
-      const retryTimer = setTimeout(
-        () => spawnFfmpegVariant(label, streamKey, args, generation),
-        3000,
-      );
-      retryTimer.unref?.();
-    }
-
-    return;
-  }
-
-  console.log(
-    `[Transcode] HTTP-FLV ready for ${label}/${streamKey} ` +
-      `(${httpFlvReadiness.receivedBytes} bytes received by probe).`,
-  );
-
-  // Allow SRS to close the short-lived probe subscriber before FFmpeg opens
-  // the real long-running connection.
-  await sleep(250);
+  // Give SRS a brief moment after publication metadata becomes visible so
+  // the first keyframe/codec headers are available to the RTMP player. This
+  // avoids a race without creating a separate probe subscriber.
+  await sleep(500);
 
   if (bitrateCapGeneration.get(streamKey) !== generation) {
     return;
@@ -8952,31 +8832,14 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   });
 };
 
-// Same input-side resilience flags already proven to reduce (not fully
-// eliminate — see MAX_TRANSCODE_RETRIES above for the rest) the
-// HTTP-FLV startup reliability for FFmpeg consumers.
-// +genpts/discardcorrupt and avoid_negative_ts guard against timestamp
-// irregularities inherited from OBS/the RTMP input that could otherwise
-// produce a genuine MSE bufferAppendError downstream with no encoder
-// restart involved at all.
+// Input-side resilience for the local RTMP source. +genpts/discardcorrupt and
+// avoid_negative_ts guard against timestamp irregularities inherited from OBS
+// that could otherwise create downstream HLS/MSE discontinuities.
 const inputResilienceFlags = [
-  // SRS HTTP-FLV is an endless live stream, not a seekable file.
-  // Prevent FFmpeg from issuing byte-range/seek behavior against it.
-  "-seekable",
-  "0",
-
-  // Identify the H.264/AAC streams quickly without holding startup for
-  // an unnecessarily large 10 MB / 10 second probe.
   "-analyzeduration",
   "3000000",
   "-probesize",
   "1000000",
-
-  // A genuinely stalled attempt should fail promptly so the retry chain
-  // can recover instead of leaving viewers waiting for two minutes.
-  "-rw_timeout",
-  "30000000",
-
   "-fflags",
   "+genpts+discardcorrupt",
   "-avoid_negative_ts",
@@ -9149,19 +9012,17 @@ function buildRenditionFfmpegArgs(
   ];
 }
 
-function getInternalHttpFlvSourceUrl(streamKey) {
+function getInternalRtmpSourceUrl(streamKey) {
   return (
-    `${SRS_HTTP_FLV_BASE_URL.replace(/\/$/, "")}/live/` +
-    `${encodeURIComponent(streamKey)}.flv`
+    `${SRS_RTMP_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(streamKey)}`
   );
 }
 
 function spawnRenditionsForStream(streamKey, renditions, generation) {
-  // The source is consumed over SRS HTTP-FLV. Manual production testing
-  // confirmed this path immediately exposes H.264/AAC media and remains
-  // stable, whereas the equivalent local RTMP PLAY request intermittently
-  // stalls until FFmpeg's rw_timeout and exits with Input/output error.
-  const input = getInternalHttpFlvSourceUrl(streamKey);
+  // Consume the raw source directly over local RTMP. This avoids the SRS
+  // HTTP-FLV first-subscriber race observed after server/SRS restarts.
+  const input = getInternalRtmpSourceUrl(streamKey);
 
   for (const rendition of renditions) {
     const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
@@ -9170,6 +9031,93 @@ function spawnRenditionsForStream(streamKey, renditions, generation) {
       `[ABR] Starting ${rendition.label} (${rendition.bitrateKbps}kbps, ${rendition.resolution}) for: ${streamKey}`,
     );
     spawnFfmpegVariant(rendition.label, streamKey, args, generation);
+  }
+}
+
+// Periodic ABR reconciliation. This recovers the exact failure mode where a
+// raw source is live but the initial startup path did not leave a running
+// rendition process (for example after an SRS/backend restart race). It also
+// recovers active broadcasts after the Node process itself restarts.
+const abrRecoveryLastAttempt = new Map();
+const ABR_RECOVERY_COOLDOWN_MS = 15000;
+
+async function reconcileAbrTranscoders() {
+  try {
+    const response = await fetch(
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      {
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`SRS streams API returned HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const activeStreams = (payload.streams || []).filter(
+      (item) => item.publish?.active,
+    );
+    const activeNames = new Set(activeStreams.map((item) => item.name));
+    const rawStreams = activeStreams.filter(
+      (item) => !isAbrRenditionStreamKey(item.name),
+    );
+
+    for (const raw of rawStreams) {
+      const streamKey = raw.name;
+      if (!streamKey) continue;
+
+      const channelResult = await pool.query(
+        `SELECT organization_id FROM channels WHERE stream_key = $1 LIMIT 1`,
+        [streamKey],
+      );
+      const organizationId = channelResult.rows[0]?.organization_id;
+      if (!organizationId) continue;
+
+      const renditions = await getRenditionPlanForOrg(organizationId);
+      if (!renditions.length) continue;
+
+      let generation = bitrateCapGeneration.get(streamKey);
+      if (!generation) {
+        generation = 1;
+        bitrateCapGeneration.set(streamKey, generation);
+      }
+
+      for (const rendition of renditions) {
+        const retryKey = `${streamKey}:${rendition.label}`;
+        const proc = activeTranscodeProcesses.get(retryKey);
+        const processRunning = proc && proc.exitCode === null && !proc.killed;
+        const renditionPublishing = activeNames.has(
+          `${streamKey}_${rendition.label}`,
+        );
+
+        if (processRunning || renditionPublishing) continue;
+
+        const now = Date.now();
+        const lastAttempt = abrRecoveryLastAttempt.get(retryKey) || 0;
+        if (now - lastAttempt < ABR_RECOVERY_COOLDOWN_MS) continue;
+        abrRecoveryLastAttempt.set(retryKey, now);
+
+        // A reconciler-driven restart begins a fresh retry budget for this
+        // missing rendition instead of inheriting a previously exhausted one.
+        transcodeRetryCount.delete(retryKey);
+
+        const input = getInternalRtmpSourceUrl(streamKey);
+        const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
+        const args = buildRenditionFfmpegArgs(
+          streamKey,
+          input,
+          output,
+          rendition,
+        );
+
+        console.warn(
+          `[ABR-RECOVERY] Raw source ${streamKey} is live but ${rendition.label} is missing — starting recovery.`,
+        );
+        spawnFfmpegVariant(rendition.label, streamKey, args, generation);
+      }
+    }
+  } catch (error) {
+    console.error("[ABR-RECOVERY] Reconciliation failed:", error.message);
   }
 }
 
@@ -10327,17 +10275,17 @@ app.post("/api/srs/on_publish", async (req, res) => {
       if (key.startsWith(`${streamKey}:`)) transcodeRetryCount.delete(key);
     }
 
-    // 4. Spawn whatever rendition ladder this org's plan calls for — see
-    // getRenditionPlanForOrg/spawnRenditionsForStream above. Same startup
-    // delay, letting SRS's source object and HTTP-FLV mount stabilize before
-    // ffmpeg connects.
+    // 4. Spawn whatever rendition ladder this org's plan calls for. A short
+    // delay allows SRS to expose codec metadata/keyframes; the deeper SRS
+    // readiness gate still verifies the source before FFmpeg starts.
     getRenditionPlanForOrg(channel.org_id)
       .then((renditions) => {
         if (!renditions.length) return;
-        setTimeout(
+        const startupTimer = setTimeout(
           () => spawnRenditionsForStream(streamKey, renditions, generation),
-          12000,
+          3000,
         );
+        startupTimer.unref?.();
       })
       .catch((err) =>
         console.error(
@@ -10387,10 +10335,15 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     const endedGeneration = (bitrateCapGeneration.get(streamKey) || 0) + 1;
     bitrateCapGeneration.set(streamKey, endedGeneration);
 
-    // Clear all retry budgets for this source stream.
+    // Clear all retry budgets and recovery cooldowns for this source stream.
     for (const key of transcodeRetryCount.keys()) {
       if (key.startsWith(`${streamKey}:`)) {
         transcodeRetryCount.delete(key);
+      }
+    }
+    for (const key of abrRecoveryLastAttempt.keys()) {
+      if (key.startsWith(`${streamKey}:`)) {
+        abrRecoveryLastAttempt.delete(key);
       }
     }
 
@@ -11472,7 +11425,7 @@ app.post(
 
       const platformConfig = SOCIAL_PLATFORMS[destination.platform];
       const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
-      const sourceUrl = getInternalHttpFlvSourceUrl(channel.stream_key);
+      const sourceUrl = getInternalRtmpSourceUrl(channel.stream_key);
 
       const proc = spawn("ffmpeg", [
         "-i",
@@ -11642,7 +11595,7 @@ app.post(
           .json({ ok: false, message: "Connected account not found" });
       }
 
-      const sourceUrl = getInternalHttpFlvSourceUrl(channel.stream_key);
+      const sourceUrl = getInternalRtmpSourceUrl(channel.stream_key);
       let destinationUrl, platformBroadcastId, platformStreamId;
 
       if (destination.platform === "facebook") {
@@ -15103,8 +15056,8 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Use the same verified HTTP-FLV source path as automatic ABR.
-    const input = getInternalHttpFlvSourceUrl(stream);
+    // Use the same verified local RTMP source path as automatic ABR.
+    const input = getInternalRtmpSourceUrl(stream);
     const output720 = `rtmp://127.0.0.1/live/${stream}_720p`;
     const output480 = `rtmp://127.0.0.1/live/${stream}_480p`;
 
@@ -15397,10 +15350,9 @@ app.get("/api/abr/:stream/status", async (req, res) => {
       }
     }
 
-    // Database live state can briefly become stale during encoder reconnects.
-    // Use SRS's active raw publisher as the primary source of truth, matching
-    // Live Monitor and the public watch-status endpoint. A ready rendition is
-    // also sufficient proof that live media is currently available.
+    // The raw SRS publisher is the only authority for whether the broadcast
+    // is live. Renditions are derived outputs and may briefly outlive the raw
+    // source; the database marker can also be stale after a missed webhook.
     let srsStreamActive = false;
 
     try {
@@ -15424,9 +15376,8 @@ app.get("/api/abr/:stream/status", async (req, res) => {
       );
     }
 
-    const isLive =
-      srsStreamActive || readyRenditions.length > 0 || Boolean(channel.is_live);
-    const abrReady = readyRenditions.length > 0;
+    const isLive = srsStreamActive;
+    const abrReady = srsStreamActive && readyRenditions.length > 0;
 
     // Self-heal the database marker when SRS proves the raw publisher is live.
     // This keeps dashboard/API consumers consistent without making playback
@@ -15453,13 +15404,7 @@ app.get("/api/abr/:stream/status", async (req, res) => {
       stream,
       isLive,
       abrReady,
-      liveSource: srsStreamActive
-        ? "srs"
-        : readyRenditions.length > 0
-          ? "rendition"
-          : channel.is_live
-            ? "database"
-            : "none",
+      liveSource: srsStreamActive ? "srs" : "none",
       liveStartedAtMs: channel.live_started_at
         ? new Date(channel.live_started_at).getTime()
         : 0,
@@ -15498,6 +15443,26 @@ app.get("/api/abr/:stream/status", async (req, res) => {
 app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
   const { stream } = req.params;
   const baseUrl = `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live`;
+
+  // Never serve stale rendition playlists after the raw broadcaster has
+  // disconnected. Derived outputs are not authoritative proof of a live
+  // broadcast and may remain visible briefly while SRS cleans them up.
+  try {
+    const rawSource = await getSrsRawStream(stream);
+    if (!rawSource) {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Retry-After", "2");
+      return res.status(503).send("The source broadcast is offline");
+    }
+  } catch (error) {
+    console.warn(
+      `[ABR] Unable to verify raw source before serving master for ${stream}:`,
+      error.message,
+    );
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Retry-After", "2");
+    return res.status(503).send("Unable to verify source broadcast status");
+  }
 
   const checkPlaylist = async (url) => {
     try {
@@ -16686,6 +16651,14 @@ app.delete(
 
     // Bitrate compliance monitor — see pollBitrateCompliance() above.
     setInterval(pollBitrateCompliance, BITRATE_POLL_INTERVAL_MS);
+
+    // ABR self-healing: recover any live raw source that is missing one or
+    // more plan-required rendition processes. Run shortly after startup and
+    // continuously so the first OBS session works after backend/SRS restarts.
+    const initialAbrRecoveryTimer = setTimeout(reconcileAbrTranscoders, 5000);
+    initialAbrRecoveryTimer.unref?.();
+    const abrRecoveryInterval = setInterval(reconcileAbrTranscoders, 10000);
+    abrRecoveryInterval.unref?.();
 
     // Bandwidth quota monitor — see pollBandwidthCompliance() above. Runs
     // once immediately, then on its slower interval.
