@@ -8718,6 +8718,66 @@ async function waitForSrsRawStreamReady(
 // session after SRS/server restarts. No short-lived HTTP-FLV subscriber probe
 // is used here because that probe itself was the first-start failure mode.
 
+// Detects an ffmpeg process that spawned successfully but never actually
+// starts publishing to SRS — the exact failure mode found 2026-08-05: three
+// ffmpeg processes sat alive with 0:00 CPU time for 15+ minutes, never
+// exiting and never producing output, which made every existing check
+// ("is the process object still alive?") report them as healthy forever.
+// Only killing the zombie lets the periodic reconciler notice the rendition
+// is genuinely missing and retry — this function does NOT retry itself, to
+// avoid duplicating that logic.
+const RENDITION_STARTUP_WATCHDOG_MS = 15000;
+const RENDITION_STARTUP_POLL_MS = 2000;
+
+async function watchRenditionStartupOrKill(
+  retryKey,
+  label,
+  streamKey,
+  proc,
+  generation,
+) {
+  const renditionStreamName = `${streamKey}_${label}`;
+  const deadline = Date.now() + RENDITION_STARTUP_WATCHDOG_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(RENDITION_STARTUP_POLL_MS);
+
+    // Stop watching if something else already superseded/replaced this attempt.
+    if (activeTranscodeProcesses.get(retryKey) !== proc) return;
+    if (bitrateCapGeneration.get(streamKey) !== generation) return;
+    if (proc.exitCode !== null || proc.killed) return; // exited on its own — normal close handler deals with it
+
+    const activeNow = await getSrsRawStream(renditionStreamName).catch(
+      () => null,
+    );
+    if (activeNow) {
+      console.log(
+        `[Transcode] ${label} confirmed publishing for ${streamKey}; watchdog standing down.`,
+      );
+      return;
+    }
+  }
+
+  if (activeTranscodeProcesses.get(retryKey) !== proc) return;
+  if (bitrateCapGeneration.get(streamKey) !== generation) return;
+  if (proc.exitCode !== null || proc.killed) return;
+
+  console.warn(
+    `[Transcode] ${label} for ${streamKey} produced no publish within ${RENDITION_STARTUP_WATCHDOG_MS}ms of spawning (pid ${proc.pid}) — treating as hung and killing it so the reconciler can retry.`,
+  );
+  activeTranscodeProcesses.delete(retryKey);
+  proc.kill("SIGTERM");
+  const forceKillTimer = setTimeout(() => {
+    if (proc.exitCode === null) {
+      console.warn(
+        `[Transcode] Force-killing ${retryKey} after watchdog SIGTERM timeout.`,
+      );
+      proc.kill("SIGKILL");
+    }
+  }, 5000);
+  forceKillTimer.unref?.();
+}
+
 const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   const retryKey = `${streamKey}:${label}`;
 
@@ -8840,6 +8900,22 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     if (transcodeStartupLocks.get(retryKey) === generation) {
       transcodeStartupLocks.delete(retryKey);
     }
+
+    // Guards against the exact hang found 2026-08-05: ffmpeg spawning but
+    // never actually publishing, which every other check in this file reads
+    // as "healthy" since the process object never exits on its own.
+    watchRenditionStartupOrKill(
+      retryKey,
+      label,
+      streamKey,
+      proc,
+      generation,
+    ).catch((err) =>
+      console.error(
+        `[Transcode] Startup watchdog failed for ${retryKey}:`,
+        err.message,
+      ),
+    );
 
     bitrateCapEncoderGeneration.set(
       streamKey,
