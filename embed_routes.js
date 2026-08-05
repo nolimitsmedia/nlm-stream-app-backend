@@ -222,7 +222,25 @@ function embedPageHtml(embedToken) {
   var socket = null;
   var chatJoined = false;
   var wasLive = false;
+  var currentSessionKey = null;
   var pollTimer = null;
+
+  // A broadcast "session" is identified by encoderGeneration + when it
+  // started — not just a live/offline boolean. Restarting the server/SRS
+  // mid-broadcast (or a bitrate-cap encoder respawn) can produce a brand
+  // new HLS/ABR session while isLive stays true the whole time from the
+  // page's perspective; without this, an already-open embed never rebuilds
+  // its player for the new session and just sits on a dead manifest until
+  // someone manually refreshes the page. Mirrors the same
+  // encoderGeneration+liveStartedAtMs remount key LivePlayer.jsx/
+  // WatchPage.jsx already use for this exact reason.
+  function sessionKeyFor(data) {
+    var stream = data && data.stream;
+    if (!stream) return null;
+    var startedAt = stream.liveStartedAtMs || stream.live_ms || 0;
+    var generation = stream.encoderGeneration || 0;
+    return generation + ":" + startedAt;
+  }
 
   function showOffline(title, sub) {
     videoWrapEl.style.background = "#000";
@@ -363,10 +381,20 @@ function embedPageHtml(embedToken) {
 
         if (data.isLive) {
           showLive();
-          if (!wasLive) startPlayback(data);
+          var sessionKey = sessionKeyFor(data);
+          // Rebuild playback whenever we weren't live before, OR the
+          // broadcast session itself changed (server/SRS restart,
+          // encoder respawn) even though isLive never flipped to false —
+          // see sessionKeyFor() above for why a plain wasLive boolean
+          // isn't enough here.
+          if (!wasLive || sessionKey !== currentSessionKey) {
+            startPlayback(data);
+          }
           wasLive = true;
+          currentSessionKey = sessionKey;
         } else {
           wasLive = false;
+          currentSessionKey = null;
           var nextTitle = "Stream is offline";
           var nextSub = "Check back soon.";
           if (data.schedule && data.schedule.scheduled_start) {
@@ -378,7 +406,13 @@ function embedPageHtml(embedToken) {
       })
       .catch(function (err) {
         console.warn("[embed] status poll failed", err.message);
-        showOffline("Stream unavailable", "Please try again shortly.");
+        // A single missed poll (transient network blip, brief server
+        // restart) shouldn't tear down playback that's otherwise fine —
+        // only show the offline shell if we weren't already live, so a
+        // hiccup on the status endpoint doesn't interrupt real viewers.
+        if (!wasLive) {
+          showOffline("Stream unavailable", "Please try again shortly.");
+        }
       });
   }
 
