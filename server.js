@@ -27,6 +27,53 @@ try {
 
 const { AsyncLocalStorage } = require("async_hooks");
 const pool = require("./db");
+
+const dbRetrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isRetryableDatabaseError = (error) => {
+  const code = String(error?.code || "").toUpperCase();
+  const message = String(error?.message || "");
+
+  return (
+    [
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "EPIPE",
+      "57P01",
+      "57P02",
+      "57P03",
+    ].includes(code) ||
+    /timeout|connection terminated|connection reset|terminated unexpectedly|server closed the connection/i.test(
+      message,
+    )
+  );
+};
+
+// Use for dashboard/background reads where one short Railway proxy hiccup
+// should not turn into a user-visible 500. Writes keep their existing direct
+// pool.query behavior so they are never accidentally repeated.
+const queryWithRetry = async (text, params = [], options = {}) => {
+  const retries = Number.isInteger(options.retries) ? options.retries : 1;
+  const retryDelayMs = Number(options.retryDelayMs || 750);
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await pool.query(text, params);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableDatabaseError(error) || attempt >= retries) throw error;
+
+      console.warn(
+        `[DATABASE] Temporary query connection failure; retrying (${attempt + 1}/${retries}) in ${retryDelayMs}ms: ${error.message}`,
+      );
+      await dbRetrySleep(retryDelayMs);
+    }
+  }
+
+  throw lastError;
+};
 const { ensureSocialOAuthTables } = require("./social_oauth_schema");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
@@ -4027,30 +4074,47 @@ app.get(
   requireRole("super_admin"),
   async (req, res) => {
     try {
-      const [orgCounts, channelCount, adminsByRole, recordingsTotals] =
-        await Promise.all([
-          pool.query(
-            `SELECT COUNT(*)::int AS total,
+      // Run the independent summary reads concurrently. Each query retries one
+      // transient Railway proxy failure before the request is allowed to fail.
+      const [
+        orgCounts,
+        channelCount,
+        adminsByRole,
+        recordingsTotals,
+        channelsResult,
+        recentRecordings,
+      ] = await Promise.all([
+        queryWithRetry(
+          `SELECT COUNT(*)::int AS total,
                     COUNT(*) FILTER (WHERE is_active)::int AS active
              FROM organizations`,
-          ),
-          pool.query(`SELECT COUNT(*)::int AS total FROM channels`),
-          pool.query(
-            `SELECT role, COUNT(*)::int AS count FROM admins GROUP BY role`,
-          ),
-          pool.query(
-            `SELECT COUNT(*)::int AS total_recordings,
+        ),
+        queryWithRetry(`SELECT COUNT(*)::int AS total FROM channels`),
+        queryWithRetry(
+          `SELECT role, COUNT(*)::int AS count FROM admins GROUP BY role`,
+        ),
+        queryWithRetry(
+          `SELECT COUNT(*)::int AS total_recordings,
                     COALESCE(SUM(file_size_bytes), 0)::bigint AS total_bytes
              FROM recordings`,
-          ),
-        ]);
-
-      const channelsResult = await pool.query(
-        `SELECT c.stream_key, c.name AS channel_name, c.live_started_at,
-                o.id AS organization_id, o.name AS organization_name
-         FROM channels c
-         JOIN organizations o ON o.id = c.organization_id`,
-      );
+        ),
+        queryWithRetry(
+          `SELECT c.stream_key, c.name AS channel_name, c.live_started_at,
+                    o.id AS organization_id, o.name AS organization_name
+             FROM channels c
+             JOIN organizations o ON o.id = c.organization_id`,
+        ),
+        queryWithRetry(
+          `SELECT r.id, r.filename, r.mp4_filename, r.created_at,
+                    r.file_size_bytes, c.name AS channel_name,
+                    o.name AS organization_name
+             FROM recordings r
+             LEFT JOIN channels c ON c.id = r.channel_id
+             LEFT JOIN organizations o ON o.id = r.organization_id
+             ORDER BY r.created_at DESC
+             LIMIT 10`,
+        ),
+      ]);
 
       const channelByStreamKey = new Map(
         channelsResult.rows.map((row) => [String(row.stream_key), row]),
@@ -4060,9 +4124,12 @@ app.get(
       let srsAvailable = true;
 
       try {
-        const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`);
-        if (!srsResponse.ok)
+        const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!srsResponse.ok) {
           throw new Error(`SRS responded ${srsResponse.status}`);
+        }
         const srsData = await srsResponse.json();
 
         liveStreams = await Promise.all(
@@ -4099,26 +4166,16 @@ app.get(
             }),
         );
       } catch (srsError) {
-        console.error(
-          "Super admin overview: SRS unavailable:",
+        console.warn(
+          "Super admin overview: SRS temporarily unavailable:",
           srsError.message,
         );
         srsAvailable = false;
       }
 
-      const activeLiveStreams = liveStreams.filter((s) => s.active);
-      const recentRecordings = await pool.query(
-        `SELECT r.id, r.filename, r.mp4_filename, r.created_at,
-                r.file_size_bytes, c.name AS channel_name,
-                o.name AS organization_name
-         FROM recordings r
-         LEFT JOIN channels c ON c.id = r.channel_id
-         LEFT JOIN organizations o ON o.id = r.organization_id
-         ORDER BY r.created_at DESC
-         LIMIT 10`,
-      );
+      const activeLiveStreams = liveStreams.filter((stream) => stream.active);
 
-      res.json({
+      return res.json({
         ok: true,
         srs_available: srsAvailable,
         organizations: orgCounts.rows[0],
@@ -4132,22 +4189,23 @@ app.get(
         totals: {
           active_streams: activeLiveStreams.length,
           live_viewers: activeLiveStreams.reduce(
-            (sum, s) => sum + Number(s.viewers || 0),
+            (sum, stream) => sum + Number(stream.viewers || 0),
             0,
           ),
           incoming_kbps: activeLiveStreams.reduce(
-            (sum, s) => sum + Number(s.kbps || 0),
+            (sum, stream) => sum + Number(stream.kbps || 0),
             0,
           ),
         },
         recent_recordings: recentRecordings.rows,
       });
     } catch (error) {
-      console.error("Get admin overview error:", error);
+      console.error("Get admin overview error after retry:", error);
 
-      res.status(500).json({
+      return res.status(503).json({
         ok: false,
-        message: "Failed to load admin overview",
+        message:
+          "The platform overview is temporarily unavailable. Please try again shortly.",
         error: error.message,
       });
     }
@@ -9537,6 +9595,35 @@ const checkBandwidthQuotaForZone = async ({
   );
 };
 
+const getBunnyBandwidthWithRetry = async (
+  pullZoneId,
+  dateFrom,
+  dateTo,
+  retries = 1,
+) => {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await bunny.getTotalBandwidthUsedBytes(
+        pullZoneId,
+        dateFrom,
+        dateTo,
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) throw error;
+
+      console.warn(
+        `[BANDWIDTH] Bunny statistics request for zone ${pullZoneId} failed; retrying in 2s: ${error?.cause?.message || error?.cause?.code || error.message}`,
+      );
+      await sleep(2000);
+    }
+  }
+
+  throw lastError;
+};
+
 const pollBandwidthCompliance = async () => {
   if (!bunny.isBunnyAccountConfigured()) return;
 
@@ -9559,7 +9646,7 @@ const pollBandwidthCompliance = async () => {
     for (const org of result.rows) {
       try {
         if (org.bunny_pull_zone_id) {
-          const cdnBytes = await bunny.getTotalBandwidthUsedBytes(
+          const cdnBytes = await getBunnyBandwidthWithRetry(
             org.bunny_pull_zone_id,
             monthStart,
             now,
@@ -9575,7 +9662,7 @@ const pollBandwidthCompliance = async () => {
         }
 
         if (org.bunny_recordings_pull_zone_id) {
-          const egressBytes = await bunny.getTotalBandwidthUsedBytes(
+          const egressBytes = await getBunnyBandwidthWithRetry(
             org.bunny_recordings_pull_zone_id,
             monthStart,
             now,
@@ -9590,14 +9677,17 @@ const pollBandwidthCompliance = async () => {
           });
         }
       } catch (orgErr) {
-        console.error(
-          `[BANDWIDTH] Check failed for org ${org.organization_id}:`,
-          orgErr.message,
+        console.warn(
+          `[BANDWIDTH] Temporary check failure for org ${org.organization_id}:`,
+          orgErr?.cause?.message || orgErr?.cause?.code || orgErr.message,
         );
       }
     }
   } catch (err) {
-    console.error("[BANDWIDTH] Compliance poll failed:", err.message);
+    console.warn(
+      "[BANDWIDTH] Compliance poll temporarily unavailable:",
+      err?.cause?.message || err?.cause?.code || err.message,
+    );
   }
 };
 
