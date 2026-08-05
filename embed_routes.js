@@ -225,6 +225,27 @@ function embedPageHtml(embedToken) {
   var currentSessionKey = null;
   var pollTimer = null;
 
+  // Startup/recovery retry budget for a SINGLE session. A brand new
+  // broadcast (or one just recovered by the server's ABR reconciler) can
+  // legitimately 503 on its first manifest fetch for a few seconds while
+  // renditions spin up — that's normal, not a real error. Without this,
+  // hls.js gives up after its own internal retries, and since the session
+  // key hasn't changed (it's still the same broadcast, just not ready yet
+  // on the very first attempt), the page would sit dead until either the
+  // session key changes or someone manually refreshes — which is exactly
+  // the "sometimes it just doesn't work" pattern reported. This retries
+  // playback a handful of times with backoff before showing a real error.
+  var STARTUP_RETRY_DELAYS_MS = [2000, 3000, 4000, 5000, 6000, 8000]; // ~28s total
+  var startupRetryCount = 0;
+  var startupRetryTimer = null;
+
+  function clearStartupRetry() {
+    if (startupRetryTimer) {
+      clearTimeout(startupRetryTimer);
+      startupRetryTimer = null;
+    }
+  }
+
   // A broadcast "session" is identified by encoderGeneration + when it
   // started — not just a live/offline boolean. Restarting the server/SRS
   // mid-broadcast (or a bitrate-cap encoder respawn) can produce a brand
@@ -247,6 +268,7 @@ function embedPageHtml(embedToken) {
     offlineEl.classList.remove("hidden");
     badgeEl.style.display = "none";
     hidePlaybackError();
+    clearStartupRetry();
     if (title) offlineTitle.textContent = title;
     if (sub !== undefined) offlineSub.textContent = sub;
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
@@ -291,6 +313,8 @@ function embedPageHtml(embedToken) {
       hls.loadSource(manifestUrl);
       hls.attachMedia(videoEl);
       hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        startupRetryCount = 0;
+        clearStartupRetry();
         hidePlaybackError();
         if (autoplay) videoEl.play().catch(function () {});
       });
@@ -303,7 +327,7 @@ function embedPageHtml(embedToken) {
           // can make a blocked CDN request look like an unrelated 404.
           // Logging it here from our own code gives the real target.
           console.warn("[embed] fatal HLS error", errData.type, manifestUrl);
-          showPlaybackError();
+          scheduleStartupRetry(data);
         }
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
@@ -311,13 +335,34 @@ function embedPageHtml(embedToken) {
       videoEl.src = manifestUrl;
       videoEl.addEventListener("error", function () {
         console.warn("[embed] native HLS playback error", manifestUrl);
-        showPlaybackError();
+        scheduleStartupRetry(data);
       });
       if (autoplay) videoEl.play().catch(function () {});
     }
   }
 
-  function showPlaybackError() {
+  // Shows a calm "stream is starting" message and retries shortly, up to a
+  // small budget — only escalates to the real error message (ad blocker
+  // etc.) once that budget is exhausted, so a normal few-second startup or
+  // reconciler-driven recovery window never looks like a broken embed.
+  function scheduleStartupRetry(data) {
+    if (startupRetryCount >= STARTUP_RETRY_DELAYS_MS.length) {
+      showPlaybackError(true);
+      return;
+    }
+    showPlaybackError(false);
+    var delay = STARTUP_RETRY_DELAYS_MS[startupRetryCount];
+    startupRetryCount += 1;
+    clearStartupRetry();
+    startupRetryTimer = setTimeout(function () {
+      startPlayback(data);
+    }, delay);
+  }
+
+  function showPlaybackError(isFinal) {
+    playbackErrorEl.textContent = isFinal
+      ? "Playback couldn't start. If you use an ad blocker or a privacy browser extension, try disabling it for this site and refresh \u2014 some block video CDN requests by default."
+      : "Stream is starting \u2014 this can take a few seconds.";
     playbackErrorEl.classList.remove("hidden");
   }
 
@@ -388,6 +433,10 @@ function embedPageHtml(embedToken) {
           // see sessionKeyFor() above for why a plain wasLive boolean
           // isn't enough here.
           if (!wasLive || sessionKey !== currentSessionKey) {
+            // Genuinely new/changed session — this is not a retry, so give
+            // it a fresh startup-retry budget.
+            startupRetryCount = 0;
+            clearStartupRetry();
             startPlayback(data);
           }
           wasLive = true;
@@ -420,6 +469,7 @@ function embedPageHtml(embedToken) {
   pollTimer = setInterval(refresh, 8000);
   window.addEventListener("beforeunload", function () {
     if (pollTimer) clearInterval(pollTimer);
+    clearStartupRetry();
     if (socket) socket.disconnect();
   });
 })();
