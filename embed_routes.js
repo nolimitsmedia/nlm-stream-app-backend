@@ -156,6 +156,12 @@ function embedPageHtml(embedToken) {
     background: var(--accent); color: #fff; border: none; border-radius: 6px;
     padding: 0 12px; font-size: 12.5px; font-weight: 600; cursor: pointer;
   }
+  #nlm-playback-error {
+    position: absolute; left: 10px; right: 10px; bottom: 44px; z-index: 3;
+    background: rgba(20,20,22,0.9); color: #e7e9ec; border: 1px solid #3a3b3f;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4;
+  }
+  #nlm-playback-error.hidden { display: none; }
 </style>
 </head>
 <body>
@@ -169,6 +175,11 @@ function embedPageHtml(embedToken) {
         <p id="nlm-offline-sub">Check back soon.</p>
       </div>
       <button id="nlm-chat-toggle" style="display:none;">Chat</button>
+      <div id="nlm-playback-error" class="hidden">
+        Playback couldn't start. If you use an ad blocker or a privacy
+        browser extension, try disabling it for this site and refresh —
+        some block video CDN requests by default.
+      </div>
     </div>
     <div id="nlm-chat-panel" class="hidden">
       <div id="nlm-chat-log"></div>
@@ -200,6 +211,7 @@ function embedPageHtml(embedToken) {
   var offlineTitle = document.getElementById("nlm-offline-title");
   var offlineSub = document.getElementById("nlm-offline-sub");
   var chatToggleBtn = document.getElementById("nlm-chat-toggle");
+  var playbackErrorEl = document.getElementById("nlm-playback-error");
   var chatPanel = document.getElementById("nlm-chat-panel");
   var chatLog = document.getElementById("nlm-chat-log");
   var chatForm = document.getElementById("nlm-chat-form");
@@ -216,6 +228,7 @@ function embedPageHtml(embedToken) {
     videoWrapEl.style.background = "#000";
     offlineEl.classList.remove("hidden");
     badgeEl.style.display = "none";
+    hidePlaybackError();
     if (title) offlineTitle.textContent = title;
     if (sub !== undefined) offlineSub.textContent = sub;
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
@@ -252,6 +265,7 @@ function embedPageHtml(embedToken) {
 
     videoEl.muted = muted;
     videoEl.controls = controls;
+    hidePlaybackError();
 
     if (window.Hls && window.Hls.isSupported()) {
       if (hls) { try { hls.destroy(); } catch (e) {} }
@@ -259,18 +273,38 @@ function embedPageHtml(embedToken) {
       hls.loadSource(manifestUrl);
       hls.attachMedia(videoEl);
       hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        hidePlaybackError();
         if (autoplay) videoEl.play().catch(function () {});
       });
       hls.on(window.Hls.Events.ERROR, function (evt, errData) {
         if (errData && errData.fatal) {
-          console.warn("[embed] fatal HLS error", errData.type);
+          // Logged with the real, unmasked manifest URL — some browser
+          // ad-blocking/privacy extensions rewrite third-party hostnames
+          // shown in the Network/Console panels (e.g. to something like
+          // "…io_orrdns") to defeat anti-adblock detection scripts, which
+          // can make a blocked CDN request look like an unrelated 404.
+          // Logging it here from our own code gives the real target.
+          console.warn("[embed] fatal HLS error", errData.type, manifestUrl);
+          showPlaybackError();
         }
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
       // Safari/iOS native HLS
       videoEl.src = manifestUrl;
+      videoEl.addEventListener("error", function () {
+        console.warn("[embed] native HLS playback error", manifestUrl);
+        showPlaybackError();
+      });
       if (autoplay) videoEl.play().catch(function () {});
     }
+  }
+
+  function showPlaybackError() {
+    playbackErrorEl.classList.remove("hidden");
+  }
+
+  function hidePlaybackError() {
+    playbackErrorEl.classList.add("hidden");
   }
 
   function setupChat(data) {
