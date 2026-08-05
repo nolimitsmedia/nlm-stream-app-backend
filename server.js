@@ -8563,6 +8563,7 @@ async function getActiveLiveCount(organizationId) {
 // eventually hit. This pre-existed the bitrate-cap work but shares the
 // identical flaw, so it's fixed here at the same time.
 const activeTranscodeProcesses = new Map(); // key: `${streamKey}:${label}`
+const transcodeStartupLocks = new Map(); // key -> broadcast generation currently starting
 const transcodeRetryCount = new Map(); // key: `${streamKey}:${label}`
 const MAX_TRANSCODE_RETRIES = 10;
 
@@ -8694,200 +8695,265 @@ async function waitForSrsRawStreamReady(
 // is used here because that probe itself was the first-start failure mode.
 
 const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
-  // Same supersession guard as autoCapBitrateStream — abandon if a newer
-  // broadcast session has started since this call was scheduled, rather
-  // than risk racing a fresh attempt to publish to the same output name.
-  if (bitrateCapGeneration.get(streamKey) !== generation) {
-    console.log(
-      `[Transcode] Skipping superseded ${label} session for ${streamKey} (a newer broadcast session has since started).`,
-    );
-    return;
-  }
-
-  const readiness = await waitForSrsRawStreamReady(streamKey, generation);
-  if (!readiness.ready) {
-    if (!readiness.superseded) {
-      console.error(
-        `[Transcode] ${label} not started for ${streamKey}: raw SRS source never became ready — ${readiness.reason}`,
-      );
-    }
-    return;
-  }
-
   const retryKey = `${streamKey}:${label}`;
 
-  const priorProcess = activeTranscodeProcesses.get(retryKey);
-  if (priorProcess && priorProcess.exitCode === null && !priorProcess.killed) {
-    console.warn(
-      `[Transcode] Killing still-alive prior ${label} instance for ${streamKey} before starting a new one.`,
-    );
-    priorProcess.kill("SIGKILL");
-  }
-
-  if (isServerLoadTooHighForNewTranscode()) {
-    console.warn(
-      `[Transcode] Server load too high — skipping ${label} for ${streamKey}.`,
-    );
-    return;
-  }
-
-  // Close the final readiness-to-spawn race. The source may unpublish after
-  // waitForSrsRawStreamReady() succeeds but before ffmpeg is actually spawned.
-  // Re-check both SRS and the broadcast generation immediately before spawn.
-  const sourceStillLive = await getSrsRawStream(streamKey).catch((err) => {
-    console.warn(
-      `[Transcode] Final SRS source check failed for ${label}/${streamKey}:`,
-      err.message,
-    );
-    return null;
-  });
-
-  if (!sourceStillLive || bitrateCapGeneration.get(streamKey) !== generation) {
-    console.warn(
-      `[Transcode] Aborting ${label} startup for ${streamKey}: source disappeared or broadcast was superseded before ffmpeg spawn.`,
+  // The initial on_publish path, the periodic reconciler, and a delayed crash
+  // retry can all notice the same missing rendition at nearly the same time.
+  // Only one startup attempt may own a rendition for a broadcast generation.
+  // Without this lock, two attempts can both pass readiness, and the later one
+  // kills/replaces the healthy process started by the first. SRS then rejects
+  // the duplicate publisher with an RTMP Input/output error, creating a retry
+  // storm and eventually leaving WatchPage stuck on "Preparing stream".
+  const startupGeneration = transcodeStartupLocks.get(retryKey);
+  if (startupGeneration === generation) {
+    console.debug(
+      `[Transcode] ${label} startup already in progress for ${streamKey}; skipping duplicate request.`,
     );
     return;
   }
 
-  // Give SRS a brief moment after publication metadata becomes visible so
-  // the first keyframe/codec headers are available to the RTMP player. This
-  // avoids a race without creating a separate probe subscriber.
-  await sleep(500);
-
-  if (bitrateCapGeneration.get(streamKey) !== generation) {
+  const existingProcess = activeTranscodeProcesses.get(retryKey);
+  if (
+    existingProcess &&
+    existingProcess.exitCode === null &&
+    !existingProcess.killed
+  ) {
+    console.debug(
+      `[Transcode] ${label} is already running for ${streamKey}; skipping duplicate startup.`,
+    );
     return;
   }
 
-  const proc = spawn("ffmpeg", args, {
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  activeTranscodeProcesses.set(retryKey, proc);
+  transcodeStartupLocks.set(retryKey, generation);
 
-  // Shared with the bitrate-cap process's own generation counter — ANY of
-  // the three transcodes (live_capped, 720p, 480p) restarting bumps this
-  // same value, so the frontend's remount key (encoderGeneration) reflects
-  // a real discontinuity regardless of which specific rendition changed
-  // underneath it. Previously this only bumped for live_capped, leaving
-  // 720p/480p restarts invisible to the player entirely.
-  bitrateCapEncoderGeneration.set(
-    streamKey,
-    (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
-  );
-
-  const { filePath: ffmpegLogPath, stream: ffmpegLogStream } =
-    createFfmpegLogFile(label, streamKey);
-
-  // Bounded rolling buffer (50KB) — still kept for the quick pointer in
-  // PM2 logs; the FULL stderr now goes to ffmpegLogStream above as it
-  // arrives, so a crash's earliest lines are never lost to this cap.
-  let stderrTail = "";
-  proc.stderr.on("data", (chunk) => {
-    const text = chunk.toString();
-    if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
-      ffmpegLogStream.write(text);
-    }
-    stderrTail += text;
-    if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
-  });
-
-  proc.stderr.on("error", (err) => {
-    console.error(
-      `[FFMPEG-LOG] stderr read failed for ${label}/${streamKey}:`,
-      err.message,
-    );
-  });
-
-  proc.on("error", (err) => {
-    console.error(
-      `[Transcode] ${label} failed to spawn for ${streamKey}:`,
-      err.message,
-    );
-  });
-
-  // Real bug found via live testing (2026-08-03): using 'exit' here meant
-  // ffmpegLogStream.end() could run BEFORE the very last stderr chunk (the
-  // actual "Input/output error" line — the single most diagnostic line in
-  // the whole crash) had been delivered. Node's docs are explicit that
-  // 'exit' can fire before stdio streams finish flushing; 'close' is the
-  // event guaranteed to fire only once stdout/stderr are fully done.
-  // Confirmed via a real captured log that still cut off right before that
-  // line despite the streaming-to-disk fix — this is the actual reason.
-  proc.on("close", async (code, signal) => {
-    if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
-      ffmpegLogStream.end();
-    }
-
-    if (activeTranscodeProcesses.get(retryKey) === proc) {
-      activeTranscodeProcesses.delete(retryKey);
-    }
-
-    if (code === 0 || code === null) {
-      // Clean exit — nothing to retry. Delete the (empty/uninteresting)
-      // log rather than letting healthy-stream logs accumulate forever.
-      if (ffmpegLogPath) fs.promises.unlink(ffmpegLogPath).catch(() => {});
+  try {
+    // Abandon delayed work from an older OBS/broadcast session.
+    if (bitrateCapGeneration.get(streamKey) !== generation) {
+      console.log(
+        `[Transcode] Skipping superseded ${label} session for ${streamKey} (a newer broadcast session has since started).`,
+      );
       return;
     }
 
-    // A newer session has started since THIS process was spawned — stay
-    // quiet, this exit is expected (superseded), not a real failure.
+    const readiness = await waitForSrsRawStreamReady(streamKey, generation);
+    if (!readiness.ready) {
+      if (!readiness.superseded) {
+        // This is a recoverable startup race. The periodic ABR reconciler will
+        // try again while the raw publisher remains live, so do not place a
+        // transient condition in the Super Admin Recent Errors panel.
+        console.warn(
+          `[Transcode] ${label} startup deferred for ${streamKey}: raw SRS source is not ready yet — ${readiness.reason}`,
+        );
+      }
+      return;
+    }
+
+    // Re-check after the asynchronous readiness wait. Another path may have
+    // completed startup while this attempt was waiting.
+    const processAfterReadiness = activeTranscodeProcesses.get(retryKey);
+    if (
+      processAfterReadiness &&
+      processAfterReadiness.exitCode === null &&
+      !processAfterReadiness.killed
+    ) {
+      console.debug(
+        `[Transcode] ${label} became active for ${streamKey} while readiness was being checked; skipping duplicate spawn.`,
+      );
+      return;
+    }
+
+    if (isServerLoadTooHighForNewTranscode()) {
+      console.warn(
+        `[Transcode] Server load too high — deferring ${label} for ${streamKey}.`,
+      );
+      return;
+    }
+
+    // Close the final readiness-to-spawn race. The source may unpublish after
+    // waitForSrsRawStreamReady() succeeds but before FFmpeg is spawned.
+    const sourceStillLive = await getSrsRawStream(streamKey).catch((err) => {
+      console.warn(
+        `[Transcode] Final SRS source check failed for ${label}/${streamKey}:`,
+        err.message,
+      );
+      return null;
+    });
+
+    if (
+      !sourceStillLive ||
+      bitrateCapGeneration.get(streamKey) !== generation
+    ) {
+      console.warn(
+        `[Transcode] Aborting ${label} startup for ${streamKey}: source disappeared or broadcast was superseded before FFmpeg spawn.`,
+      );
+      return;
+    }
+
+    // Give SRS a brief moment after publication metadata becomes visible so
+    // the first keyframe/codec headers are available to the RTMP player.
+    await sleep(500);
+
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
-    console.warn(
-      `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — retrying` +
-        (ffmpegLogPath ? ` (full stderr written to ${ffmpegLogPath})` : "") +
-        `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
+    const processBeforeSpawn = activeTranscodeProcesses.get(retryKey);
+    if (
+      processBeforeSpawn &&
+      processBeforeSpawn.exitCode === null &&
+      !processBeforeSpawn.killed
+    ) {
+      console.debug(
+        `[Transcode] ${label} is already active for ${streamKey}; cancelling duplicate FFmpeg spawn.`,
+      );
+      return;
+    }
+
+    const proc = spawn("ffmpeg", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    activeTranscodeProcesses.set(retryKey, proc);
+
+    // The startup lock is no longer needed after the process has been recorded.
+    if (transcodeStartupLocks.get(retryKey) === generation) {
+      transcodeStartupLocks.delete(retryKey);
+    }
+
+    bitrateCapEncoderGeneration.set(
+      streamKey,
+      (bitrateCapEncoderGeneration.get(streamKey) || 0) + 1,
     );
 
-    // Only retry if SRS itself still sees the raw source as genuinely
-    // active — replaces the old DB-only `is_live` check (ChatGPT review
-    // finding: `is_live` can stay true through states where the raw
-    // stream isn't actually consumable yet, e.g. a brief reconnect gap).
-    try {
-      const readinessForRetry = await waitForSrsRawStreamReady(
-        streamKey,
-        generation,
-        { timeoutMs: 15000, pollMs: 1000 },
-      );
+    const { filePath: ffmpegLogPath, stream: ffmpegLogStream } =
+      createFfmpegLogFile(label, streamKey);
 
-      if (!readinessForRetry.ready) {
-        if (!readinessForRetry.superseded) {
-          console.warn(
-            `[Transcode] Not retrying ${label} for ${streamKey}: raw source unavailable in SRS — ${readinessForRetry.reason}`,
-          );
-        }
+    let stderrTail = "";
+    proc.stderr.on("data", (chunk) => {
+      const chunkText = chunk.toString();
+      if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
+        ffmpegLogStream.write(chunkText);
+      }
+      stderrTail += chunkText;
+      if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
+    });
+
+    proc.stderr.on("error", (err) => {
+      console.error(
+        `[FFMPEG-LOG] stderr read failed for ${label}/${streamKey}:`,
+        err.message,
+      );
+    });
+
+    proc.on("error", (err) => {
+      console.error(
+        `[Transcode] ${label} failed to spawn for ${streamKey}:`,
+        err.message,
+      );
+    });
+
+    proc.on("close", async (code, signal) => {
+      if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
+        ffmpegLogStream.end();
+      }
+
+      if (activeTranscodeProcesses.get(retryKey) === proc) {
+        activeTranscodeProcesses.delete(retryKey);
+      }
+
+      if (code === 0 || code === null) {
+        if (ffmpegLogPath) fs.promises.unlink(ffmpegLogPath).catch(() => {});
         return;
       }
 
-      const attempts = (transcodeRetryCount.get(retryKey) || 0) + 1;
-      transcodeRetryCount.set(retryKey, attempts);
+      // A newer broadcast session owns this stream now.
+      if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
-      if (attempts > MAX_TRANSCODE_RETRIES) {
-        console.error(
-          `[Transcode] Giving up on ${label} for ${streamKey} after ${attempts} failed attempts — that rendition will be unavailable for the rest of this broadcast.`,
+      // If another legitimate path already installed a replacement process,
+      // this old process closing must not start a second retry chain.
+      const replacementProcess = activeTranscodeProcesses.get(retryKey);
+      if (
+        replacementProcess &&
+        replacementProcess !== proc &&
+        replacementProcess.exitCode === null &&
+        !replacementProcess.killed
+      ) {
+        console.debug(
+          `[Transcode] ${label} replacement is already running for ${streamKey}; suppressing stale retry.`,
         );
-        notifySlack(`ffmpeg gave up on ABR transcode (${label})`, {
-          streamKey,
-          label,
-          attempts,
-          timestamp: new Date().toISOString(),
-        });
         return;
       }
 
       console.warn(
-        `[Transcode] ${label} ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_TRANSCODE_RETRIES}) for ${streamKey}`,
+        `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — evaluating retry` +
+          (ffmpegLogPath ? ` (full stderr written to ${ffmpegLogPath})` : "") +
+          `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
       );
-      setTimeout(
-        () => spawnFfmpegVariant(label, streamKey, args, generation),
-        3000,
-      );
-    } catch (err) {
-      console.error(
-        `[Transcode] Failed readiness check for ${streamKey} before retrying ${label}:`,
-        err.message,
-      );
+
+      try {
+        const readinessForRetry = await waitForSrsRawStreamReady(
+          streamKey,
+          generation,
+          { timeoutMs: 15000, pollMs: 1000 },
+        );
+
+        if (!readinessForRetry.ready) {
+          if (!readinessForRetry.superseded) {
+            console.warn(
+              `[Transcode] Not retrying ${label} for ${streamKey}: raw source unavailable in SRS — ${readinessForRetry.reason}`,
+            );
+          }
+          return;
+        }
+
+        const processBeforeRetry = activeTranscodeProcesses.get(retryKey);
+        if (
+          processBeforeRetry &&
+          processBeforeRetry.exitCode === null &&
+          !processBeforeRetry.killed
+        ) {
+          console.debug(
+            `[Transcode] ${label} recovered through another path for ${streamKey}; retry cancelled.`,
+          );
+          return;
+        }
+
+        const attempts = (transcodeRetryCount.get(retryKey) || 0) + 1;
+        transcodeRetryCount.set(retryKey, attempts);
+
+        if (attempts > MAX_TRANSCODE_RETRIES) {
+          console.error(
+            `[Transcode] Giving up on ${label} for ${streamKey} after ${attempts} failed attempts — the ABR reconciler will continue periodic recovery checks.`,
+          );
+          notifySlack(`ffmpeg gave up on ABR transcode (${label})`, {
+            streamKey,
+            label,
+            attempts,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        console.warn(
+          `[Transcode] ${label} ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_TRANSCODE_RETRIES}) for ${streamKey}`,
+        );
+
+        const retryTimer = setTimeout(
+          () => spawnFfmpegVariant(label, streamKey, args, generation),
+          3000,
+        );
+        retryTimer.unref?.();
+      } catch (err) {
+        console.error(
+          `[Transcode] Failed readiness check for ${streamKey} before retrying ${label}:`,
+          err.message,
+        );
+      }
+    });
+  } finally {
+    // Clear only the lock belonging to this exact broadcast generation. A
+    // newer OBS session may already have installed its own startup lock.
+    if (transcodeStartupLocks.get(retryKey) === generation) {
+      transcodeStartupLocks.delete(retryKey);
     }
-  });
+  }
 };
 
 // Input-side resilience for the local RTMP source. +genpts/discardcorrupt and
@@ -9144,11 +9210,14 @@ async function reconcileAbrTranscoders() {
         const retryKey = `${streamKey}:${rendition.label}`;
         const proc = activeTranscodeProcesses.get(retryKey);
         const processRunning = proc && proc.exitCode === null && !proc.killed;
+        const startupInProgress =
+          transcodeStartupLocks.get(retryKey) === generation;
         const renditionPublishing = activeNames.has(
           `${streamKey}_${rendition.label}`,
         );
 
-        if (processRunning || renditionPublishing) continue;
+        if (processRunning || startupInProgress || renditionPublishing)
+          continue;
 
         const now = Date.now();
         const lastAttempt = abrRecoveryLastAttempt.get(retryKey) || 0;
@@ -10434,6 +10503,11 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     for (const key of abrRecoveryLastAttempt.keys()) {
       if (key.startsWith(`${streamKey}:`)) {
         abrRecoveryLastAttempt.delete(key);
+      }
+    }
+    for (const key of transcodeStartupLocks.keys()) {
+      if (key.startsWith(`${streamKey}:`)) {
+        transcodeStartupLocks.delete(key);
       }
     }
 
