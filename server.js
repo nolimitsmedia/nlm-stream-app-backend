@@ -9322,7 +9322,7 @@ function buildRenditionFfmpegArgs(
     "-hide_banner",
     "-nostats",
     "-loglevel",
-    getFfmpegLogLevel(exactStreamKey),
+    getFfmpegLogLevel(streamKey),
     ...inputResilienceFlags,
     "-i",
     input,
