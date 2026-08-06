@@ -9015,28 +9015,14 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     }
 
     const inputIndex = args.indexOf("-i");
-    const playpathIndex = args.indexOf("-rtmp_playpath");
     const configuredInput =
       inputIndex >= 0 && inputIndex + 1 < args.length
         ? String(args[inputIndex + 1])
         : "";
-    const configuredPlaypath =
-      playpathIndex >= 0 && playpathIndex + 1 < args.length
-        ? String(args[playpathIndex + 1])
-        : "";
-
-    if (configuredPlaypath !== String(streamKey)) {
-      console.error(
-        `[Transcode] Refusing to spawn ${label} for ${streamKey}: RTMP playpath mismatch ` +
-          `(configured=${JSON.stringify(configuredPlaypath)}, expected=${JSON.stringify(streamKey)}).`,
-      );
-      return;
-    }
 
     console.log(
       `[Transcode] Spawning ${label} for ${streamKey} with RTMP input ` +
-        `${JSON.stringify(configuredInput)}, playpath=${JSON.stringify(configuredPlaypath)}, ` +
-        `playpathLength=${configuredPlaypath.length}.`,
+        `${JSON.stringify(configuredInput)}.`,
     );
 
     const proc = spawn("ffmpeg", args, {
@@ -9331,8 +9317,6 @@ function buildRenditionFfmpegArgs(
   output,
   { bitrateKbps, resolution },
 ) {
-  const exactStreamKey = String(streamKey || "").trim();
-
   return [
     "-y",
     "-hide_banner",
@@ -9340,22 +9324,6 @@ function buildRenditionFfmpegArgs(
     "-loglevel",
     getFfmpegLogLevel(exactStreamKey),
     ...inputResilienceFlags,
-
-    // Pass the RTMP application and playpath separately instead of embedding
-    // the stream key inside the input URL. The production failure captured on
-    // 2026-08-06 showed FFmpeg processes whose -i URL had lost the final
-    // character of a 32-character secure stream key, while the output URL and
-    // SRS publisher still contained the complete key. Supplying the playpath
-    // as its own argv value removes that ambiguity and guarantees FFmpeg asks
-    // SRS for the exact channel key.
-    "-rtmp_live",
-    "live",
-    "-rtmp_app",
-    "live",
-    "-rtmp_playpath",
-    exactStreamKey,
-    "-rw_timeout",
-    "30000000",
     "-i",
     input,
     "-map",
@@ -9402,12 +9370,11 @@ function buildRenditionFfmpegArgs(
   ];
 }
 
-function getInternalRtmpSourceUrl(_streamKey) {
-  // The exact stream name is supplied separately through -rtmp_playpath in
-  // buildRenditionFfmpegArgs(). Keep the input URL limited to the RTMP
-  // application so long, case-sensitive secure stream keys cannot be altered
-  // or truncated inside a combined URL argument.
-  return `${SRS_RTMP_BASE_URL.replace(/\/$/, "")}/live`;
+function getInternalRtmpSourceUrl(streamKey) {
+  return (
+    `${SRS_RTMP_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(streamKey)}`
+  );
 }
 
 function spawnRenditionsForStream(streamKey, renditions, generation) {
