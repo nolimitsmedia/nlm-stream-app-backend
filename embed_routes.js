@@ -382,7 +382,7 @@ function embedPageHtml(embedToken) {
     var manifestPath = data.transcodingEnabled
       ? "/api/abr/" + data.streamKey + "/master.m3u8"
       : "/api/hls/" + data.streamKey + ".m3u8";
-    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\/$/, "");
+    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\\/$/, "");
     var manifestUrl = origin + manifestPath + (data.hlsAuthQs || "");
 
     var autoplay = boolParam(
