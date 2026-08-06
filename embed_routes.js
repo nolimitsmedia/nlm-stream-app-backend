@@ -248,20 +248,15 @@ function embedPageHtml(embedToken) {
     }
   }
 
-  // A broadcast "session" is identified by encoderGeneration + when it
-  // started — not just a live/offline boolean. Restarting the server/SRS
-  // mid-broadcast (or a bitrate-cap encoder respawn) can produce a brand
-  // new HLS/ABR session while isLive stays true the whole time from the
-  // page's perspective; without this, an already-open embed never rebuilds
-  // its player for the new session and just sits on a dead manifest until
-  // someone manually refreshes the page. Mirrors the same
-  // encoderGeneration+liveStartedAtMs remount key LivePlayer.jsx/
-  // WatchPage.jsx already use for this exact reason.
+  // A playback session follows the raw OBS broadcast, not individual
+  // rendition/FFmpeg restarts. Using encoderGeneration here caused the iframe
+  // to repeatedly destroy and rebuild a healthy player while the ABR ladder
+  // initialized or self-healed.
   function sessionKeyFor(data) {
     var stream = data && data.stream;
     if (!stream) return null;
     var startedAt = stream.liveStartedAtMs || stream.live_ms || 0;
-    var generation = stream.encoderGeneration || 0;
+    var generation = stream.broadcastGeneration || 0;
     return generation + ":" + startedAt;
   }
 
@@ -282,6 +277,15 @@ function embedPageHtml(embedToken) {
   function showLive() {
     offlineEl.classList.add("hidden");
     badgeEl.style.display = "flex";
+  }
+
+  function showPreparing() {
+    playbackReady = false;
+    offlineTitle.textContent = "Preparing stream";
+    offlineSub.textContent = "Optimizing the broadcast for reliable playback…";
+    offlineEl.classList.remove("hidden");
+    badgeEl.style.display = "flex";
+    hidePlaybackError();
   }
 
   function applyBranding(data) {
@@ -448,7 +452,10 @@ function embedPageHtml(embedToken) {
   }
 
   function refresh() {
-    fetch("/api/public/embed/" + encodeURIComponent(EMBED_TOKEN) + "/status")
+    fetch("/api/public/embed/" + encodeURIComponent(EMBED_TOKEN) + "/status", {
+      cache: "no-store",
+      credentials: "omit",
+    })
       .then(function (r) {
         if (!r.ok) throw new Error("status " + r.status);
         return r.json();
@@ -459,21 +466,40 @@ function embedPageHtml(embedToken) {
         setupChat(data);
 
         if (data.isLive) {
-          showLive();
           var sessionKey = sessionKeyFor(data);
-          // Rebuild playback whenever we weren't live before, OR the
-          // broadcast session itself changed (server/SRS restart,
-          // encoder respawn) even though isLive never flipped to false —
-          // see sessionKeyFor() above for why a plain wasLive boolean
-          // isn't enough here.
-          if (!wasLive || sessionKey !== currentSessionKey) {
-            // Genuinely new/changed session — this is not a retry, so give
-            // it a fresh startup-retry budget.
+          var canStartPlayback =
+            data.playbackReady !== false &&
+            (!data.transcodingEnabled || data.abrReady === true);
+
+          wasLive = true;
+
+          if (!canStartPlayback) {
+            currentSessionKey = sessionKey;
+            clearStartupRetry();
+            if (hls) {
+              try { hls.destroy(); } catch (e) {}
+              hls = null;
+            }
+            videoEl.removeAttribute("src");
+            videoEl.load();
+            showPreparing();
+            return;
+          }
+
+          showLive();
+
+          // Start only for a genuinely new raw broadcast or after a previous
+          // preparing/offline state. Rendition-only restarts keep the current
+          // player alive and are handled by hls.js recovery.
+          if (
+            !playbackReady ||
+            sessionKey !== currentSessionKey
+          ) {
             startupRetryCount = 0;
             clearStartupRetry();
             startPlayback(data);
           }
-          wasLive = true;
+
           currentSessionKey = sessionKey;
         } else {
           wasLive = false;

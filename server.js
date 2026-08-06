@@ -6414,52 +6414,117 @@ const getPublicWatchStatus = async (streamKey) => {
     }
   }
 
-  // PRIMARY: Check DB is_live flag set by SRS on_publish webhook
+  // SRS is the authoritative source for whether a broadcast is live.
+  // The database flag is bookkeeping and may become stale if an unpublish
+  // webhook is delayed or missed. Keeping SRS authoritative prevents the
+  // Watch Page and embed player from remaining on "Preparing stream" while
+  // no raw publisher actually exists.
+  let channelState = null;
   try {
     const channelResult = await pool.query(
       `SELECT stream_key, name, is_live, live_started_at,
               EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
        FROM channels
-       WHERE stream_key = $1 AND organization_id = $2 AND is_live = TRUE
+       WHERE stream_key = $1 AND organization_id = $2
        LIMIT 1`,
       [streamKey, organizationId],
     );
-    if (channelResult.rows[0]) {
-      const ch = channelResult.rows[0];
-      activeStream = {
-        name: ch.stream_key,
-        publish: { active: true, active_age: ch.uptime_seconds || 0 },
-        clients: 0,
-        kbps: { recv_30s: 0 },
-        encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
-        liveStartedAtMs: ch.live_started_at
-          ? new Date(ch.live_started_at).getTime()
-          : 0,
-      };
-    }
+    channelState = channelResult.rows[0] || null;
   } catch (dbErr) {
-    console.error("DB is_live check error:", dbErr.message);
+    console.warn("DB watch-state lookup failed:", dbErr.message);
   }
 
-  // FALLBACK: Try polling SRS directly
-  if (!activeStream) {
-    try {
-      const response = await fetch(`${SRS_API_URL}/api/v1/streams`, {
-        signal: AbortSignal.timeout(3000),
-      });
+  let srsReachable = false;
+  let rawSrsStream = null;
+
+  try {
+    const response = await fetch(
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      { signal: AbortSignal.timeout(4000) },
+    );
+
+    if (response.ok) {
+      srsReachable = true;
       const data = await response.json();
-      activeStream = (data.streams || []).find(
-        (s) => s.name === streamKey && s.publish?.active,
+      rawSrsStream = (data.streams || []).find(
+        (stream) =>
+          stream.name === streamKey &&
+          stream.publish?.active &&
+          !isAbrRenditionStreamKey(stream.name),
       );
-      if (activeStream) {
-        activeStream = {
-          ...activeStream,
-          encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
-        };
-      }
-    } catch {
-      /* silent - SRS not reachable from cloud */
     }
+  } catch (srsErr) {
+    console.debug(
+      `[WATCH-STATUS] Unable to verify SRS state for ${streamKey}:`,
+      srsErr.message,
+    );
+  }
+
+  if (rawSrsStream) {
+    const liveStartedAtMs = channelState?.live_started_at
+      ? new Date(channelState.live_started_at).getTime()
+      : Date.now();
+
+    activeStream = {
+      ...rawSrsStream,
+      encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
+      broadcastGeneration: bitrateCapGeneration.get(streamKey) || 0,
+      liveStartedAtMs,
+    };
+
+    if (!channelState?.is_live) {
+      pool
+        .query(
+          `UPDATE channels
+           SET is_live = TRUE,
+               live_started_at = COALESCE(live_started_at, NOW())
+           WHERE stream_key = $1 AND organization_id = $2`,
+          [streamKey, organizationId],
+        )
+        .catch((error) =>
+          console.debug(
+            `[WATCH-STATUS] Failed to repair live DB state for ${streamKey}:`,
+            error.message,
+          ),
+        );
+    }
+  } else if (srsReachable) {
+    // SRS answered successfully and proved that the raw source is offline.
+    // Repair a stale DB live marker asynchronously.
+    if (channelState?.is_live) {
+      pool
+        .query(
+          `UPDATE channels
+           SET is_live = FALSE, live_started_at = NULL
+           WHERE stream_key = $1 AND organization_id = $2`,
+          [streamKey, organizationId],
+        )
+        .catch((error) =>
+          console.debug(
+            `[WATCH-STATUS] Failed to clear stale DB state for ${streamKey}:`,
+            error.message,
+          ),
+        );
+    }
+  } else if (channelState?.is_live) {
+    // Only fall back to the DB when SRS itself could not be reached. This
+    // preserves service during a brief SRS API/network hiccup without letting
+    // a stale DB flag override a successful SRS "offline" result.
+    activeStream = {
+      name: channelState.stream_key,
+      publish: {
+        active: true,
+        active_age: channelState.uptime_seconds || 0,
+      },
+      clients: 0,
+      kbps: { recv_30s: 0 },
+      source: "db_fallback",
+      encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
+      broadcastGeneration: bitrateCapGeneration.get(streamKey) || 0,
+      liveStartedAtMs: channelState.live_started_at
+        ? new Date(channelState.live_started_at).getTime()
+        : 0,
+    };
   }
 
   const scheduleResult = await pool.query(
@@ -6524,12 +6589,43 @@ const getPublicWatchStatus = async (streamKey) => {
     : `/api/hls/${streamKey}.m3u8`;
   const hlsAuthQs = appendBunnyToken(hlsUrlPath);
 
+  // Report readiness through the same public status object used by both the
+  // React Watch Page and the standalone iframe. This keeps both surfaces from
+  // requesting the ABR master while the raw source is live but renditions are
+  // still initializing.
+  let abrReady = !transcodingEnabled && Boolean(activeStream);
+  let playbackReady = Boolean(activeStream);
+
+  if (activeStream && transcodingEnabled && organizationId) {
+    try {
+      const renditionPlan = await getRenditionPlanForOrg(organizationId);
+      for (const rendition of renditionPlan) {
+        const upstreamUrl =
+          `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live/` +
+          `${streamKey}_${rendition.label}.m3u8`;
+        const initialized = await fetchInitializedHlsPlaylist(upstreamUrl);
+        if (initialized.ok) {
+          abrReady = true;
+          break;
+        }
+      }
+    } catch (readinessError) {
+      console.debug(
+        `[WATCH-STATUS] ABR readiness check failed for ${streamKey}:`,
+        readinessError.message,
+      );
+    }
+    playbackReady = abrReady;
+  }
+
   return {
     organization_id: organizationId,
     organization: brandingData.organization,
     settings: brandingData.settings,
     branding: brandingData.branding,
     isLive: Boolean(activeStream),
+    abrReady,
+    playbackReady,
     stream: activeStream || null,
     schedule: scheduleResult.rows[0] || null,
     viewerMetrics,
@@ -8571,11 +8667,14 @@ async function getOrgStreamingPlan(organizationId) {
 }
 
 // ── Helper: count currently live streams for an org ───────────────
-async function getActiveLiveCount(organizationId) {
+async function getActiveLiveCount(organizationId, excludeStreamKey = null) {
   const result = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM channels
-     WHERE organization_id = $1 AND is_live = TRUE`,
-    [organizationId],
+    `SELECT COUNT(*)::int AS count
+     FROM channels
+     WHERE organization_id = $1
+       AND is_live = TRUE
+       AND ($2::text IS NULL OR stream_key <> $2)`,
+    [organizationId, excludeStreamKey],
   );
   return result.rows[0]?.count || 0;
 }
@@ -10540,7 +10639,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
 
     // 2. Check concurrent stream limit for this org's plan
     const plan = await getOrgStreamingPlan(channel.org_id);
-    const liveCount = await getActiveLiveCount(channel.org_id);
+    const liveCount = await getActiveLiveCount(channel.org_id, streamKey);
 
     if (liveCount >= plan.max_concurrent_streams) {
       console.warn(
@@ -15785,6 +15884,7 @@ app.get("/api/abr/:stream/status", async (req, res) => {
         ? new Date(channel.live_started_at).getTime()
         : 0,
       encoderGeneration: bitrateCapEncoderGeneration.get(stream) || 0,
+      broadcastGeneration: bitrateCapGeneration.get(stream) || 0,
       plannedRenditions: renditionPlan.map((rendition) => ({
         label: rendition.label,
         bitrateKbps: rendition.bitrateKbps,
