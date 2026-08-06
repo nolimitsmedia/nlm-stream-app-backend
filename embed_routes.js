@@ -239,13 +239,87 @@ function embedPageHtml(embedToken) {
   var startupRetryCount = 0;
   var startupRetryTimer = null;
   var RECOVERY_RETRY_DELAY_MS = 10000;
+  var PLAYBACK_WATCHDOG_INTERVAL_MS = 3000;
+  var PLAYBACK_STALL_THRESHOLD_MS = 12000;
   var playbackReady = false;
+  var playbackWatchdogTimer = null;
+  var lastPlaybackTime = 0;
+  var lastPlaybackProgressAt = 0;
 
   function clearStartupRetry() {
     if (startupRetryTimer) {
       clearTimeout(startupRetryTimer);
       startupRetryTimer = null;
     }
+  }
+
+  function clearPlaybackWatchdog() {
+    if (playbackWatchdogTimer) {
+      clearInterval(playbackWatchdogTimer);
+      playbackWatchdogTimer = null;
+    }
+  }
+
+  function markPlaybackProgress() {
+    var currentTime = Number(videoEl.currentTime || 0);
+    if (currentTime > lastPlaybackTime + 0.05) {
+      lastPlaybackTime = currentTime;
+      lastPlaybackProgressAt = Date.now();
+    }
+  }
+
+  function confirmPlaybackReady() {
+    playbackReady = true;
+    startupRetryCount = 0;
+    clearStartupRetry();
+    hidePlaybackError();
+    markPlaybackProgress();
+  }
+
+  function startPlaybackWatchdog(data) {
+    clearPlaybackWatchdog();
+    lastPlaybackTime = Number(videoEl.currentTime || 0);
+    lastPlaybackProgressAt = Date.now();
+
+    playbackWatchdogTimer = setInterval(function () {
+      if (!wasLive || !playbackReady || videoEl.paused || videoEl.ended) {
+        return;
+      }
+
+      markPlaybackProgress();
+
+      var hasBufferedMedia =
+        videoEl.buffered &&
+        videoEl.buffered.length > 0 &&
+        videoEl.buffered.end(videoEl.buffered.length - 1) >
+          videoEl.currentTime + 0.25;
+
+      var stalledForMs = Date.now() - lastPlaybackProgressAt;
+
+      if (
+        stalledForMs >= PLAYBACK_STALL_THRESHOLD_MS &&
+        !hasBufferedMedia
+      ) {
+        console.warn(
+          "[embed] playback progress stalled; rebuilding HLS player",
+          {
+            currentTime: videoEl.currentTime,
+            readyState: videoEl.readyState,
+            stalledForMs: stalledForMs,
+          },
+        );
+
+        playbackReady = false;
+        clearPlaybackWatchdog();
+
+        if (hls) {
+          try { hls.destroy(); } catch (e) {}
+          hls = null;
+        }
+
+        scheduleStartupRetry(data);
+      }
+    }, PLAYBACK_WATCHDOG_INTERVAL_MS);
   }
 
   // A playback session follows the raw OBS broadcast, not individual
@@ -267,6 +341,7 @@ function embedPageHtml(embedToken) {
     badgeEl.style.display = "none";
     hidePlaybackError();
     clearStartupRetry();
+    clearPlaybackWatchdog();
     if (title) offlineTitle.textContent = title;
     if (sub !== undefined) offlineSub.textContent = sub;
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
@@ -281,6 +356,7 @@ function embedPageHtml(embedToken) {
 
   function showPreparing() {
     playbackReady = false;
+    clearPlaybackWatchdog();
     offlineTitle.textContent = "Preparing stream";
     offlineSub.textContent = "Optimizing the broadcast for reliable playback…";
     offlineEl.classList.remove("hidden");
@@ -301,67 +377,144 @@ function embedPageHtml(embedToken) {
 
   function startPlayback(data) {
     playbackReady = false;
+    clearPlaybackWatchdog();
 
     var manifestPath = data.transcodingEnabled
       ? "/api/abr/" + data.streamKey + "/master.m3u8"
       : "/api/hls/" + data.streamKey + ".m3u8";
-    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\\/$/, "");
+    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\/$/, "");
     var manifestUrl = origin + manifestPath + (data.hlsAuthQs || "");
 
-    var autoplay = boolParam("autoplay", data.embedSettings && data.embedSettings.autoplay !== undefined ? !!data.embedSettings.autoplay : true);
-    var muted = boolParam("muted", data.embedSettings && data.embedSettings.muted !== undefined ? !!data.embedSettings.muted : true);
-    var controls = boolParam("controls", data.embedSettings && data.embedSettings.controls !== undefined ? !!data.embedSettings.controls : true);
+    var autoplay = boolParam(
+      "autoplay",
+      data.embedSettings && data.embedSettings.autoplay !== undefined
+        ? !!data.embedSettings.autoplay
+        : true,
+    );
+    var muted = boolParam(
+      "muted",
+      data.embedSettings && data.embedSettings.muted !== undefined
+        ? !!data.embedSettings.muted
+        : true,
+    );
+    var controls = boolParam(
+      "controls",
+      data.embedSettings && data.embedSettings.controls !== undefined
+        ? !!data.embedSettings.controls
+        : true,
+    );
 
     videoEl.muted = muted;
     videoEl.controls = controls;
+    videoEl.autoplay = autoplay;
+    videoEl.playsInline = true;
     hidePlaybackError();
 
+    var tryPlay = function () {
+      if (!autoplay) return;
+      videoEl.play().catch(function (error) {
+        console.debug("[embed] autoplay was deferred", error && error.message);
+      });
+    };
+
+    videoEl.onplaying = function () {
+      confirmPlaybackReady();
+      startPlaybackWatchdog(data);
+    };
+    videoEl.oncanplay = function () {
+      confirmPlaybackReady();
+      tryPlay();
+    };
+    videoEl.ontimeupdate = function () {
+      markPlaybackProgress();
+    };
+    videoEl.onwaiting = function () {
+      if (playbackReady) {
+        lastPlaybackProgressAt = Date.now();
+      }
+    };
+
     if (window.Hls && window.Hls.isSupported()) {
-      if (hls) { try { hls.destroy(); } catch (e) {} }
-      hls = new window.Hls({ enableWorker: true });
+      if (hls) {
+        try { hls.destroy(); } catch (e) {}
+      }
+
+      hls = new window.Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 10,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        manifestLoadingMaxRetry: 10,
+        levelLoadingMaxRetry: 10,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 1000,
+      });
+
       hls.loadSource(manifestUrl);
       hls.attachMedia(videoEl);
+
       hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
-        playbackReady = true;
-        startupRetryCount = 0;
-        clearStartupRetry();
-        hidePlaybackError();
-        if (autoplay) videoEl.play().catch(function () {});
+        // A parsed manifest is not proof that Chrome is actively decoding.
+        // Let canplay/playing/FRAG_BUFFERED confirm real playback.
+        tryPlay();
       });
+
+      hls.on(window.Hls.Events.FRAG_BUFFERED, function () {
+        confirmPlaybackReady();
+        startPlaybackWatchdog(data);
+        tryPlay();
+      });
+
       hls.on(window.Hls.Events.ERROR, function (evt, errData) {
-        if (errData && errData.fatal) {
-          // Log the real manifest target and error detail before rebuilding
-          // the player. Destroying the failed HLS instance first prevents
-          // overlapping loaders/listeners during repeated startup recovery.
-          console.warn(
-            "[embed] fatal HLS error",
-            errData.type,
-            errData.details,
-            manifestUrl,
-          );
+        if (!errData) return;
 
-          if (hls) {
-            try { hls.destroy(); } catch (e) {}
-            hls = null;
-          }
+        var details = errData.details || "";
+        var responseCode = errData.response && errData.response.code;
+        var shouldRecover =
+          errData.fatal ||
+          responseCode === 404 ||
+          responseCode === 503 ||
+          details === "bufferAppendError" ||
+          details === "bufferStalledError" ||
+          details === "fragLoadError" ||
+          details === "fragLoadTimeOut" ||
+          details === "levelLoadError" ||
+          details === "levelLoadTimeOut";
 
-          scheduleStartupRetry(data);
+        if (!shouldRecover) return;
+
+        console.warn(
+          "[embed] HLS playback recovery",
+          errData.type,
+          details,
+          responseCode,
+          manifestUrl,
+        );
+
+        playbackReady = false;
+        clearPlaybackWatchdog();
+
+        if (hls) {
+          try { hls.destroy(); } catch (e) {}
+          hls = null;
         }
+
+        scheduleStartupRetry(data);
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
-      // Safari/iOS native HLS
       videoEl.src = manifestUrl;
       videoEl.onloadedmetadata = function () {
-        playbackReady = true;
-        startupRetryCount = 0;
-        clearStartupRetry();
-        hidePlaybackError();
+        tryPlay();
       };
       videoEl.onerror = function () {
         console.warn("[embed] native HLS playback error", manifestUrl);
+        playbackReady = false;
+        clearPlaybackWatchdog();
         scheduleStartupRetry(data);
       };
-      if (autoplay) videoEl.play().catch(function () {});
+      tryPlay();
     }
   }
 
@@ -528,6 +681,7 @@ function embedPageHtml(embedToken) {
   refresh();
   pollTimer = setInterval(refresh, 8000);
   window.addEventListener("beforeunload", function () {
+    clearPlaybackWatchdog();
     if (pollTimer) clearInterval(pollTimer);
     clearStartupRetry();
     if (socket) socket.disconnect();
