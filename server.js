@@ -8848,7 +8848,7 @@ async function waitForSrsRawStreamReady(
 // Only killing the zombie lets the periodic reconciler notice the rendition
 // is genuinely missing and retry — this function does NOT retry itself, to
 // avoid duplicating that logic.
-const RENDITION_STARTUP_WATCHDOG_MS = 30000;
+const RENDITION_STARTUP_WATCHDOG_MS = 45000;
 const RENDITION_STARTUP_POLL_MS = 2000;
 
 async function watchRenditionStartupOrKill(
@@ -8995,10 +8995,13 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       return;
     }
 
-    // The readiness gate already observed three consecutive advancing media
-    // samples. Keep a final short buffer so all three rendition subscribers do
-    // not attach on the exact same millisecond.
-    await sleep(1500);
+    // The readiness gate observed the raw source actively delivering media
+    // (a single passing check, not repeated confirmations — see
+    // waitForSrsRawStreamReady's hasMedia check above). Keep a short buffer
+    // so all three rendition subscribers do not attach on the exact same
+    // millisecond, without adding unnecessary delay before spawn now that
+    // analyzeduration/probesize are back to their smaller, fast-start values.
+    await sleep(500);
 
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
@@ -9195,9 +9198,11 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
 // that could otherwise create downstream HLS/MSE discontinuities.
 const inputResilienceFlags = [
   "-analyzeduration",
-  "10000000",
+  "3000000",
   "-probesize",
-  "5000000",
+  "1000000",
+  "-rw_timeout",
+  "30000000",
   "-fflags",
   "+genpts+discardcorrupt",
   "-avoid_negative_ts",
