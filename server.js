@@ -9196,13 +9196,21 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
 // Input-side resilience for the local RTMP source. +genpts/discardcorrupt and
 // avoid_negative_ts guard against timestamp irregularities inherited from OBS
 // that could otherwise create downstream HLS/MSE discontinuities.
+//
+// Deliberately NO -rw_timeout here: an internal ffmpeg read/write timeout
+// races against the external watchRenditionStartupOrKill() watchdog
+// (RENDITION_STARTUP_WATCHDOG_MS, currently 45s) — whichever fires first
+// wins, and a shorter internal timeout silently pre-empts the external one
+// every time, defeating its clearer logging/reconciler handoff. Confirmed
+// live 2026-08-06: adding "-rw_timeout"/"30000000" here caused ffmpeg to
+// self-exit at exactly 30s (no SIGTERM in its log) well before the 45s
+// external watchdog ever got a chance to act. One hang-detection mechanism
+// should own this decision, not two independent timers.
 const inputResilienceFlags = [
   "-analyzeduration",
   "3000000",
   "-probesize",
   "1000000",
-  "-rw_timeout",
-  "30000000",
   "-fflags",
   "+genpts+discardcorrupt",
   "-avoid_negative_ts",
