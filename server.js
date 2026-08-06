@@ -8657,10 +8657,13 @@ async function getSrsRawStream(streamKey) {
 async function waitForSrsRawStreamReady(
   streamKey,
   generation,
-  { timeoutMs = 20000, pollMs = 1000 } = {},
+  { timeoutMs = 30000, pollMs = 1000, stableSamplesRequired = 3 } = {},
 ) {
   const deadline = Date.now() + timeoutMs;
   let lastReason = "stream not found";
+  let stableSamples = 0;
+  let previousFrames = null;
+  let previousRecvBytes = null;
 
   while (Date.now() < deadline) {
     if (bitrateCapGeneration.get(streamKey) !== generation) {
@@ -8674,35 +8677,58 @@ async function waitForSrsRawStreamReady(
     try {
       const stream = await getSrsRawStream(streamKey);
       if (!stream) {
+        stableSamples = 0;
+        previousFrames = null;
+        previousRecvBytes = null;
         lastReason = "raw stream is not actively published in SRS";
       } else {
-        // Real bug found via live testing (2026-08-03): frames/recv_bytes
-        // are CUMULATIVE counters (SRS's total since the connection was
-        // established), not current-rate figures — once a stream has ever
-        // sent any data, these never go back to signaling "stalled",
-        // making this check nearly a no-op for the one case it was built
-        // to catch (a source that's connected but not CURRENTLY
-        // delivering media). Confirmed live: a stalled OBS connection
-        // still showed frames=0/recv_30s=0 for the current window, while
-        // recv_bytes stayed a large positive cumulative total from
-        // earlier — the old check would have called that "ready".
-        // kbps.recv_30s is SRS's own rolling recent-throughput figure —
-        // the correct field for "is this genuinely active right now".
         const recv30s = Number(
           stream.kbps?.recv_30s ?? stream.kbps?.recv30s ?? 0,
         );
-        const activeAge = Number(stream.publish?.active_age || 0);
-        // This API check is only the preliminary publication gate. The
-        // HTTP-FLV byte probe below is authoritative for actual readability,
-        // because SRS counters can lag or remain cumulative across the
-        // subscriber-startup window.
-        const hasMedia =
-          recv30s > 0 || Number(stream.frames || 0) >= 1 || activeAge < 3;
+        const frames = Number(stream.frames || 0);
+        const recvBytes = Number(stream.recv_bytes || 0);
+        const hasVideoMetadata = Boolean(stream.video?.codec);
+        const hasAudioMetadata = Boolean(stream.audio?.codec);
+        const countersAdvanced =
+          previousFrames !== null &&
+          previousRecvBytes !== null &&
+          (frames > previousFrames || recvBytes > previousRecvBytes);
 
-        if (hasMedia) return { ready: true, stream };
-        lastReason = `SRS source is active but not currently delivering media (recv_30s=${recv30s}kbps, active_age=${activeAge}s)`;
+        // Do not treat a newly-created publisher as ready merely because it
+        // exists. FFmpeg needs codec headers plus media that is actively
+        // advancing across several observations. Requiring consecutive
+        // healthy samples removes the first-OBS-session race where SRS had
+        // accepted the publisher but had not yet made a usable keyframe/header
+        // sequence available to RTMP subscribers.
+        const healthySample =
+          hasVideoMetadata &&
+          hasAudioMetadata &&
+          recv30s > 0 &&
+          frames > 0 &&
+          recvBytes > 0 &&
+          countersAdvanced;
+
+        if (healthySample) {
+          stableSamples += 1;
+        } else {
+          stableSamples = 0;
+        }
+
+        previousFrames = frames;
+        previousRecvBytes = recvBytes;
+
+        if (stableSamples >= stableSamplesRequired) {
+          return { ready: true, stream };
+        }
+
+        lastReason =
+          `waiting for stable codec/media samples ` +
+          `(${stableSamples}/${stableSamplesRequired}, recv_30s=${recv30s}kbps, ` +
+          `frames=${frames}, video=${stream.video?.codec || "none"}, ` +
+          `audio=${stream.audio?.codec || "none"})`;
       }
     } catch (err) {
+      stableSamples = 0;
       lastReason = err.message;
     }
 
@@ -8726,7 +8752,7 @@ async function waitForSrsRawStreamReady(
 // Only killing the zombie lets the periodic reconciler notice the rendition
 // is genuinely missing and retry — this function does NOT retry itself, to
 // avoid duplicating that logic.
-const RENDITION_STARTUP_WATCHDOG_MS = 15000;
+const RENDITION_STARTUP_WATCHDOG_MS = 30000;
 const RENDITION_STARTUP_POLL_MS = 2000;
 
 async function watchRenditionStartupOrKill(
@@ -8873,9 +8899,10 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       return;
     }
 
-    // Give SRS a brief moment after publication metadata becomes visible so
-    // the first keyframe/codec headers are available to the RTMP player.
-    await sleep(500);
+    // The readiness gate already observed three consecutive advancing media
+    // samples. Keep a final short buffer so all three rendition subscribers do
+    // not attach on the exact same millisecond.
+    await sleep(1500);
 
     if (bitrateCapGeneration.get(streamKey) !== generation) return;
 
@@ -9061,9 +9088,9 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
 // that could otherwise create downstream HLS/MSE discontinuities.
 const inputResilienceFlags = [
   "-analyzeduration",
-  "3000000",
+  "10000000",
   "-probesize",
-  "1000000",
+  "5000000",
   "-fflags",
   "+genpts+discardcorrupt",
   "-avoid_negative_ts",
@@ -9248,14 +9275,23 @@ function spawnRenditionsForStream(streamKey, renditions, generation) {
   // HTTP-FLV first-subscriber race observed after server/SRS restarts.
   const input = getInternalRtmpSourceUrl(streamKey);
 
-  for (const rendition of renditions) {
-    const output = `rtmp://127.0.0.1/live/${streamKey}_${rendition.label}`;
+  renditions.forEach((rendition, index) => {
+    const output = `rtmp://127.0.0.1:1935/live/${streamKey}_${rendition.label}`;
     const args = buildRenditionFfmpegArgs(streamKey, input, output, rendition);
-    console.log(
-      `[ABR] Starting ${rendition.label} (${rendition.bitrateKbps}kbps, ${rendition.resolution}) for: ${streamKey}`,
-    );
-    spawnFfmpegVariant(rendition.label, streamKey, args, generation);
-  }
+
+    // Stagger subscribers slightly. Starting three RTMP readers at precisely
+    // the same instant was correlated with the first-session startup failure
+    // on this SRS host. Each variant still performs its own readiness check,
+    // lock, watchdog, and retry.
+    const startDelayMs = index * 1250;
+    const timer = setTimeout(() => {
+      console.log(
+        `[ABR] Starting ${rendition.label} (${rendition.bitrateKbps}kbps, ${rendition.resolution}) for: ${streamKey}`,
+      );
+      spawnFfmpegVariant(rendition.label, streamKey, args, generation);
+    }, startDelayMs);
+    timer.unref?.();
+  });
 }
 
 // Periodic ABR reconciliation. This recovers the exact failure mode where a
