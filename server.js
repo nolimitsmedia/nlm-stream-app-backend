@@ -15790,7 +15790,12 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
   try {
     const rawSource = await getSrsRawStream(stream);
     if (!rawSource) {
-      res.setHeader("Cache-Control", "no-store");
+      res.setHeader(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, max-age=0",
+      );
+      res.setHeader("CDN-Cache-Control", "no-store");
+      res.setHeader("Surrogate-Control", "no-store");
       res.setHeader("Retry-After", "2");
       return res.status(503).send("The source broadcast is offline");
     }
@@ -15799,7 +15804,12 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
       `[ABR] Unable to verify raw source before serving master for ${stream}:`,
       error.message,
     );
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, max-age=0",
+    );
+    res.setHeader("CDN-Cache-Control", "no-store");
+    res.setHeader("Surrogate-Control", "no-store");
     res.setHeader("Retry-After", "2");
     return res.status(503).send("Unable to verify source broadcast status");
   }
@@ -15867,7 +15877,12 @@ ${path}${appendBunnyToken(path)}
       stream,
       planned: renditionPlan.map((rendition) => rendition.label),
     });
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, max-age=0",
+    );
+    res.setHeader("CDN-Cache-Control", "no-store");
+    res.setHeader("Surrogate-Control", "no-store");
     res.setHeader("Retry-After", "2");
     return res
       .status(503)
@@ -15875,7 +15890,12 @@ ${path}${appendBunnyToken(path)}
   }
 
   res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, max-age=0",
+  );
+  res.setHeader("CDN-Cache-Control", "no-store");
+  res.setHeader("Surrogate-Control", "no-store");
   return res.send(masterPlaylist);
 });
 

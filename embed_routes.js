@@ -238,6 +238,8 @@ function embedPageHtml(embedToken) {
   var STARTUP_RETRY_DELAYS_MS = [2000, 3000, 4000, 5000, 6000, 8000]; // ~28s total
   var startupRetryCount = 0;
   var startupRetryTimer = null;
+  var RECOVERY_RETRY_DELAY_MS = 10000;
+  var playbackReady = false;
 
   function clearStartupRetry() {
     if (startupRetryTimer) {
@@ -264,6 +266,7 @@ function embedPageHtml(embedToken) {
   }
 
   function showOffline(title, sub) {
+    playbackReady = false;
     videoWrapEl.style.background = "#000";
     offlineEl.classList.remove("hidden");
     badgeEl.style.display = "none";
@@ -293,6 +296,8 @@ function embedPageHtml(embedToken) {
   }
 
   function startPlayback(data) {
+    playbackReady = false;
+
     var manifestPath = data.transcodingEnabled
       ? "/api/abr/" + data.streamKey + "/master.m3u8"
       : "/api/hls/" + data.streamKey + ".m3u8";
@@ -313,6 +318,7 @@ function embedPageHtml(embedToken) {
       hls.loadSource(manifestUrl);
       hls.attachMedia(videoEl);
       hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        playbackReady = true;
         startupRetryCount = 0;
         clearStartupRetry();
         hidePlaybackError();
@@ -320,23 +326,37 @@ function embedPageHtml(embedToken) {
       });
       hls.on(window.Hls.Events.ERROR, function (evt, errData) {
         if (errData && errData.fatal) {
-          // Logged with the real, unmasked manifest URL — some browser
-          // ad-blocking/privacy extensions rewrite third-party hostnames
-          // shown in the Network/Console panels (e.g. to something like
-          // "…io_orrdns") to defeat anti-adblock detection scripts, which
-          // can make a blocked CDN request look like an unrelated 404.
-          // Logging it here from our own code gives the real target.
-          console.warn("[embed] fatal HLS error", errData.type, manifestUrl);
+          // Log the real manifest target and error detail before rebuilding
+          // the player. Destroying the failed HLS instance first prevents
+          // overlapping loaders/listeners during repeated startup recovery.
+          console.warn(
+            "[embed] fatal HLS error",
+            errData.type,
+            errData.details,
+            manifestUrl,
+          );
+
+          if (hls) {
+            try { hls.destroy(); } catch (e) {}
+            hls = null;
+          }
+
           scheduleStartupRetry(data);
         }
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
       // Safari/iOS native HLS
       videoEl.src = manifestUrl;
-      videoEl.addEventListener("error", function () {
+      videoEl.onloadedmetadata = function () {
+        playbackReady = true;
+        startupRetryCount = 0;
+        clearStartupRetry();
+        hidePlaybackError();
+      };
+      videoEl.onerror = function () {
         console.warn("[embed] native HLS playback error", manifestUrl);
         scheduleStartupRetry(data);
-      });
+      };
       if (autoplay) videoEl.play().catch(function () {});
     }
   }
@@ -346,15 +366,29 @@ function embedPageHtml(embedToken) {
   // etc.) once that budget is exhausted, so a normal few-second startup or
   // reconciler-driven recovery window never looks like a broken embed.
   function scheduleStartupRetry(data) {
-    if (startupRetryCount >= STARTUP_RETRY_DELAYS_MS.length) {
+    // Avoid stacking several retry timers when hls.js reports more than one
+    // fatal event for the same failed manifest request.
+    if (startupRetryTimer) return;
+
+    var initialRetry = startupRetryCount < STARTUP_RETRY_DELAYS_MS.length;
+    var delay = initialRetry
+      ? STARTUP_RETRY_DELAYS_MS[startupRetryCount]
+      : RECOVERY_RETRY_DELAY_MS;
+
+    if (initialRetry) {
+      startupRetryCount += 1;
+      showPlaybackError(false);
+    } else {
+      // The initial startup budget is exhausted, but the stream may still
+      // recover later when FFmpeg/SRS finally publishes a rendition. Keep
+      // checking every ten seconds instead of getting permanently stuck.
       showPlaybackError(true);
-      return;
     }
-    showPlaybackError(false);
-    var delay = STARTUP_RETRY_DELAYS_MS[startupRetryCount];
-    startupRetryCount += 1;
-    clearStartupRetry();
+
     startupRetryTimer = setTimeout(function () {
+      startupRetryTimer = null;
+
+      if (!wasLive || playbackReady) return;
       startPlayback(data);
     }, delay);
   }
