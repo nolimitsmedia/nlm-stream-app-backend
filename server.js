@@ -8756,13 +8756,13 @@ async function getSrsRawStream(streamKey) {
 async function waitForSrsRawStreamReady(
   streamKey,
   generation,
-  { timeoutMs = 30000, pollMs = 1000, stableSamplesRequired = 3 } = {},
+  { timeoutMs = 30000, pollMs = 1000 } = {},
 ) {
   const deadline = Date.now() + timeoutMs;
   let lastReason = "stream not found";
-  let stableSamples = 0;
   let previousFrames = null;
   let previousRecvBytes = null;
+  let observedAdvancement = false;
 
   while (Date.now() < deadline) {
     if (bitrateCapGeneration.get(streamKey) !== generation) {
@@ -8775,10 +8775,11 @@ async function waitForSrsRawStreamReady(
 
     try {
       const stream = await getSrsRawStream(streamKey);
+
       if (!stream) {
-        stableSamples = 0;
         previousFrames = null;
         previousRecvBytes = null;
+        observedAdvancement = false;
         lastReason = "raw stream is not actively published in SRS";
       } else {
         const recv30s = Number(
@@ -8788,46 +8789,42 @@ async function waitForSrsRawStreamReady(
         const recvBytes = Number(stream.recv_bytes || 0);
         const hasVideoMetadata = Boolean(stream.video?.codec);
         const hasAudioMetadata = Boolean(stream.audio?.codec);
-        const countersAdvanced =
+
+        if (
           previousFrames !== null &&
           previousRecvBytes !== null &&
-          (frames > previousFrames || recvBytes > previousRecvBytes);
-
-        // Do not treat a newly-created publisher as ready merely because it
-        // exists. FFmpeg needs codec headers plus media that is actively
-        // advancing across several observations. Requiring consecutive
-        // healthy samples removes the first-OBS-session race where SRS had
-        // accepted the publisher but had not yet made a usable keyframe/header
-        // sequence available to RTMP subscribers.
-        const healthySample =
-          hasVideoMetadata &&
-          hasAudioMetadata &&
-          recv30s > 0 &&
-          frames > 0 &&
-          recvBytes > 0 &&
-          countersAdvanced;
-
-        if (healthySample) {
-          stableSamples += 1;
-        } else {
-          stableSamples = 0;
+          (frames > previousFrames || recvBytes > previousRecvBytes)
+        ) {
+          observedAdvancement = true;
         }
 
         previousFrames = frames;
         previousRecvBytes = recvBytes;
 
-        if (stableSamples >= stableSamplesRequired) {
+        // SRS does not guarantee that its public counters refresh on every
+        // one-second API poll. Requiring three consecutive counter increases
+        // can therefore keep a healthy OBS source blocked forever. Instead,
+        // require valid codec metadata, non-zero media counters/bitrate, and
+        // at least one observed advancement during this readiness window.
+        const mediaReady =
+          hasVideoMetadata &&
+          hasAudioMetadata &&
+          recv30s > 0 &&
+          frames > 0 &&
+          recvBytes > 0 &&
+          observedAdvancement;
+
+        if (mediaReady) {
           return { ready: true, stream };
         }
 
         lastReason =
-          `waiting for stable codec/media samples ` +
-          `(${stableSamples}/${stableSamplesRequired}, recv_30s=${recv30s}kbps, ` +
+          `waiting for usable codec/media sample ` +
+          `(advanced=${observedAdvancement}, recv_30s=${recv30s}kbps, ` +
           `frames=${frames}, video=${stream.video?.codec || "none"}, ` +
           `audio=${stream.audio?.codec || "none"})`;
       }
     } catch (err) {
-      stableSamples = 0;
       lastReason = err.message;
     }
 
