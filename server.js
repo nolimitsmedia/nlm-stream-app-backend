@@ -4322,6 +4322,159 @@ app.get(
 );
 
 // ══════════════════════════════════════════
+// SUPER ADMIN DASHBOARD — trend history (Platform Overview graphs)
+// A periodic snapshot job, separate from the live getServerStatusSnapshot()
+// above — that one only ever answers "right now"; this is what lets the
+// dashboard show a trend line instead of a single current-moment gauge.
+// ══════════════════════════════════════════
+async function ensureServerMetricsHistoryTable(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS server_metrics_history (
+      id SERIAL PRIMARY KEY,
+      recorded_at TIMESTAMPTZ DEFAULT NOW(),
+      cpu_percent INTEGER,
+      mem_used_percent INTEGER,
+      disk_used_percent INTEGER,
+      live_stream_count INTEGER,
+      live_viewer_count INTEGER,
+      incoming_kbps INTEGER
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_server_metrics_history_recorded_at
+    ON server_metrics_history (recorded_at)
+  `);
+}
+
+const SERVER_METRICS_COLLECTION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const SERVER_METRICS_RETENTION_DAYS = 30;
+
+async function collectServerMetricsSnapshot() {
+  try {
+    const status = getServerStatusSnapshot();
+    // Same formula the dashboard frontend already uses for the CPU gauge —
+    // computed here too so the stored history matches what a viewer sees
+    // live, rather than drifting from load-average alone.
+    const cpuPercent = Math.min(
+      100,
+      Math.round(
+        ((status.load_avg?.["1m"] || 0) / (status.cpu_count || 1)) * 100,
+      ),
+    );
+
+    // Live stream count + incoming bitrate, straight from SRS — mirrors
+    // getActiveStreamsSnapshot()'s approach (channel-scoped, not raw SRS
+    // noise) without paying for a full per-stream viewer-metrics lookup on
+    // every 5-minute tick.
+    let liveStreamCount = 0;
+    let incomingKbps = 0;
+    try {
+      const channelsResult = await pool.query(
+        `SELECT stream_key FROM channels`,
+      );
+      const knownStreamKeys = new Set(
+        channelsResult.rows.map((row) => String(row.stream_key)),
+      );
+      const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (srsResponse.ok) {
+        const srsData = await srsResponse.json();
+        const active = (srsData.streams || []).filter(
+          (s) => s.publish?.active && knownStreamKeys.has(s.name),
+        );
+        liveStreamCount = active.length;
+        incomingKbps = active.reduce(
+          (sum, s) => sum + Number(s.kbps?.recv_30s || 0),
+          0,
+        );
+      }
+    } catch (srsError) {
+      console.warn(
+        "Server metrics snapshot: SRS unavailable:",
+        srsError.message,
+      );
+    }
+
+    // Platform-wide concurrent viewers — same 45-second "active" window
+    // used everywhere else viewer counts are computed, so this stays
+    // consistent with what the rest of the dashboard already shows.
+    let liveViewerCount = 0;
+    try {
+      const viewerResult = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM viewer_sessions
+         WHERE ended_at IS NULL AND last_seen_at >= NOW() - INTERVAL '45 seconds'`,
+      );
+      liveViewerCount = viewerResult.rows[0]?.count || 0;
+    } catch (viewerError) {
+      console.warn(
+        "Server metrics snapshot: viewer count query failed:",
+        viewerError.message,
+      );
+    }
+
+    await pool.query(
+      `INSERT INTO server_metrics_history
+         (cpu_percent, mem_used_percent, disk_used_percent, live_stream_count, live_viewer_count, incoming_kbps)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        cpuPercent,
+        status.memory?.used_percent ?? null,
+        status.disk?.used_percent ?? null,
+        liveStreamCount,
+        liveViewerCount,
+        Math.round(incomingKbps),
+      ],
+    );
+
+    // Prune in the same tick rather than a separate cron — cheap at this
+    // volume (one row per 5 minutes) and keeps retention self-contained.
+    await pool.query(
+      `DELETE FROM server_metrics_history
+       WHERE recorded_at < NOW() - INTERVAL '${SERVER_METRICS_RETENTION_DAYS} days'`,
+    );
+  } catch (error) {
+    console.error("collectServerMetricsSnapshot failed:", error.message);
+  }
+}
+
+app.get(
+  "/api/admin/server-metrics-history",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const rangeParam = String(req.query.range || "24h");
+      const rangeInterval =
+        rangeParam === "7d"
+          ? "7 days"
+          : rangeParam === "30d"
+            ? "30 days"
+            : "24 hours";
+
+      const result = await pool.query(
+        `SELECT recorded_at, cpu_percent, mem_used_percent, disk_used_percent,
+                live_stream_count, live_viewer_count, incoming_kbps
+         FROM server_metrics_history
+         WHERE recorded_at >= NOW() - INTERVAL '${rangeInterval}'
+         ORDER BY recorded_at ASC`,
+      );
+
+      res.json({ ok: true, range: rangeParam, points: result.rows });
+    } catch (error) {
+      console.error("Get server metrics history error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load server metrics history",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
 // FEATURE FLAGS
 // Read: any authenticated user, since the app's own UI needs to know
 // current flag states to decide what to render.
@@ -17149,6 +17302,7 @@ app.delete(
   await ensureNotificationPreferencesTable();
   await ensureSocialOAuthTables(pool);
   await ensureRestartAuditTable();
+  await ensureServerMetricsHistoryTable(pool);
   await embedRoutes.ensureEmbedColumns(pool); // Phase 1 — embed_token/embed_settings columns
 })()
   .then(() => {
@@ -17171,6 +17325,15 @@ app.delete(
 
     // Bitrate compliance monitor — see pollBitrateCompliance() above.
     setInterval(pollBitrateCompliance, BITRATE_POLL_INTERVAL_MS);
+
+    // Server metrics trend history — see collectServerMetricsSnapshot()
+    // above. Runs once shortly after startup so the dashboard has at least
+    // one data point immediately, then on its own interval.
+    setTimeout(collectServerMetricsSnapshot, 15000);
+    setInterval(
+      collectServerMetricsSnapshot,
+      SERVER_METRICS_COLLECTION_INTERVAL_MS,
+    );
 
     // ABR self-healing: recover any live raw source that is missing one or
     // more plan-required rendition processes. Run shortly after startup and
