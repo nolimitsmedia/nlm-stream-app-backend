@@ -382,6 +382,15 @@ function embedPageHtml(embedToken) {
     var manifestPath = data.transcodingEnabled
       ? "/api/abr/" + data.streamKey + "/master.m3u8"
       : "/api/hls/" + data.streamKey + ".m3u8";
+    // NOTE: this ".replace(/\\/$/, ...)" needs TWO backslashes here in the
+    // source, not one. This whole function body is a JS template literal —
+    // "\/" is not a real escape sequence, so a single backslash silently
+    // vanishes during template-literal parsing, turning the regex into
+    // "//$/" — a JS line comment — which breaks the entire client script's
+    // syntax (confirmed live 2026-08-07, "Unexpected token 'var'", 3x in a
+    // row from this exact line being "simplified" back to one backslash).
+    // If you're reading this because it looks like a typo: it isn't — leave
+    // the double backslash as-is.
     var origin = (data.hlsBaseUrl || window.location.origin).replace(/\\/$/, "");
     var manifestUrl = origin + manifestPath + (data.hlsAuthQs || "");
 
