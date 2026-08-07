@@ -39,7 +39,10 @@ const crypto = require("crypto");
 // production embed link should live on a different host/CDN zone than the
 // general API base.
 const EMBED_PLAYER_HOST =
-  process.env.EMBED_PLAYER_HOST || process.env.API_PUBLIC_URL || "";
+  process.env.EMBED_PLAYER_HOST ||
+  process.env.CLIENT_URL ||
+  process.env.API_PUBLIC_URL ||
+  "";
 
 // 32 URL-safe characters (base64url of 24 random bytes) — long enough to be
 // unguessable, short enough to paste into a query string without fuss.
@@ -382,16 +385,7 @@ function embedPageHtml(embedToken) {
     var manifestPath = data.transcodingEnabled
       ? "/api/abr/" + data.streamKey + "/master.m3u8"
       : "/api/hls/" + data.streamKey + ".m3u8";
-    // NOTE: this ".replace(/\\/$/, ...)" needs TWO backslashes here in the
-    // source, not one. This whole function body is a JS template literal —
-    // "\/" is not a real escape sequence, so a single backslash silently
-    // vanishes during template-literal parsing, turning the regex into
-    // "//$/" — a JS line comment — which breaks the entire client script's
-    // syntax (confirmed live 2026-08-07, "Unexpected token 'var'", 3x in a
-    // row from this exact line being "simplified" back to one backslash).
-    // If you're reading this because it looks like a typo: it isn't — leave
-    // the double backslash as-is.
-    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\\/$/, "");
+    var origin = (data.hlsBaseUrl || window.location.origin).replace(/\/$/, "");
     var manifestUrl = origin + manifestPath + (data.hlsAuthQs || "");
 
     var autoplay = boolParam(
@@ -892,6 +886,27 @@ module.exports = {
             .send(shellHtml("This stream embed could not be found."));
         }
 
+        const frontendEmbedUrl = buildEmbedUrl(embedToken);
+        const apiBase = String(process.env.API_PUBLIC_URL || "").replace(
+          /\/$/,
+          "",
+        );
+        const frontendBase = String(EMBED_PLAYER_HOST || "").replace(/\/$/, "");
+
+        // Preserve legacy iframe links that still point to api.nolimitsmedia.com.
+        // Once EMBED_PLAYER_HOST/CLIENT_URL points at the React deployment,
+        // redirect those links to the dedicated EmbedPlayer component while
+        // retaining autoplay/muted/controls/chat query parameters.
+        if (frontendBase && frontendBase !== apiBase) {
+          const query = new URLSearchParams(req.query || {}).toString();
+          return res.redirect(
+            302,
+            `${frontendEmbedUrl}${query ? `?${query}` : ""}`,
+          );
+        }
+
+        // Development/fallback mode: keep the existing inline player available
+        // when no separate frontend embed host has been configured.
         res.send(embedPageHtml(embedToken));
       } catch (error) {
         console.error("Embed Page Error:", error);
