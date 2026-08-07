@@ -102,13 +102,12 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
-// Internal live-source URL used by FFmpeg consumers. Local RTMP is the
-// authoritative source path for ABR transcoding. Production testing showed
-// that the first HTTP-FLV subscriber after an SRS/server restart can connect
-// but receive zero bytes until the broadcaster reconnects, while local RTMP
-// delivers H.264/AAC immediately on the first OBS session.
-const SRS_RTMP_BASE_URL =
-  process.env.SRS_RTMP_BASE_URL || "rtmp://127.0.0.1:1935";
+// Internal SRS endpoints. RTMP remains the publish/output transport for
+// encoded renditions, while FFmpeg consumers read the raw broadcast through
+// SRS's local HLS endpoint. Live production testing on 2026-08-07 confirmed
+// that local/public RTMP playback can complete the TCP/RTMP connection yet
+// deliver no media frames, while the raw SRS HLS feed immediately exposes
+// healthy H.264/AAC media to ffprobe/FFmpeg.
 const SRS_INTERNAL_HLS_BASE_URL =
   process.env.SRS_INTERNAL_HLS_BASE_URL || "http://127.0.0.1:8080";
 const API_PUBLIC_URL = process.env.API_PUBLIC_URL || `http://localhost:${PORT}`;
@@ -8835,10 +8834,11 @@ async function waitForSrsRawStreamReady(
 }
 
 // SRS may fire on_publish before codec metadata and the first keyframe are
-// fully available. waitForSrsRawStreamReady() is the startup gate; FFmpeg then
-// reads directly from local RTMP, which was verified to work on the first OBS
-// session after SRS/server restarts. No short-lived HTTP-FLV subscriber probe
-// is used here because that probe itself was the first-start failure mode.
+// fully available. waitForSrsRawStreamReady() remains the startup gate; FFmpeg
+// then reads the raw broadcast from SRS's local HLS endpoint. This avoids the
+// production failure where RTMP playback connected successfully but delivered
+// no media frames, while keeping readiness tied to the authoritative SRS
+// publisher state rather than merely trusting the database flag.
 
 // Detects an ffmpeg process that spawned successfully but never actually
 // starts publishing to SRS — the exact failure mode found 2026-08-05: three
@@ -9024,7 +9024,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         : "";
 
     console.log(
-      `[Transcode] Spawning ${label} for ${streamKey} with RTMP input ` +
+      `[Transcode] Spawning ${label} for ${streamKey} with media input ` +
         `${JSON.stringify(configuredInput)}.`,
     );
 
@@ -9193,7 +9193,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   }
 };
 
-// Input-side resilience for the local RTMP source. +genpts/discardcorrupt and
+// Input-side resilience for the local SRS HLS source. +genpts/discardcorrupt and
 // avoid_negative_ts guard against timestamp irregularities inherited from OBS
 // that could otherwise create downstream HLS/MSE discontinuities.
 //
@@ -9383,23 +9383,24 @@ function buildRenditionFfmpegArgs(
   ];
 }
 
-function getInternalRtmpSourceUrl(streamKey) {
+function getInternalHlsSourceUrl(streamKey) {
   return (
-    `${SRS_RTMP_BASE_URL.replace(/\/$/, "")}/live/` +
-    `${encodeURIComponent(streamKey)}`
+    `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(streamKey)}.m3u8`
   );
 }
 
 function spawnRenditionsForStream(streamKey, renditions, generation) {
-  // Consume the raw source directly over local RTMP. This avoids the SRS
-  // HTTP-FLV first-subscriber race observed after server/SRS restarts.
-  const input = getInternalRtmpSourceUrl(streamKey);
+  // Consume the raw source through SRS's local HLS endpoint. Production
+  // verification showed this path immediately exposes valid H.264/AAC media,
+  // while local RTMP playback can connect yet remain frame-starved indefinitely.
+  const input = getInternalHlsSourceUrl(streamKey);
 
   renditions.forEach((rendition, index) => {
     const output = `rtmp://127.0.0.1:1935/live/${streamKey}_${rendition.label}`;
     const args = buildRenditionFfmpegArgs(streamKey, input, output, rendition);
 
-    // Stagger subscribers slightly. Starting three RTMP readers at precisely
+    // Stagger subscribers slightly. Starting three HLS readers at precisely
     // the same instant was correlated with the first-session startup failure
     // on this SRS host. Each variant still performs its own readiness check,
     // lock, watchdog, and retry.
@@ -9484,7 +9485,7 @@ async function reconcileAbrTranscoders() {
         // missing rendition instead of inheriting a previously exhausted one.
         transcodeRetryCount.delete(retryKey);
 
-        const input = getInternalRtmpSourceUrl(streamKey);
+        const input = getInternalHlsSourceUrl(streamKey);
         const output = `rtmp://127.0.0.1:1935/live/${streamKey}_${rendition.label}`;
         const args = buildRenditionFfmpegArgs(
           streamKey,
@@ -9514,7 +9515,8 @@ async function reconcileAbrTranscoders() {
 //
 // Deliberately does NOT track/kill the spawned ffmpeg process explicitly:
 // like the existing 720p/480p auto-transcode above, ffmpeg reading from
-// a live RTMP source exits on its own once that source disconnects
+// the live source exits/retries through shared lifecycle handling once the source
+// disconnects or its HLS input becomes unavailable.
 // (on_unpublish), so no separate process-lifecycle management is needed.
 //
 // SAFETY FALLBACK: before spawning a new transcode, checks current server
@@ -11921,7 +11923,7 @@ app.post(
 
       const platformConfig = SOCIAL_PLATFORMS[destination.platform];
       const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
-      const sourceUrl = getInternalRtmpSourceUrl(channel.stream_key);
+      const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
 
       const proc = spawn("ffmpeg", [
         "-i",
@@ -12091,7 +12093,7 @@ app.post(
           .json({ ok: false, message: "Connected account not found" });
       }
 
-      const sourceUrl = getInternalRtmpSourceUrl(channel.stream_key);
+      const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
       let destinationUrl, platformBroadcastId, platformStreamId;
 
       if (destination.platform === "facebook") {
@@ -15552,8 +15554,8 @@ app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Use the same verified local RTMP source path as automatic ABR.
-    const input = getInternalRtmpSourceUrl(stream);
+    // Use the same verified local SRS HLS source path as automatic ABR.
+    const input = getInternalHlsSourceUrl(stream);
     const output720 = `rtmp://127.0.0.1/live/${stream}_720p`;
     const output480 = `rtmp://127.0.0.1/live/${stream}_480p`;
 
