@@ -78,6 +78,7 @@ const queryWithRetry = async (text, params = [], options = {}) => {
 const { ensureSocialOAuthTables } = require("./social_oauth_schema");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
+const { clear } = require("console");
 
 // Tracks which organization (if any) the current request is scoped to,
 // so errors logged deep inside async route handlers can still be tagged
@@ -230,6 +231,31 @@ app.use((req, res, next) => {
   if (req.path.startsWith("/api/")) {
     res.setHeader("Cache-Control", "no-store, private");
   }
+  next();
+});
+
+// ══════════════════════════════════════════
+// SECURITY HEADERS
+// Deliberately does NOT set X-Frame-Options or a frame-ancestors CSP
+// directive anywhere in this app — the embed player (see embed_routes.js
+// and /embed/:token) is specifically designed to be iframed on arbitrary
+// third-party client websites; a blanket frame-blocking header here would
+// break that feature entirely, not just harden something. If a
+// frame-blocking policy is ever wanted for the dashboard/admin surface
+// specifically, that belongs on the frontend's own static hosting config
+// (DirectAdmin/nginx), not here — this backend can't tell "a dashboard
+// request" from "an embed request" at this generic response-header layer.
+// HSTS deliberately omits includeSubDomains — not every subdomain under
+// nolimitsmedia.com has been confirmed HTTPS-ready; safe to add later
+// once that's verified for all of them at once.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()",
+  );
   next();
 });
 
