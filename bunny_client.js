@@ -27,6 +27,17 @@ const BUNNY_ORIGIN_URL = process.env.BUNNY_ORIGIN_URL || "";
 // that same region for consistency unless told otherwise.
 const BUNNY_STORAGE_ZONE_REGION = process.env.BUNNY_STORAGE_ZONE_REGION || "NY";
 
+// The single platform-wide key server.js's signBunnyUrlPath()/
+// appendBunnyToken() already sign every HLS/ABR URL with. Every zone this
+// module provisions gets its own real Token Authentication key FORCED to
+// equal this value (via resetSecurityKey below) — rather than storing a
+// different auto-generated key per organization and rewriting the signing
+// code to look one up per request, every zone's actual key simply matches
+// the one value already used everywhere. Must be the exact same env var
+// server.js reads (BUNNY_HLS_TOKEN_KEY) or signed URLs will validate
+// against the wrong key.
+const BUNNY_HLS_TOKEN_KEY = process.env.BUNNY_HLS_TOKEN_KEY || "";
+
 const isBunnyAccountConfigured = () => Boolean(BUNNY_ACCOUNT_API_KEY);
 
 const callBunnyApi = async (method, path, body) => {
@@ -59,6 +70,44 @@ const callBunnyApi = async (method, path, body) => {
   return data;
 };
 
+// Enables Token Authentication on an existing pull zone and forces its
+// real security key to equal our single platform-wide BUNNY_HLS_TOKEN_KEY
+// — this is what makes Token Authentication enforcement compatible with
+// the existing single-shared-key signing code in server.js without
+// needing to touch that code, store a different key per organization, or
+// look one up per request.
+//
+// Real incident, 2026-08-08: an auto-provisioned zone (nlm-one-church)
+// was found via a live unsigned-request test to be serving live HLS
+// manifests AND video segments with ZERO authentication — every zone
+// createPullZoneForOrganization() created before this fix had the exact
+// same gap, since Token Authentication defaults to OFF on a brand-new
+// Bunny pull zone and was never explicitly turned on here.
+//
+// NOTE: field names below (ZoneSecurityEnabled on the update call,
+// SecurityKey on resetSecurityKey) are the best-identified match for
+// Bunny's current API shape — NOT yet confirmed against a real response
+// from this account, consistent with the same caveat already given for
+// createPullZoneForOrganization() below. After running this, verify in
+// the Bunny dashboard (Pull Zone -> Security -> Token authentication)
+// that it actually shows ON with the expected key before trusting it for
+// a bulk backfill across every existing organization.
+const enableTokenAuthForPullZone = async (pullZoneId) => {
+  if (!BUNNY_HLS_TOKEN_KEY) {
+    throw new Error(
+      "BUNNY_HLS_TOKEN_KEY is not configured — refusing to enable Token Authentication with no key to set it to (that would just break playback for this zone)",
+    );
+  }
+
+  await callBunnyApi("POST", `/pullzone/${pullZoneId}`, {
+    ZoneSecurityEnabled: true,
+  });
+
+  await callBunnyApi("POST", `/pullzone/${pullZoneId}/resetSecurityKey`, {
+    SecurityKey: BUNNY_HLS_TOKEN_KEY,
+  });
+};
+
 // Creates a new Pull Zone for an organization's live HLS delivery. Returns
 // the zone's id and its default CDN hostname ({name}.b-cdn.net).
 //
@@ -81,6 +130,15 @@ const createPullZoneForOrganization = async (orgSlug) => {
     OriginUrl: BUNNY_ORIGIN_URL,
     Type: 0, // 0 = Standard/Premium tier pull zone
   });
+
+  // Every new zone MUST have Token Authentication enabled before it's
+  // handed back — otherwise its HLS manifests/segments are fetchable by
+  // anyone who knows or guesses the org's stream key, completely
+  // bypassing signed-URL playback gating. See enableTokenAuthForPullZone
+  // above for the real incident this fixes. Deliberately NOT caught here
+  // — if this fails, provisioning should fail loudly rather than hand
+  // back an org with a silently unprotected pull zone.
+  await enableTokenAuthForPullZone(result.Id);
 
   return {
     pullZoneId: result.Id,
@@ -182,6 +240,7 @@ module.exports = {
   provisionBunnyZonesForOrganization,
   createPullZoneForOrganization,
   createStorageZoneForOrganization,
+  enableTokenAuthForPullZone,
   getPullZoneStatistics,
   getTotalBandwidthUsedBytes,
 };
