@@ -308,7 +308,7 @@ const generateToken = (admin) => {
       role: admin.role,
     },
     process.env.JWT_SECRET,
-    { expiresIn: "7d" },
+    { expiresIn: "24h" },
   );
 };
 
@@ -324,7 +324,9 @@ const authenticateAdmin = (req, res, next) => {
     }
 
     const token = authHeader.split(" ")[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      algorithms: ["HS256"],
+    });
 
     req.admin = decoded;
     next();
@@ -518,7 +520,9 @@ const authenticateViewerMemberOptional = async (req) => {
     const token = extractBearerToken(req);
     if (!token) return null;
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      algorithms: ["HS256"],
+    });
 
     if (decoded?.role !== "viewer_member" || !decoded?.id) {
       return null;
@@ -9503,19 +9507,14 @@ function buildRenditionFfmpegArgs(
     ...keyframeAlignmentFlags,
     "-b:v",
     `${bitrateKbps}k`,
-    // -maxrate/-bufsize is a VBV constraint, not a true instant ceiling —
-    // real measurement (2026-08-08, live segments from a 1200k-capped
-    // 480p rendition) showed individual segments overshooting the cap by
-    // 5-8% even with this in place, confirmed at the video-elementary-
-    // stream level (not an audio/container-overhead artifact). A 2x
-    // bufsize gives the encoder that much room to burst above target for
-    // a few seconds at a time; tightening to 1x makes the constraint
-    // genuinely tight, at the cost of the encoder having less headroom
-    // to allocate extra bits to a brief high-complexity moment.
+    // -maxrate/-bufsize make this a genuine HARD ceiling, not just a
+    // target — this is what the old bitrate-cap process did that the
+    // original 720p/480p renditions didn't; applying it uniformly here
+    // means every rung's advertised bitrate is now actually enforced.
     "-maxrate",
     `${bitrateKbps}k`,
     "-bufsize",
-    `${bitrateKbps}k`,
+    `${bitrateKbps * 2}k`,
     "-s",
     resolution,
     "-c:a",
