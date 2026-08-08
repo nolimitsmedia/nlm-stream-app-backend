@@ -271,6 +271,34 @@ const publicEngagementLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+// Viewer/member account auth — was completely unprotected despite being a
+// real login/registration surface (admin login already had loginLimiter;
+// this brings public member auth in line with that, not a new pattern).
+const memberAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: {
+    ok: false,
+    message: "Too many attempts. Please try again in a few minutes.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+// Status-polling endpoints — legitimately hit every few seconds by every
+// active player (see POLL_WHEN_LIVE_MS/heartbeat intervals elsewhere in
+// this file). Deliberately much more generous than publicEngagementLimiter
+// (a per-user-action limiter) so several real viewers behind the same
+// office/NAT IP don't get falsely throttled just for watching.
+const statusPollLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,
+  message: {
+    ok: false,
+    message: "Too many requests. Please slow down.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 app.use(express.json());
 
@@ -623,45 +651,48 @@ const getOrganizationIdFromReplaySlug = async (slug) => {
   return result.rows[0]?.organization_id || null;
 };
 
-app.post("/api/public/members/register", async (req, res) => {
-  try {
-    const name = cleanOrgText(req.body?.name || "", 255);
-    const email = cleanOrgText(req.body?.email || "", 255).toLowerCase();
-    const password = String(req.body?.password || "");
-    const replaySlug = cleanOrgText(req.body?.replay_slug || "", 255);
-    const requestedOrg = req.body?.organization_id
-      ? Number(req.body.organization_id)
-      : null;
+app.post(
+  "/api/public/members/register",
+  memberAuthLimiter,
+  async (req, res) => {
+    try {
+      const name = cleanOrgText(req.body?.name || "", 255);
+      const email = cleanOrgText(req.body?.email || "", 255).toLowerCase();
+      const password = String(req.body?.password || "");
+      const replaySlug = cleanOrgText(req.body?.replay_slug || "", 255);
+      const requestedOrg = req.body?.organization_id
+        ? Number(req.body.organization_id)
+        : null;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({
-        ok: false,
-        message: "Name, email, and password are required.",
-      });
-    }
+      if (!name || !email || !password) {
+        return res.status(400).json({
+          ok: false,
+          message: "Name, email, and password are required.",
+        });
+      }
 
-    if (password.length < 6) {
-      return res.status(400).json({
-        ok: false,
-        message: "Password must be at least 6 characters.",
-      });
-    }
+      if (password.length < 6) {
+        return res.status(400).json({
+          ok: false,
+          message: "Password must be at least 6 characters.",
+        });
+      }
 
-    const organizationId =
-      requestedOrg ||
-      (replaySlug ? await getOrganizationIdFromReplaySlug(replaySlug) : null);
+      const organizationId =
+        requestedOrg ||
+        (replaySlug ? await getOrganizationIdFromReplaySlug(replaySlug) : null);
 
-    if (!organizationId) {
-      return res.status(400).json({
-        ok: false,
-        message: "Unable to determine organization for this member account.",
-      });
-    }
+      if (!organizationId) {
+        return res.status(400).json({
+          ok: false,
+          message: "Unable to determine organization for this member account.",
+        });
+      }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+      const passwordHash = await bcrypt.hash(password, 10);
 
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       INSERT INTO replay_viewer_members (
         organization_id,
         name,
@@ -672,31 +703,32 @@ app.post("/api/public/members/register", async (req, res) => {
       VALUES ($1, $2, $3, $4, 'active')
       RETURNING id, organization_id, name, email, status, created_at
       `,
-      [organizationId, name, email, passwordHash],
-    );
+        [organizationId, name, email, passwordHash],
+      );
 
-    const viewer = result.rows[0];
-    const token = generateViewerToken(viewer);
+      const viewer = result.rows[0];
+      const token = generateViewerToken(viewer);
 
-    res.json({ ok: true, viewer, token });
-  } catch (error) {
-    if (error.code === "23505") {
-      return res.status(409).json({
+      res.json({ ok: true, viewer, token });
+    } catch (error) {
+      if (error.code === "23505") {
+        return res.status(409).json({
+          ok: false,
+          message: "A member account already exists for this email.",
+        });
+      }
+
+      console.error("Member register error:", error);
+      res.status(500).json({
         ok: false,
-        message: "A member account already exists for this email.",
+        message: "Failed to register member account.",
+        error: error.message,
       });
     }
+  },
+);
 
-    console.error("Member register error:", error);
-    res.status(500).json({
-      ok: false,
-      message: "Failed to register member account.",
-      error: error.message,
-    });
-  }
-});
-
-app.post("/api/public/members/login", async (req, res) => {
+app.post("/api/public/members/login", memberAuthLimiter, async (req, res) => {
   try {
     const email = cleanOrgText(req.body?.email || "", 255).toLowerCase();
     const password = String(req.body?.password || "");
@@ -5736,36 +5768,39 @@ const closeStaleViewerSessions = async () => {
   `);
 };
 
-app.post("/api/public/viewers/start", async (req, res) => {
-  try {
-    const streamKey = cleanOrgText(req.body.stream_key, 255);
-    const viewerId =
-      cleanOrgText(req.body.viewer_id, 255) || makeSessionToken();
+app.post(
+  "/api/public/viewers/start",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const streamKey = cleanOrgText(req.body.stream_key, 255);
+      const viewerId =
+        cleanOrgText(req.body.viewer_id, 255) || makeSessionToken();
 
-    if (!streamKey) {
-      return res.status(400).json({
-        ok: false,
-        message: "Stream key is required",
-      });
-    }
+      if (!streamKey) {
+        return res.status(400).json({
+          ok: false,
+          message: "Stream key is required",
+        });
+      }
 
-    await closeStaleViewerSessions();
+      await closeStaleViewerSessions();
 
-    const organizationId = await getOrganizationIdForStreamKey(streamKey);
-    const userAgent = req.headers["user-agent"] || null;
-    const referrer = req.headers.referer || req.headers.referrer || null;
-    const ipAddress = getRequestIpAddress(req);
-    const deviceInfo = getDeviceInfoFromUserAgent(userAgent);
-    const countryCode = getRequestCountryCode(req, ipAddress);
-    const countryName = getCountryNameFromCode(countryCode);
+      const organizationId = await getOrganizationIdForStreamKey(streamKey);
+      const userAgent = req.headers["user-agent"] || null;
+      const referrer = req.headers.referer || req.headers.referrer || null;
+      const ipAddress = getRequestIpAddress(req);
+      const deviceInfo = getDeviceInfoFromUserAgent(userAgent);
+      const countryCode = getRequestCountryCode(req, ipAddress);
+      const countryName = getCountryNameFromCode(countryCode);
 
-    /*
-     * Reuse only a currently-active browser-tab session.
-     * Do not revive old ended/inactive rows because that can inflate watch time
-     * after a stream stops, a test reset runs, or a viewer returns much later.
-     */
-    const existingSession = await pool.query(
-      `
+      /*
+       * Reuse only a currently-active browser-tab session.
+       * Do not revive old ended/inactive rows because that can inflate watch time
+       * after a stream stops, a test reset runs, or a viewer returns much later.
+       */
+      const existingSession = await pool.query(
+        `
       SELECT *
       FROM viewer_sessions
       WHERE stream_key = $1
@@ -5776,14 +5811,14 @@ app.post("/api/public/viewers/start", async (req, res) => {
       ORDER BY last_seen_at DESC
       LIMIT 1
       `,
-      [streamKey, viewerId, organizationId],
-    );
+        [streamKey, viewerId, organizationId],
+      );
 
-    let session = existingSession.rows[0];
+      let session = existingSession.rows[0];
 
-    if (session) {
-      const refreshedSession = await pool.query(
-        `
+      if (session) {
+        const refreshedSession = await pool.query(
+          `
         UPDATE viewer_sessions
         SET last_seen_at = NOW(),
             ended_at = NULL,
@@ -5799,25 +5834,25 @@ app.post("/api/public/viewers/start", async (req, res) => {
         WHERE id = $1
         RETURNING *
         `,
-        [
-          session.id,
-          ipAddress,
-          userAgent,
-          referrer,
-          deviceInfo.deviceType,
-          deviceInfo.browserName,
-          deviceInfo.osName,
-          countryCode,
-          countryName,
-        ],
-      );
+          [
+            session.id,
+            ipAddress,
+            userAgent,
+            referrer,
+            deviceInfo.deviceType,
+            deviceInfo.browserName,
+            deviceInfo.osName,
+            countryCode,
+            countryName,
+          ],
+        );
 
-      session = refreshedSession.rows[0];
-    } else {
-      const sessionToken = makeSessionToken();
+        session = refreshedSession.rows[0];
+      } else {
+        const sessionToken = makeSessionToken();
 
-      const result = await pool.query(
-        `
+        const result = await pool.query(
+          `
         INSERT INTO viewer_sessions (
           organization_id,
           stream_key,
@@ -5835,68 +5870,74 @@ app.post("/api/public/viewers/start", async (req, res) => {
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING *
         `,
-        [
-          organizationId,
-          streamKey,
-          viewerId,
-          sessionToken,
-          ipAddress,
-          userAgent,
-          referrer,
-          deviceInfo.deviceType,
-          deviceInfo.browserName,
-          deviceInfo.osName,
-          countryCode,
-          countryName,
-        ],
+          [
+            organizationId,
+            streamKey,
+            viewerId,
+            sessionToken,
+            ipAddress,
+            userAgent,
+            referrer,
+            deviceInfo.deviceType,
+            deviceInfo.browserName,
+            deviceInfo.osName,
+            countryCode,
+            countryName,
+          ],
+        );
+
+        session = result.rows[0];
+      }
+
+      const metrics = await getViewerMetricsForStream(
+        streamKey,
+        organizationId,
       );
 
-      session = result.rows[0];
-    }
-
-    const metrics = await getViewerMetricsForStream(streamKey, organizationId);
-
-    io.to(organizationScopedRoom("analytics", organizationId, streamKey)).emit(
-      "analytics:viewers",
-      {
+      io.to(
+        organizationScopedRoom("analytics", organizationId, streamKey),
+      ).emit("analytics:viewers", {
         stream_key: streamKey,
         ...metrics,
-      },
-    );
+      });
 
-    res.json({
-      ok: true,
-      session: {
-        id: session.id,
-        session_token: session.session_token,
-        viewer_id: session.viewer_id,
-      },
-      metrics,
-    });
-  } catch (error) {
-    console.error("Start viewer session error:", error);
+      res.json({
+        ok: true,
+        session: {
+          id: session.id,
+          session_token: session.session_token,
+          viewer_id: session.viewer_id,
+        },
+        metrics,
+      });
+    } catch (error) {
+      console.error("Start viewer session error:", error);
 
-    res.status(500).json({
-      ok: false,
-      message: "Failed to start viewer session",
-      error: error.message,
-    });
-  }
-});
-
-app.post("/api/public/viewers/heartbeat", async (req, res) => {
-  try {
-    const sessionToken = cleanOrgText(req.body.session_token, 255);
-
-    if (!sessionToken) {
-      return res.status(400).json({
+      res.status(500).json({
         ok: false,
-        message: "Session token is required",
+        message: "Failed to start viewer session",
+        error: error.message,
       });
     }
+  },
+);
 
-    const result = await pool.query(
-      `
+app.post(
+  "/api/public/viewers/heartbeat",
+  statusPollLimiter,
+  async (req, res) => {
+    try {
+      const sessionToken = cleanOrgText(req.body.session_token, 255);
+
+      if (!sessionToken) {
+        return res.status(400).json({
+          ok: false,
+          message: "Session token is required",
+        });
+      }
+
+      const result = await pool.query(
+        `
       UPDATE viewer_sessions
       SET last_seen_at = NOW(),
           duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::int
@@ -5904,44 +5945,48 @@ app.post("/api/public/viewers/heartbeat", async (req, res) => {
         AND ended_at IS NULL
       RETURNING organization_id, stream_key
       `,
-      [sessionToken],
-    );
+        [sessionToken],
+      );
 
-    if (!result.rows[0]) {
-      return res.status(404).json({
+      if (!result.rows[0]) {
+        return res.status(404).json({
+          ok: false,
+          message: "Viewer session not found",
+        });
+      }
+
+      const row = result.rows[0];
+      const metrics = await getViewerMetricsForStream(
+        row.stream_key,
+        row.organization_id,
+      );
+
+      res.json({ ok: true, metrics });
+    } catch (error) {
+      console.error("Viewer heartbeat error:", error);
+
+      res.status(500).json({
         ok: false,
-        message: "Viewer session not found",
+        message: "Failed to update viewer heartbeat",
+        error: error.message,
       });
     }
+  },
+);
 
-    const row = result.rows[0];
-    const metrics = await getViewerMetricsForStream(
-      row.stream_key,
-      row.organization_id,
-    );
+app.post(
+  "/api/public/viewers/end",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const sessionToken = cleanOrgText(req.body.session_token, 255);
 
-    res.json({ ok: true, metrics });
-  } catch (error) {
-    console.error("Viewer heartbeat error:", error);
+      if (!sessionToken) {
+        return res.json({ ok: true });
+      }
 
-    res.status(500).json({
-      ok: false,
-      message: "Failed to update viewer heartbeat",
-      error: error.message,
-    });
-  }
-});
-
-app.post("/api/public/viewers/end", async (req, res) => {
-  try {
-    const sessionToken = cleanOrgText(req.body.session_token, 255);
-
-    if (!sessionToken) {
-      return res.json({ ok: true });
-    }
-
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       UPDATE viewer_sessions
       SET ended_at = NOW(),
           last_seen_at = NOW(),
@@ -5950,39 +5995,40 @@ app.post("/api/public/viewers/end", async (req, res) => {
         AND ended_at IS NULL
       RETURNING organization_id, stream_key
       `,
-      [sessionToken],
-    );
-
-    if (result.rows[0]) {
-      const row = result.rows[0];
-      const metrics = await getViewerMetricsForStream(
-        row.stream_key,
-        row.organization_id,
+        [sessionToken],
       );
 
-      io.to(
-        organizationScopedRoom(
-          "analytics",
-          row.organization_id,
+      if (result.rows[0]) {
+        const row = result.rows[0];
+        const metrics = await getViewerMetricsForStream(
           row.stream_key,
-        ),
-      ).emit("analytics:viewers", {
-        stream_key: row.stream_key,
-        ...metrics,
+          row.organization_id,
+        );
+
+        io.to(
+          organizationScopedRoom(
+            "analytics",
+            row.organization_id,
+            row.stream_key,
+          ),
+        ).emit("analytics:viewers", {
+          stream_key: row.stream_key,
+          ...metrics,
+        });
+      }
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error("End viewer session error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to end viewer session",
+        error: error.message,
       });
     }
-
-    res.json({ ok: true });
-  } catch (error) {
-    console.error("End viewer session error:", error);
-
-    res.status(500).json({
-      ok: false,
-      message: "Failed to end viewer session",
-      error: error.message,
-    });
-  }
-});
+  },
+);
 
 const getRequestedTenantIdForAnalytics = (req) => {
   return req.headers["x-organization-id"] || req.query.organization_id || null;
@@ -6793,7 +6839,7 @@ const getPublicWatchStatus = async (streamKey) => {
   };
 };
 
-app.get("/api/public/watch/:streamKey", async (req, res) => {
+app.get("/api/public/watch/:streamKey", statusPollLimiter, async (req, res) => {
   try {
     const { streamKey } = req.params;
     const status = await getPublicWatchStatus(streamKey);
@@ -7397,25 +7443,29 @@ const cleanPrayerText = (value, maxLength = 1200) => {
     .slice(0, maxLength);
 };
 
-app.post("/api/public/prayer-requests/:streamKey", async (req, res) => {
-  try {
-    const { streamKey } = req.params;
-    const cleanStreamKey = cleanPrayerText(streamKey, 255);
-    const displayName = cleanPrayerText(req.body.display_name, 120);
-    const requestText = cleanPrayerText(req.body.request_text, 1200);
-    const isAnonymous = Boolean(req.body.is_anonymous);
+app.post(
+  "/api/public/prayer-requests/:streamKey",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const { streamKey } = req.params;
+      const cleanStreamKey = cleanPrayerText(streamKey, 255);
+      const displayName = cleanPrayerText(req.body.display_name, 120);
+      const requestText = cleanPrayerText(req.body.request_text, 1200);
+      const isAnonymous = Boolean(req.body.is_anonymous);
 
-    if (!cleanStreamKey || !requestText) {
-      return res.status(400).json({
-        ok: false,
-        message: "Prayer request is required",
-      });
-    }
+      if (!cleanStreamKey || !requestText) {
+        return res.status(400).json({
+          ok: false,
+          message: "Prayer request is required",
+        });
+      }
 
-    const organizationId = await getOrganizationIdForStreamKey(cleanStreamKey);
+      const organizationId =
+        await getOrganizationIdForStreamKey(cleanStreamKey);
 
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       INSERT INTO prayer_requests (
         organization_id,
         stream_key,
@@ -7426,32 +7476,33 @@ app.post("/api/public/prayer-requests/:streamKey", async (req, res) => {
       VALUES ($1, $2, $3, $4, $5)
       RETURNING id, organization_id, stream_key, display_name, request_text, is_anonymous, status, created_at
       `,
-      [
-        organizationId,
-        cleanStreamKey,
-        isAnonymous ? null : displayName || "Guest",
-        requestText,
-        isAnonymous,
-      ],
-    );
+        [
+          organizationId,
+          cleanStreamKey,
+          isAnonymous ? null : displayName || "Guest",
+          requestText,
+          isAnonymous,
+        ],
+      );
 
-    io.to("admins:prayer-requests").emit("prayer:new", result.rows[0]);
+      io.to("admins:prayer-requests").emit("prayer:new", result.rows[0]);
 
-    res.json({
-      ok: true,
-      prayerRequest: result.rows[0],
-      message: "Prayer request submitted successfully",
-    });
-  } catch (error) {
-    console.error("Create prayer request error:", error);
+      res.json({
+        ok: true,
+        prayerRequest: result.rows[0],
+        message: "Prayer request submitted successfully",
+      });
+    } catch (error) {
+      console.error("Create prayer request error:", error);
 
-    res.status(500).json({
-      ok: false,
-      message: "Failed to submit prayer request",
-      error: error.message,
-    });
-  }
-});
+      res.status(500).json({
+        ok: false,
+        message: "Failed to submit prayer request",
+        error: error.message,
+      });
+    }
+  },
+);
 
 app.get(
   "/api/prayer-requests",
@@ -14298,47 +14349,6 @@ app.get("/api/public/organizations", async (req, res) => {
   }
 });
 
-app.get("/api/public/organizations", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT DISTINCT
-        o.id,
-        o.name,
-        o.slug,
-        o.logo_url,
-        o.primary_color,
-        COALESCE(os.watch_page_title, o.name) AS display_name,
-        os.secondary_color
-      FROM organizations o
-      INNER JOIN recordings r ON r.organization_id = o.id
-        AND r.is_public = TRUE
-        AND r.mp4_filename IS NOT NULL
-      LEFT JOIN organization_settings os ON os.organization_id = o.id
-      WHERE o.is_active = TRUE
-      ORDER BY o.name ASC
-    `);
-
-    res.json({
-      ok: true,
-      organizations: result.rows.map((org) => ({
-        id: org.id,
-        name: org.display_name || org.name,
-        slug: org.slug,
-        logo_url: org.logo_url || null,
-        primary_color: org.primary_color || "#0d6efd",
-        secondary_color: org.secondary_color || "#fd9d00",
-      })),
-    });
-  } catch (error) {
-    console.error("Public organizations error:", error);
-    res.status(500).json({
-      ok: false,
-      message: "Failed to load organizations.",
-      error: error.message,
-    });
-  }
-});
-
 app.get(
   "/api/public/members/library",
   requireViewerMember,
@@ -14908,50 +14918,53 @@ app.get("/api/public/replays/:slug/progress", async (req, res) => {
   }
 });
 
-app.post("/api/public/replays/:slug/session/start", async (req, res) => {
-  try {
-    const row = await getPublicReplayBySlug(req.params.slug);
-    const viewerMember = await authenticateViewerMemberOptional(req);
+app.post(
+  "/api/public/replays/:slug/session/start",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const row = await getPublicReplayBySlug(req.params.slug);
+      const viewerMember = await authenticateViewerMemberOptional(req);
 
-    const access = getReplayAccessStatus(row, viewerMember);
+      const access = getReplayAccessStatus(row, viewerMember);
 
-    if (!access.allowed) {
-      return res.status(access.status).json({
-        ok: false,
-        code: access.code,
-        visibility: access.visibility || null,
-        organization_id: access.organization_id || null,
-        organization_name: access.organization_name || null,
-        replay_title: access.replay_title || null,
-        message: access.message,
-      });
-    }
+      if (!access.allowed) {
+        return res.status(access.status).json({
+          ok: false,
+          code: access.code,
+          visibility: access.visibility || null,
+          organization_id: access.organization_id || null,
+          organization_name: access.organization_name || null,
+          replay_title: access.replay_title || null,
+          message: access.message,
+        });
+      }
 
-    await closeStaleReplaySessions();
+      await closeStaleReplaySessions();
 
-    const viewerId =
-      viewerMember?.email ||
-      cleanOrgText(req.body.viewer_id, 255) ||
-      makeSessionToken();
-    const currentTime = Math.max(
-      0,
-      Math.floor(Number(req.body.current_time || 0)),
-    );
-    const watchedSeconds = Math.max(
-      0,
-      Math.floor(Number(req.body.watched_seconds || 0)),
-    );
-    const playbackRate = Number(req.body.playback_rate || 1);
-    const eventType = cleanOrgText(req.body.event_type || "start", 80);
-    const userAgent = req.headers["user-agent"] || null;
-    const referrer = req.headers.referer || req.headers.referrer || null;
-    const ipAddress = getRequestIpAddress(req);
-    const deviceInfo = getDeviceInfoFromUserAgent(userAgent);
-    const countryCode = getRequestCountryCode(req, ipAddress);
-    const countryName = getCountryNameFromCode(countryCode);
+      const viewerId =
+        viewerMember?.email ||
+        cleanOrgText(req.body.viewer_id, 255) ||
+        makeSessionToken();
+      const currentTime = Math.max(
+        0,
+        Math.floor(Number(req.body.current_time || 0)),
+      );
+      const watchedSeconds = Math.max(
+        0,
+        Math.floor(Number(req.body.watched_seconds || 0)),
+      );
+      const playbackRate = Number(req.body.playback_rate || 1);
+      const eventType = cleanOrgText(req.body.event_type || "start", 80);
+      const userAgent = req.headers["user-agent"] || null;
+      const referrer = req.headers.referer || req.headers.referrer || null;
+      const ipAddress = getRequestIpAddress(req);
+      const deviceInfo = getDeviceInfoFromUserAgent(userAgent);
+      const countryCode = getRequestCountryCode(req, ipAddress);
+      const countryName = getCountryNameFromCode(countryCode);
 
-    const active = await pool.query(
-      `
+      const active = await pool.query(
+        `
       SELECT *
       FROM replay_sessions
       WHERE recording_id = $1
@@ -14963,14 +14976,14 @@ app.post("/api/public/replays/:slug/session/start", async (req, res) => {
       ORDER BY ended_at IS NULL DESC, last_seen_at DESC
       LIMIT 1
       `,
-      [row.id, viewerId],
-    );
+        [row.id, viewerId],
+      );
 
-    let session = active.rows[0];
+      let session = active.rows[0];
 
-    if (session) {
-      const refreshed = await pool.query(
-        `
+      if (session) {
+        const refreshed = await pool.query(
+          `
         UPDATE replay_sessions
         SET last_seen_at = NOW(),
             ended_at = NULL,
@@ -14990,27 +15003,27 @@ app.post("/api/public/replays/:slug/session/start", async (req, res) => {
         WHERE id = $1
         RETURNING *
         `,
-        [
-          session.id,
-          currentTime,
-          ipAddress,
-          userAgent,
-          referrer,
-          deviceInfo.deviceType,
-          deviceInfo.browserName,
-          deviceInfo.osName,
-          countryCode,
-          countryName,
-          watchedSeconds,
-          eventType,
-          playbackRate,
-        ],
-      );
-      session = refreshed.rows[0];
-    } else {
-      const sessionToken = makeSessionToken();
-      const inserted = await pool.query(
-        `
+          [
+            session.id,
+            currentTime,
+            ipAddress,
+            userAgent,
+            referrer,
+            deviceInfo.deviceType,
+            deviceInfo.browserName,
+            deviceInfo.osName,
+            countryCode,
+            countryName,
+            watchedSeconds,
+            eventType,
+            playbackRate,
+          ],
+        );
+        session = refreshed.rows[0];
+      } else {
+        const sessionToken = makeSessionToken();
+        const inserted = await pool.query(
+          `
         INSERT INTO replay_sessions (
           organization_id,
           recording_id,
@@ -15035,94 +15048,98 @@ app.post("/api/public/replays/:slug/session/start", async (req, res) => {
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING *
         `,
-        [
-          row.organization_id,
-          row.id,
-          row.public_slug,
-          viewerId,
-          sessionToken,
-          ipAddress,
-          userAgent,
-          referrer,
-          currentTime,
-          viewerMember?.id || null,
-          deviceInfo.deviceType,
-          deviceInfo.browserName,
-          deviceInfo.osName,
-          countryCode,
-          countryName,
-          watchedSeconds,
-          eventType,
-          playbackRate,
-        ],
-      );
-      session = inserted.rows[0];
+          [
+            row.organization_id,
+            row.id,
+            row.public_slug,
+            viewerId,
+            sessionToken,
+            ipAddress,
+            userAgent,
+            referrer,
+            currentTime,
+            viewerMember?.id || null,
+            deviceInfo.deviceType,
+            deviceInfo.browserName,
+            deviceInfo.osName,
+            countryCode,
+            countryName,
+            watchedSeconds,
+            eventType,
+            playbackRate,
+          ],
+        );
+        session = inserted.rows[0];
 
-      await pool.query(
-        `UPDATE recordings SET replay_views = COALESCE(replay_views, 0) + 1 WHERE id = $1`,
-        [row.id],
-      );
+        await pool.query(
+          `UPDATE recordings SET replay_views = COALESCE(replay_views, 0) + 1 WHERE id = $1`,
+          [row.id],
+        );
+      }
+
+      await recordReplaySessionEvent({
+        organizationId: row.organization_id,
+        recordingId: row.id,
+        replaySessionId: session.id,
+        publicSlug: row.public_slug,
+        viewerId,
+        eventType,
+        currentTime,
+        watchedSeconds,
+        deltaSeconds: 0,
+        playbackRate,
+      });
+
+      const metrics = await getReplaySessionMetrics(row.id);
+
+      res.json({
+        ok: true,
+        session: {
+          session_token: session.session_token,
+          viewer_id: session.viewer_id,
+        },
+        metrics,
+      });
+    } catch (error) {
+      console.error("Start replay session error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to start replay session" });
     }
+  },
+);
 
-    await recordReplaySessionEvent({
-      organizationId: row.organization_id,
-      recordingId: row.id,
-      replaySessionId: session.id,
-      publicSlug: row.public_slug,
-      viewerId,
-      eventType,
-      currentTime,
-      watchedSeconds,
-      deltaSeconds: 0,
-      playbackRate,
-    });
+app.post(
+  "/api/public/replays/:slug/session/heartbeat",
+  statusPollLimiter,
+  async (req, res) => {
+    try {
+      const sessionToken = cleanOrgText(req.body.session_token, 255);
 
-    const metrics = await getReplaySessionMetrics(row.id);
+      if (!sessionToken) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Session token is required" });
+      }
 
-    res.json({
-      ok: true,
-      session: {
-        session_token: session.session_token,
-        viewer_id: session.viewer_id,
-      },
-      metrics,
-    });
-  } catch (error) {
-    console.error("Start replay session error:", error);
-    res
-      .status(500)
-      .json({ ok: false, message: "Failed to start replay session" });
-  }
-});
+      const currentTime = Math.max(
+        0,
+        Math.floor(Number(req.body.current_time || 0)),
+      );
+      const watchedSeconds = Math.max(
+        0,
+        Math.floor(Number(req.body.watched_seconds || 0)),
+      );
+      const completed = Boolean(req.body.completed);
+      const eventType = cleanOrgText(req.body.event_type || "heartbeat", 80);
+      const playbackRate = Number(req.body.playback_rate || 1);
+      const deltaSeconds = Math.max(
+        0,
+        Math.floor(Number(req.body.delta_seconds || 0)),
+      );
 
-app.post("/api/public/replays/:slug/session/heartbeat", async (req, res) => {
-  try {
-    const sessionToken = cleanOrgText(req.body.session_token, 255);
-
-    if (!sessionToken) {
-      return res
-        .status(400)
-        .json({ ok: false, message: "Session token is required" });
-    }
-
-    const currentTime = Math.max(
-      0,
-      Math.floor(Number(req.body.current_time || 0)),
-    );
-    const watchedSeconds = Math.max(
-      0,
-      Math.floor(Number(req.body.watched_seconds || 0)),
-    );
-    const completed = Boolean(req.body.completed);
-    const eventType = cleanOrgText(req.body.event_type || "heartbeat", 80);
-    const playbackRate = Number(req.body.playback_rate || 1);
-    const deltaSeconds = Math.max(
-      0,
-      Math.floor(Number(req.body.delta_seconds || 0)),
-    );
-
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       UPDATE replay_sessions
       SET last_seen_at = NOW(),
           current_time_seconds = $2,
@@ -15144,71 +15161,77 @@ app.post("/api/public/replays/:slug/session/heartbeat", async (req, res) => {
         AND ended_at IS NULL
       RETURNING id, organization_id, recording_id, public_slug, viewer_id
       `,
-      [
-        sessionToken,
+        [
+          sessionToken,
+          currentTime,
+          watchedSeconds,
+          completed,
+          eventType,
+          playbackRate,
+        ],
+      );
+
+      if (!result.rows[0]) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Replay session not found" });
+      }
+
+      const updatedSession = result.rows[0];
+
+      await recordReplaySessionEvent({
+        organizationId: updatedSession.organization_id,
+        recordingId: updatedSession.recording_id,
+        replaySessionId: updatedSession.id,
+        publicSlug: updatedSession.public_slug,
+        viewerId: updatedSession.viewer_id,
+        eventType,
         currentTime,
         watchedSeconds,
-        completed,
-        eventType,
+        deltaSeconds,
         playbackRate,
-      ],
-    );
+      });
 
-    if (!result.rows[0]) {
-      return res
-        .status(404)
-        .json({ ok: false, message: "Replay session not found" });
+      const metrics = await getReplaySessionMetrics(
+        updatedSession.recording_id,
+      );
+      res.json({ ok: true, metrics });
+    } catch (error) {
+      console.error("Replay heartbeat error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to update replay heartbeat" });
     }
+  },
+);
 
-    const updatedSession = result.rows[0];
+app.post(
+  "/api/public/replays/:slug/session/end",
+  publicEngagementLimiter,
+  async (req, res) => {
+    try {
+      const sessionToken = cleanOrgText(req.body.session_token, 255);
 
-    await recordReplaySessionEvent({
-      organizationId: updatedSession.organization_id,
-      recordingId: updatedSession.recording_id,
-      replaySessionId: updatedSession.id,
-      publicSlug: updatedSession.public_slug,
-      viewerId: updatedSession.viewer_id,
-      eventType,
-      currentTime,
-      watchedSeconds,
-      deltaSeconds,
-      playbackRate,
-    });
+      if (!sessionToken) return res.json({ ok: true });
 
-    const metrics = await getReplaySessionMetrics(updatedSession.recording_id);
-    res.json({ ok: true, metrics });
-  } catch (error) {
-    console.error("Replay heartbeat error:", error);
-    res
-      .status(500)
-      .json({ ok: false, message: "Failed to update replay heartbeat" });
-  }
-});
+      const currentTime = Math.max(
+        0,
+        Math.floor(Number(req.body.current_time || 0)),
+      );
+      const watchedSeconds = Math.max(
+        0,
+        Math.floor(Number(req.body.watched_seconds || 0)),
+      );
+      const completed = Boolean(req.body.completed);
+      const eventType = cleanOrgText(req.body.event_type || "end", 80);
+      const playbackRate = Number(req.body.playback_rate || 1);
+      const deltaSeconds = Math.max(
+        0,
+        Math.floor(Number(req.body.delta_seconds || 0)),
+      );
 
-app.post("/api/public/replays/:slug/session/end", async (req, res) => {
-  try {
-    const sessionToken = cleanOrgText(req.body.session_token, 255);
-
-    if (!sessionToken) return res.json({ ok: true });
-
-    const currentTime = Math.max(
-      0,
-      Math.floor(Number(req.body.current_time || 0)),
-    );
-    const watchedSeconds = Math.max(
-      0,
-      Math.floor(Number(req.body.watched_seconds || 0)),
-    );
-    const completed = Boolean(req.body.completed);
-    const eventType = cleanOrgText(req.body.event_type || "end", 80);
-    const playbackRate = Number(req.body.playback_rate || 1);
-    const deltaSeconds = Math.max(
-      0,
-      Math.floor(Number(req.body.delta_seconds || 0)),
-    );
-
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       UPDATE replay_sessions
       SET ended_at = NOW(),
           last_seen_at = NOW(),
@@ -15231,45 +15254,46 @@ app.post("/api/public/replays/:slug/session/end", async (req, res) => {
         AND ended_at IS NULL
       RETURNING id, organization_id, recording_id, public_slug, viewer_id
       `,
-      [
-        sessionToken,
-        currentTime,
-        watchedSeconds,
-        completed,
-        eventType,
-        playbackRate,
-      ],
-    );
+        [
+          sessionToken,
+          currentTime,
+          watchedSeconds,
+          completed,
+          eventType,
+          playbackRate,
+        ],
+      );
 
-    const endedSession = result.rows[0];
+      const endedSession = result.rows[0];
 
-    if (endedSession) {
-      await recordReplaySessionEvent({
-        organizationId: endedSession.organization_id,
-        recordingId: endedSession.recording_id,
-        replaySessionId: endedSession.id,
-        publicSlug: endedSession.public_slug,
-        viewerId: endedSession.viewer_id,
-        eventType,
-        currentTime,
-        watchedSeconds,
-        deltaSeconds,
-        playbackRate,
-      });
+      if (endedSession) {
+        await recordReplaySessionEvent({
+          organizationId: endedSession.organization_id,
+          recordingId: endedSession.recording_id,
+          replaySessionId: endedSession.id,
+          publicSlug: endedSession.public_slug,
+          viewerId: endedSession.viewer_id,
+          eventType,
+          currentTime,
+          watchedSeconds,
+          deltaSeconds,
+          playbackRate,
+        });
+      }
+
+      const metrics = endedSession
+        ? await getReplaySessionMetrics(endedSession.recording_id)
+        : null;
+
+      res.json({ ok: true, metrics });
+    } catch (error) {
+      console.error("End replay session error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to end replay session" });
     }
-
-    const metrics = endedSession
-      ? await getReplaySessionMetrics(endedSession.recording_id)
-      : null;
-
-    res.json({ ok: true, metrics });
-  } catch (error) {
-    console.error("End replay session error:", error);
-    res
-      .status(500)
-      .json({ ok: false, message: "Failed to end replay session" });
-  }
-});
+  },
+);
 
 app.get("/api/public/replays/:slug/media", async (req, res) => {
   try {
