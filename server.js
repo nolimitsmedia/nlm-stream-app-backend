@@ -222,6 +222,7 @@ async function sendMailgunEmail({ to, subject, text }) {
   const domain = process.env.MAILGUN_DOMAIN;
   const fromEmail =
     process.env.MAILGUN_FROM_EMAIL || `no-reply@${domain || ""}`;
+  const fromName = process.env.MAILGUN_FROM_NAME || "NLM Streaming Cloud";
   const region = process.env.MAILGUN_REGION === "eu" ? "eu" : "us";
   const baseUrl =
     region === "eu" ? "https://api.eu.mailgun.net" : "https://api.mailgun.net";
@@ -230,7 +231,7 @@ async function sendMailgunEmail({ to, subject, text }) {
 
   try {
     const body = new URLSearchParams({
-      from: `NLM Streaming Cloud <${fromEmail}>`,
+      from: `${fromName} <${fromEmail}>`,
       to,
       subject,
       text,
@@ -8388,6 +8389,21 @@ const SRS_HLS_ORIGIN = process.env.SRS_HLS_ORIGIN || "http://localhost:8080";
 const segmentCache = new Map(); // segment filename -> { buffer, contentType, cachedAt }
 const SEGMENT_CACHE_TTL_MS = 15000;
 
+// CDN-facing (Bunny edge) cache duration for segment responses — separate
+// from SEGMENT_CACHE_TTL_MS above, which only controls how long THIS
+// Node process holds a segment in memory to absorb a concurrent-viewer
+// burst. This constant controls how long Bunny's edge nodes themselves
+// cache the response before re-checking with us. Since segments are
+// immutable once written AND the cache key already includes the `_s`
+// session tag (a filename reused by a NEW broadcast can never resolve to
+// a PRIOR session's bytes — see the cacheKey comment below), there's no
+// staleness risk from caching much longer than the in-memory TTL above.
+// Longer edge caching directly reduces repeat origin round-trips for
+// actively-watched streams. Bumped from 30s (2026-08-10, Storage & CDN
+// review) — 30s was a safe-but-conservative default from before the
+// session-tag staleness fix existed to justify going longer.
+const SEGMENT_EDGE_CACHE_SECONDS = 300;
+
 // Same idea for the manifest itself: if N viewers are each polling the
 // playlist every ~1-2s, that's N separate ngrok round trips per interval.
 // We cache the RAW upstream text (not the per-viewer rewritten output,
@@ -8837,7 +8853,10 @@ app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
   if (cached) {
     res.setHeader("Content-Type", cached.contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=30");
+    res.setHeader(
+      "Cache-Control",
+      `public, max-age=${SEGMENT_EDGE_CACHE_SECONDS}`,
+    );
     res.setHeader("X-Segment-Cache", "HIT");
     return res.send(cached.buffer);
   }
@@ -8862,7 +8881,10 @@ app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
     const contentType = "video/mp2t";
     res.setHeader("Content-Type", contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=30");
+    res.setHeader(
+      "Cache-Control",
+      `public, max-age=${SEGMENT_EDGE_CACHE_SECONDS}`,
+    );
     res.setHeader("X-Segment-Cache", "MISS");
     const buffer = Buffer.from(await upstream.arrayBuffer());
     segmentCache.set(cacheKey, {
