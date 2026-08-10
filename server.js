@@ -13204,6 +13204,272 @@ app.post(
 
 /*
 |--------------------------------------------------------------------------
+| MANUAL RECORDING CLIPS (mid-broadcast start/stop)
+|--------------------------------------------------------------------------
+| Wowza Engine parity, deferred from the earlier feature batch, built last
+| per user's own priority ranking. Deliberately NOT built by retroactively
+| slicing the passively-collected HLS segments by timestamp — that's
+| fragile (depends on segment boundaries lining up with whatever moment
+| someone clicked start/stop) and duplicates what the existing "record
+| all incoming streams" pipeline already does. Instead, clicking "Start
+| Recording" spawns a DEDICATED ffmpeg process that actively captures the
+| live output to its own MP4 file for exactly the [start, stop] window —
+| a genuinely independent clip, not a filtered view of the continuous
+| archive. This runs completely independently of the auto_record_enabled
+| toggle — an org can have automatic recording off entirely and still
+| pull manual clips, or have both running at once; they don't interact.
+*/
+
+const manualRecordingProcesses = new Map(); // channelId -> { proc, startedAt, outputPath }
+
+app.get(
+  "/api/channels/:channelId/manual-recording/status",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const running = manualRecordingProcesses.get(channel.id);
+
+      res.json({
+        ok: true,
+        recording: Boolean(running),
+        startedAt: running?.startedAt || null,
+      });
+    } catch (error) {
+      console.error("Manual recording status error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to load recording status" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/manual-recording/start",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      if (manualRecordingProcesses.has(channel.id)) {
+        return res.status(400).json({
+          ok: false,
+          message: "A manual recording is already running on this channel.",
+        });
+      }
+
+      const isLive = await isSrsStreamLive(channel.stream_key);
+      if (!isLive) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "This channel isn't currently live — nothing to record. Start manual recording once the broadcast is live.",
+        });
+      }
+
+      const outputDir = path.join(
+        RECORDINGS_LIVE_CAPPED_ROOT,
+        channel.stream_key,
+      );
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+
+      const startedAt = new Date();
+      const outputFilename = `manual-${startedAt.getTime()}.mp4`;
+      const outputPath = path.join(outputDir, outputFilename);
+
+      // -re not needed here — this reads a LIVE HLS source (SRS keeps
+      // producing new segments in real time regardless of how fast
+      // ffmpeg reads them), unlike the file-broadcast feature above
+      // which reads a static file and needs -re to pace itself.
+      const sourceUrl = `${SRS_HLS_ORIGIN}/live/${channel.stream_key}.m3u8`;
+
+      const args = ["-i", sourceUrl, "-c", "copy", "-f", "mp4", outputPath];
+
+      const proc = spawn("ffmpeg", args);
+
+      proc.stderr.on("data", (data) => {
+        console.log(
+          `[MANUAL-RECORDING ${channel.stream_key}]`,
+          data.toString().slice(0, 300),
+        );
+      });
+
+      proc.on("exit", (code) => {
+        console.log(
+          `[MANUAL-RECORDING ${channel.stream_key}] exited with code ${code}`,
+        );
+        manualRecordingProcesses.delete(channel.id);
+      });
+
+      manualRecordingProcesses.set(channel.id, {
+        proc,
+        startedAt: startedAt.toISOString(),
+        outputPath,
+      });
+
+      res.json({ ok: true, message: "Manual recording started" });
+    } catch (error) {
+      console.error("Start manual recording error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to start manual recording" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/manual-recording/stop",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const running = manualRecordingProcesses.get(channel.id);
+      if (!running) {
+        return res.status(400).json({
+          ok: false,
+          message: "No manual recording is running on this channel.",
+        });
+      }
+
+      const { proc, startedAt, outputPath } = running;
+      const endedAt = new Date();
+
+      // SIGTERM (not SIGKILL) so ffmpeg gets to finalize the MP4's moov
+      // atom cleanly before exiting — an abrupt kill here would leave a
+      // corrupted, unplayable file. Same graceful-then-force pattern
+      // already used elsewhere in this file (social simulcast, ABR
+      // transcoders) — force-kill only if it hasn't exited after 5s.
+      proc.kill("SIGTERM");
+
+      const registerRecording = async () => {
+        try {
+          if (!fs.existsSync(outputPath)) {
+            console.error(
+              `[MANUAL-RECORDING] Expected output file missing after stop: ${outputPath}`,
+            );
+            return;
+          }
+
+          const stats = fs.statSync(outputPath);
+          const durationSeconds = Math.max(
+            1,
+            Math.round(
+              (endedAt.getTime() - new Date(startedAt).getTime()) / 1000,
+            ),
+          );
+          const filename = path.basename(outputPath);
+
+          await pool.query(
+            `
+            INSERT INTO recordings (
+              organization_id, channel_id, stream_key,
+              filename, filepath, file_type, file_size_bytes,
+              duration_seconds, duration, size_mb,
+              status, source, processing_status,
+              started_at, ended_at, created_at, updated_at,
+              mp4_filename, mp4_filepath
+            )
+            VALUES (
+              $1, $2, $3,
+              $4, $5, 'mp4', $6,
+              $7, $7, $8,
+              'archived', 'manual_clip', 'ready',
+              $9, $10, NOW(), NOW(),
+              $4, $5
+            )
+            `,
+            [
+              channel.organization_id,
+              channel.id,
+              channel.stream_key,
+              filename,
+              outputPath,
+              stats.size,
+              durationSeconds,
+              Number((stats.size / 1024 ** 2).toFixed(2)),
+              startedAt,
+              endedAt.toISOString(),
+            ],
+          );
+
+          console.log(
+            `[MANUAL-RECORDING] Registered clip for ${channel.stream_key}: ${filename} (${durationSeconds}s)`,
+          );
+        } catch (err) {
+          console.error(
+            `[MANUAL-RECORDING] Failed to register clip after stop:`,
+            err.message,
+          );
+        }
+      };
+
+      // ffmpeg needs a moment to actually finish writing after SIGTERM —
+      // wait for its exit event rather than registering the file
+      // immediately, or the stat/size read below could race a
+      // still-finalizing file.
+      proc.once("exit", () => {
+        registerRecording();
+      });
+
+      const forceKillTimer = setTimeout(() => {
+        if (proc.exitCode === null) {
+          console.warn(
+            `[MANUAL-RECORDING ${channel.stream_key}] Force-killing after graceful shutdown timeout.`,
+          );
+          proc.kill("SIGKILL");
+        }
+      }, 5000);
+      forceKillTimer.unref();
+
+      manualRecordingProcesses.delete(channel.id);
+
+      res.json({ ok: true, message: "Manual recording stopped" });
+    } catch (error) {
+      console.error("Stop manual recording error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to stop manual recording" });
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
 | TRANSCODING
 |--------------------------------------------------------------------------
 */
