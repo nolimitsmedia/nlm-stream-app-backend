@@ -8453,6 +8453,42 @@ function appendBunnyToken(urlPath, existingQs = "") {
   return `${existingQs}${sep}token=${encodeURIComponent(token)}&expires=${expires}&token_ignore_params=true`;
 }
 
+// AES-128 HLS content encryption (2026-08-10, Wowza-parity item 3) — SRS
+// writes an #EXT-X-KEY line into every media playlist once hls_keys is on
+// (see srs.conf), with a URI SRS builds from hls_key_url + the raw key
+// filename (e.g. "http://host.docker.internal:5000/api/hls/key/live/
+// mystream-0.key"). That internal-only host is never reachable by a real
+// viewer's player — same reason every .ts segment line gets rewritten
+// before a manifest reaches a client. This does the equivalent rewrite
+// for the key line specifically: swap in the public, Bunny-Token-Auth-
+// signed /api/hls/key/... route, leaving METHOD=/IV= untouched. Every
+// manifest-serving route that rewrites segment URIs must also call this
+// on each line, or playback breaks the moment SRS emits an encrypted
+// stream — segments would load but never decrypt.
+function rewriteHlsKeyLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("#EXT-X-KEY")) return line;
+
+  const uriMatch = trimmed.match(/URI="([^"]+)"/);
+  if (!uriMatch) return line; // no URI to rewrite (e.g. METHOD=NONE), leave as-is
+
+  const rawUri = uriMatch[1];
+  const questionIndex = rawUri.indexOf("?");
+  const uriPath = questionIndex >= 0 ? rawUri.slice(0, questionIndex) : rawUri;
+  const keyFilename = uriPath.split("/").pop();
+  // hls_key_file is "[app]/[stream]-[seq].key" — the app segment is
+  // whatever directory SRS placed it under (matches hls_ts_file's own
+  // [app] token), so take the path segment right before the filename
+  // rather than assuming a fixed value.
+  const pathParts = uriPath.split("/").filter(Boolean);
+  const app = pathParts.length >= 2 ? pathParts[pathParts.length - 2] : "live";
+
+  const keyPath = `/api/hls/key/${encodeURIComponent(app)}/${encodeURIComponent(keyFilename)}`;
+  const signedKeyUrl = `${keyPath}${appendBunnyToken(keyPath)}`;
+
+  return line.replace(rawUri, signedKeyUrl);
+}
+
 // Once a broadcast has successfully resolved to either live_capped or
 // live, stick with that SAME app for the rest of that broadcast rather
 // than re-deciding on every poll. Silently flipping between the two apps
@@ -8773,6 +8809,10 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       .map((line) => {
         const t = line.trim();
 
+        if (t.startsWith("#EXT-X-KEY")) {
+          return rewriteHlsKeyLine(line);
+        }
+
         if (!t || t.startsWith("#")) {
           return line;
         }
@@ -8830,6 +8870,49 @@ app.get("/api/hls/:streamKey.m3u8", async (req, res) => {
       ok: false,
       message: "HLS unavailable: " + err.message,
     });
+  }
+});
+
+app.get("/api/hls/key/:app/:filename", async (req, res) => {
+  const { app, filename } = req.params;
+
+  // Reject anything that isn't the .key filename shape SRS itself
+  // generates (hls_key_file: [app]/[stream]-[seq].key in srs.conf) —
+  // this route exists to proxy exactly one thing, not act as a general
+  // file fetcher into SRS's internal http_server.
+  if (!/^[\w-]+\.key$/.test(filename)) {
+    return res.status(400).send("Invalid key filename");
+  }
+
+  try {
+    const upstream = await fetch(`${SRS_HLS_ORIGIN}/${app}/${filename}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!upstream.ok) {
+      console.error("[HLS KEY UPSTREAM ERROR]", {
+        app,
+        filename,
+        status: upstream.status,
+      });
+      return res.status(upstream.status).send("Key unavailable");
+    }
+
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    // Same edge-cache reasoning as segments: a given key file is static
+    // for its whole hls_fragments_per_key window once SRS writes it, and
+    // Bunny Token Auth already gates the initial signed request — no
+    // staleness risk from caching this at the edge.
+    res.setHeader(
+      "Cache-Control",
+      `public, max-age=${SEGMENT_EDGE_CACHE_SECONDS}`,
+    );
+    res.send(buffer);
+  } catch (err) {
+    res.status(503).send("Key temporarily unavailable, please retry shortly");
   }
 });
 
@@ -10018,6 +10101,22 @@ const SOCIAL_PLATFORMS = {
   youtube: {
     label: "YouTube",
     rtmpBase: "rtmp://a.rtmp.youtube.com/live2",
+  },
+  // Instagram has no Graph-API equivalent to Facebook/YouTube's "create a
+  // broadcast, get RTMP credentials back" flow — Meta only offers Live
+  // Producer, a manual, browser-only tool (instagram.com, not the app)
+  // that issues a fresh one-time Stream URL + Stream Key per broadcast,
+  // requiring a Business or Creator account. There is no OAuth
+  // automation to build here — this is deliberately manual-key-only,
+  // same as Facebook/YouTube's existing 'manual' automation_mode.
+  // rtmpBase below is Live Producer's documented ingest host; if a real
+  // broadcast fails to connect, check whether Instagram handed back a
+  // materially different host in that session's generated URL and
+  // update this — Instagram doesn't publish a stable public spec for it
+  // the way Facebook/YouTube do.
+  instagram: {
+    label: "Instagram",
+    rtmpBase: "rtmps://live-upload.instagram.com:443/rtmp",
   },
 };
 
@@ -12432,6 +12531,10 @@ const rewriteRelativeSegmentUris = (manifestText, streamKey) =>
     .split("\n")
     .map((line) => {
       const trimmed = line.trim();
+
+      if (trimmed.startsWith("#EXT-X-KEY")) {
+        return rewriteHlsKeyLine(line);
+      }
 
       if (!trimmed || trimmed.startsWith("#")) {
         return line;
