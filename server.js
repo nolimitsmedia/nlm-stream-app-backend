@@ -12099,7 +12099,12 @@ const scanRecordingFilesForOrganization = async (
   return recordings;
 };
 
-const processRecordingFile = async ({ organizationId, stream, file }) => {
+const processRecordingFile = async ({
+  organizationId,
+  stream,
+  file,
+  skipStabilityCheck = false,
+}) => {
   const cleanStream = safeRecordingSegment(stream);
   const cleanFile = safeRecordingSegment(file);
 
@@ -12147,7 +12152,7 @@ const processRecordingFile = async ({ organizationId, stream, file }) => {
 
   const inputStats = fs.statSync(inputPath);
 
-  if (!isFileStable(inputPath)) {
+  if (!skipStabilityCheck && !isFileStable(inputPath)) {
     const row = await upsertRecordingRowFromFile({
       organizationId,
       channel,
@@ -13288,25 +13293,54 @@ app.post(
         });
       }
 
-      const outputDir = path.join(
-        RECORDINGS_LIVE_CAPPED_ROOT,
+      const startedAt = new Date();
+      const outputFilename = `manual-${startedAt.getTime()}.flv`;
+      const outputPath = getRecordingAbsolutePath(
         channel.stream_key,
+        outputFilename,
       );
+
+      if (!outputPath) {
+        return res
+          .status(500)
+          .json({ ok: false, message: "Could not resolve recording path" });
+      }
+
+      const outputDir = path.dirname(outputPath);
       if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
       }
-
-      const startedAt = new Date();
-      const outputFilename = `manual-${startedAt.getTime()}.mp4`;
-      const outputPath = path.join(outputDir, outputFilename);
 
       // -re not needed here — this reads a LIVE HLS source (SRS keeps
       // producing new segments in real time regardless of how fast
       // ffmpeg reads them), unlike the file-broadcast feature above
       // which reads a static file and needs -re to pace itself.
+      //
+      // FLV output, NOT MP4 — this was the actual root cause of an
+      // earlier bug: raw `-f mp4` from an open-ended/live source (no
+      // known final duration) is a known-fragile combination for
+      // ffmpeg's MP4 muxer without fragmented-mp4 flags, and was
+      // observed live cutting recordings short after a few seconds
+      // despite the UI still showing the timer counting up. FLV is the
+      // ONLY format every other live-capture ffmpeg process in this
+      // entire file uses (social simulcast, ABR renditions) — this now
+      // matches that established, proven-working convention instead of
+      // being a second, untested pattern. The existing convertFlvToMp4()
+      // + processRecordingFile() pipeline (used for every other
+      // recording in this system) handles turning this into a playable
+      // MP4 afterward — see the stop handler below.
       const sourceUrl = `${SRS_HLS_ORIGIN}/live/${channel.stream_key}.m3u8`;
 
-      const args = ["-i", sourceUrl, "-c", "copy", "-f", "mp4", outputPath];
+      const args = [
+        ...inputResilienceFlags,
+        "-i",
+        sourceUrl,
+        "-c",
+        "copy",
+        "-f",
+        "flv",
+        outputPath,
+      ];
 
       const proc = spawn("ffmpeg", args);
 
@@ -13369,9 +13403,9 @@ app.post(
       const { proc, startedAt, outputPath } = running;
       const endedAt = new Date();
 
-      // SIGTERM (not SIGKILL) so ffmpeg gets to finalize the MP4's moov
-      // atom cleanly before exiting — an abrupt kill here would leave a
-      // corrupted, unplayable file. Same graceful-then-force pattern
+      // SIGTERM (not SIGKILL) so ffmpeg gets to close the FLV file
+      // cleanly before exiting — an abrupt kill here could leave a
+      // truncated/corrupted file. Same graceful-then-force pattern
       // already used elsewhere in this file (social simulcast, ABR
       // transcoders) — force-kill only if it hasn't exited after 5s.
       proc.kill("SIGTERM");
@@ -13385,50 +13419,40 @@ app.post(
             return;
           }
 
-          const stats = fs.statSync(outputPath);
-          const durationSeconds = Math.max(
-            1,
-            Math.round(
-              (endedAt.getTime() - new Date(startedAt).getTime()) / 1000,
-            ),
-          );
           const filename = path.basename(outputPath);
 
+          // Reuses the SAME conversion pipeline every other recording in
+          // this system goes through (FLV→MP4 via convertFlvToMp4,
+          // thumbnail generation, DB row with correct width/height/
+          // bitrate/codec) rather than a second hand-rolled INSERT —
+          // this is also what makes the resulting clip show up and play
+          // correctly in the normal Recordings list, not a special case.
+          const recording = await processRecordingFile({
+            organizationId: channel.organization_id,
+            stream: channel.stream_key,
+            file: filename,
+            // We know this file is complete because we're calling this
+            // from ffmpeg's own "exit" event handler, not guessing from
+            // a passive filesystem scan — the mtime-age heuristic
+            // isFileStable() normally uses doesn't apply here and would
+            // otherwise leave this clip stuck in "waiting" until
+            // something else re-triggers processing, which for a manual
+            // clip taken mid-broadcast could be a very long time away
+            // (not until the whole broadcast eventually ends).
+            skipStabilityCheck: true,
+          });
+
+          // processRecordingFile doesn't have a param for this — tag it
+          // as a manual clip afterward so it's distinguishable from
+          // auto-archived recordings without touching that shared
+          // function's signature (which the passive pipeline also uses).
           await pool.query(
-            `
-            INSERT INTO recordings (
-              organization_id, channel_id, stream_key,
-              filename, filepath, file_type, file_size_bytes,
-              duration_seconds, duration, size_mb,
-              status, source, processing_status,
-              started_at, ended_at, created_at, updated_at,
-              mp4_filename, mp4_filepath
-            )
-            VALUES (
-              $1, $2, $3,
-              $4, $5, 'mp4', $6,
-              $7, $7, $8,
-              'archived', 'manual_clip', 'ready',
-              $9, $10, NOW(), NOW(),
-              $4, $5
-            )
-            `,
-            [
-              channel.organization_id,
-              channel.id,
-              channel.stream_key,
-              filename,
-              outputPath,
-              stats.size,
-              durationSeconds,
-              Number((stats.size / 1024 ** 2).toFixed(2)),
-              startedAt,
-              endedAt.toISOString(),
-            ],
+            `UPDATE recordings SET source = 'manual_clip', started_at = $2, ended_at = $3 WHERE id = $1`,
+            [recording.id, startedAt, endedAt.toISOString()],
           );
 
           console.log(
-            `[MANUAL-RECORDING] Registered clip for ${channel.stream_key}: ${filename} (${durationSeconds}s)`,
+            `[MANUAL-RECORDING] Registered clip for ${channel.stream_key}: ${filename}`,
           );
         } catch (err) {
           console.error(
