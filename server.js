@@ -9792,6 +9792,191 @@ app.post(
 
 /*
 |--------------------------------------------------------------------------
+| SYSTEM STATUS — Wowza-parity item 4, 2026-08-10
+|--------------------------------------------------------------------------
+| One shared health-check engine, two views (Claude's recommendation) —
+| a public coarse view (Operational/Degraded/Outage per category, no
+| internal detail) for client trust/self-serve "is it us or is it them,"
+| and an admin detailed view (real latency numbers, raw errors) off the
+| exact same underlying checks. Runs on a background interval and caches
+| the result rather than live-checking on every request — this matters
+| most for the public endpoint, which could be hit frequently and should
+| never itself become a load source or a way to hammer third-party APIs
+| (WHMCS especially) on every page view.
+*/
+
+const systemHealthSnapshot = {
+  updatedAt: null,
+  checks: {
+    database: { ok: null, latencyMs: null, error: null },
+    srs: { ok: null, latencyMs: null, error: null },
+    bunny: { ok: null, latencyMs: null, error: null, configured: false },
+    whmcs: { ok: null, configured: false },
+  },
+};
+
+const SYSTEM_HEALTH_CHECK_INTERVAL_MS = 30 * 1000;
+
+async function runSystemHealthChecks() {
+  // Database
+  const dbStart = Date.now();
+  try {
+    await pool.query("SELECT 1");
+    systemHealthSnapshot.checks.database = {
+      ok: true,
+      latencyMs: Date.now() - dbStart,
+      error: null,
+    };
+  } catch (err) {
+    systemHealthSnapshot.checks.database = {
+      ok: false,
+      latencyMs: null,
+      error: err.message,
+    };
+  }
+
+  // SRS — same /api/v1/streams endpoint already used elsewhere in this
+  // file as the standard "is SRS up" check, reused here for consistency
+  // rather than inventing a second pattern.
+  const srsStart = Date.now();
+  try {
+    const res = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    systemHealthSnapshot.checks.srs = {
+      ok: res.ok,
+      latencyMs: Date.now() - srsStart,
+      error: res.ok ? null : `HTTP ${res.status}`,
+    };
+  } catch (err) {
+    systemHealthSnapshot.checks.srs = {
+      ok: false,
+      latencyMs: null,
+      error: err.message,
+    };
+  }
+
+  // Bunny — a real (but lightweight, short-timeout) reachability check.
+  // Bunny's API is high-availability infrastructure, not a fragile
+  // third-party billing system, so pinging it every 30s is low-risk —
+  // unlike WHMCS below, which deliberately is NOT live-pinged.
+  if (bunny.isBunnyAccountConfigured()) {
+    const bunnyStart = Date.now();
+    try {
+      await fetch("https://api.bunny.net/", {
+        signal: AbortSignal.timeout(5000),
+      });
+      systemHealthSnapshot.checks.bunny = {
+        ok: true,
+        latencyMs: Date.now() - bunnyStart,
+        error: null,
+        configured: true,
+      };
+    } catch (err) {
+      systemHealthSnapshot.checks.bunny = {
+        ok: false,
+        latencyMs: null,
+        error: err.message,
+        configured: true,
+      };
+    }
+  } else {
+    systemHealthSnapshot.checks.bunny = {
+      ok: null,
+      latencyMs: null,
+      error: null,
+      configured: false,
+    };
+  }
+
+  // WHMCS — deliberately config-presence only, NOT a live API call.
+  // WHMCS is a third-party billing system with its own rate limits;
+  // pinging it every 30 seconds purely for a status page is the kind of
+  // thing that looks harmless until it isn't. If WHMCS-specific
+  // incidents ever need surfacing here, add a real check deliberately,
+  // with its own longer interval — not by loosening this one.
+  systemHealthSnapshot.checks.whmcs = {
+    ok: whmcs.isWhmcsConfigured() ? true : null,
+    configured: whmcs.isWhmcsConfigured(),
+  };
+
+  systemHealthSnapshot.updatedAt = new Date().toISOString();
+}
+
+// Maps the raw checks above into the 4 coarse, public-facing categories.
+// "operational" is the default for anything not configured/not
+// applicable — an unconfigured optional integration isn't a platform
+// outage. "outage" only for the two checks core to the product actually
+// working (database, srs); "degraded" for auxiliary ones (bunny, whmcs).
+function getPublicStatusCategories() {
+  const {
+    database,
+    srs,
+    bunny: bunnyCheck,
+    whmcs: whmcsCheck,
+  } = systemHealthSnapshot.checks;
+
+  const statusFor = (ok, criticalIfDown) => {
+    if (ok === false) return criticalIfDown ? "outage" : "degraded";
+    return "operational";
+  };
+
+  const categories = [
+    {
+      name: "Live Streaming",
+      status: statusFor(srs.ok, true),
+    },
+    {
+      name: "Dashboard & API",
+      status: statusFor(database.ok, true),
+    },
+    {
+      name: "Recordings",
+      status: statusFor(bunnyCheck.ok, false),
+    },
+    {
+      name: "Billing",
+      status: statusFor(whmcsCheck.ok, false),
+    },
+  ];
+
+  const overall = categories.some((c) => c.status === "outage")
+    ? "outage"
+    : categories.some((c) => c.status === "degraded")
+      ? "degraded"
+      : "operational";
+
+  return { overall, categories };
+}
+
+app.get("/api/public/status", async (req, res) => {
+  const { overall, categories } = getPublicStatusCategories();
+
+  res.set("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+    status: overall,
+    categories,
+    updated_at: systemHealthSnapshot.updatedAt,
+  });
+});
+
+app.get(
+  "/api/admin/status",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    res.json({
+      ok: true,
+      updated_at: systemHealthSnapshot.updatedAt,
+      checks: systemHealthSnapshot.checks,
+      public_view: getPublicStatusCategories(),
+    });
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
 | PUBLIC API (v1) — Wowza-parity item 5, 2026-08-10
 |--------------------------------------------------------------------------
 | Read-only for v1, deliberately: the actual demand here is orgs pulling
@@ -13658,6 +13843,12 @@ io.on("connection", (socket) => {
 
     // Bitrate compliance monitor — see pollBitrateCompliance() above.
     setInterval(pollBitrateCompliance, BITRATE_POLL_INTERVAL_MS);
+
+    // System status page — see runSystemHealthChecks() above. Runs once
+    // immediately so /api/public/status has real data from the moment
+    // the server comes up, then on its own interval.
+    runSystemHealthChecks();
+    setInterval(runSystemHealthChecks, SYSTEM_HEALTH_CHECK_INTERVAL_MS);
 
     // Server metrics trend history — see collectServerMetricsSnapshot()
     // above. Runs once shortly after startup so the dashboard has at least
