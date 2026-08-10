@@ -8011,6 +8011,42 @@ const archiveReadyRecordingsForOrganization = async (organizationId) => {
 // local disk usage for a feature they haven't paid for. Mirrors the same
 // "delete after we're done with it" pattern archiveRecordingRow already
 // uses for the paid path.
+// Same cleanup as cleanupUnrecordedFilesForOrganization above, but scoped
+// to ONE channel's raw files only — used when a channel's own
+// auto_record_enabled toggle is off, so it doesn't touch other channels
+// in the same org that still have recording on.
+const cleanupUnrecordedFilesForChannel = async (streamKey) => {
+  try {
+    for (const root of [RECORDINGS_LIVE_ROOT, RECORDINGS_LIVE_CAPPED_ROOT]) {
+      const streamFolder = path.join(root, streamKey);
+      if (
+        !fs.existsSync(streamFolder) ||
+        !fs.statSync(streamFolder).isDirectory()
+      ) {
+        continue;
+      }
+
+      for (const file of fs.readdirSync(streamFolder)) {
+        if (file.endsWith(".tmp") || file.endsWith(".part")) continue;
+        const filePath = path.join(streamFolder, file);
+        try {
+          if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
+        } catch (fileErr) {
+          console.error(
+            `[RECORDING-GATE] Failed to remove ${filePath}:`,
+            fileErr.message,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[RECORDING-GATE] Per-channel cleanup failed for ${streamKey}:`,
+      err.message,
+    );
+  }
+};
+
 const cleanupUnrecordedFilesForOrganization = async (organizationId) => {
   try {
     const allowedChannels = await getAllowedChannelMap(organizationId);
@@ -8330,7 +8366,12 @@ const cleanupRawDvrFiles = async (organizationId) => {
   }
 };
 
-async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
+async function autoSyncRecordingsDelayed(
+  organizationId,
+  delayMs = 8000,
+  channelId = null,
+  streamKey = null,
+) {
   setTimeout(async () => {
     try {
       const summary = await getOrganizationSubscriptionSummary(organizationId);
@@ -8341,6 +8382,24 @@ async function autoSyncRecordingsDelayed(organizationId, delayMs = 8000) {
         );
         await cleanupUnrecordedFilesForOrganization(organizationId);
         return;
+      }
+
+      // Plan allows recording org-wide, but this specific channel may
+      // have its own "record all incoming streams" toggle off (Wowza-
+      // parity, 2026-08-10) — clean up just this channel's raw files so
+      // the scan below finds nothing to archive for it, while leaving
+      // every other channel in the org completely unaffected.
+      if (channelId && streamKey) {
+        const channelResult = await pool.query(
+          `SELECT auto_record_enabled FROM channels WHERE id = $1`,
+          [channelId],
+        );
+        if (channelResult.rows[0]?.auto_record_enabled === false) {
+          console.log(
+            `[RECORDING-GATE] Channel ${channelId} has recording toggled off — cleaning up its raw files instead of archiving.`,
+          );
+          await cleanupUnrecordedFilesForChannel(streamKey);
+        }
       }
 
       console.log(`[DVR] Auto-syncing recordings for org: ${organizationId}`);
@@ -9198,6 +9257,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     );
 
     const orgId = channelResult.rows[0]?.organization_id;
+    const endedChannelId = channelResult.rows[0]?.id;
 
     // Notify dashboard
     if (io) {
@@ -9209,7 +9269,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
 
     // Auto-sync recordings after stream ends (wait for SRS to write files)
     if (orgId) {
-      autoSyncRecordingsDelayed(orgId, 8000);
+      autoSyncRecordingsDelayed(orgId, 8000, endedChannelId, streamKey);
     }
 
     console.log(`[SRS] Stream offline: ${streamKey}`);
@@ -9507,6 +9567,57 @@ app.post(
       res.status(500).json({
         ok: false,
         message: "Failed to clear live status",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// "Record all incoming streams" toggle (Wowza-parity, 2026-08-10) —
+// layered on top of the org's plan-level recording_enabled gate, not a
+// replacement for it. See ensureChannelRecordingColumn and
+// autoSyncRecordingsDelayed for how this is actually enforced at
+// broadcast-end time.
+app.put(
+  "/api/channels/:id/recording-toggle",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(req.params.id, req.organization.id);
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const enabled = req.body.auto_record_enabled !== false;
+
+      const result = await pool.query(
+        `
+        UPDATE channels
+        SET auto_record_enabled = $1
+        WHERE id = $2
+        RETURNING id, name, auto_record_enabled
+        `,
+        [enabled, channel.id],
+      );
+
+      res.json({
+        ok: true,
+        message: enabled
+          ? "This channel will now record every broadcast automatically."
+          : "Automatic recording turned off for this channel.",
+        channel: result.rows[0],
+      });
+    } catch (error) {
+      console.error("Recording toggle error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update recording setting",
         error: error.message,
       });
     }
@@ -10950,6 +11061,20 @@ const generateRecordingThumbnail = async (inputPath, thumbnailPath) => {
   await execCommand(command);
 
   return { skipped: false, thumbnailPath };
+};
+
+// "Record all incoming streams" toggle (Wowza-parity, 2026-08-10) —
+// layered ON TOP OF the existing plan-level recording_enabled gate, not a
+// replacement for it. The plan sets the ceiling (does this org's
+// subscription include recording at all); this column lets an admin turn
+// recording off for one specific channel even when the plan allows it.
+// Defaults to TRUE so existing channels keep today's automatic-whenever-
+// the-plan-allows-it behavior with no migration-time behavior change.
+const ensureChannelRecordingColumn = async () => {
+  await pool.query(`
+    ALTER TABLE channels
+    ADD COLUMN IF NOT EXISTS auto_record_enabled BOOLEAN DEFAULT TRUE
+  `);
 };
 
 const ensureRecordingLibraryTable = async () => {
@@ -13119,6 +13244,7 @@ io.on("connection", (socket) => {
   await ensureScheduledStreamsTable();
   await ensureOrganizationTables();
   await ensureRecordingLibraryTable();
+  await ensureChannelRecordingColumn();
   await ensureViewerAnalyticsTables();
   await ensureReplayAnalyticsTables();
   await ensureSubscriptionTables();
