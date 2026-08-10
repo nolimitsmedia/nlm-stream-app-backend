@@ -12316,6 +12316,203 @@ app.delete(
 
 /*
 |--------------------------------------------------------------------------
+| FILE-AS-LIVE BROADCAST
+|--------------------------------------------------------------------------
+| Streams a pre-uploaded recording out through the normal live pipeline as
+| if it were a real broadcast — repeat airings, time-zone rebroadcasts, or
+| filling a scheduled slot with pre-recorded content (Wowza-parity item 2,
+| 2026-08-10). Publishes to the SAME RTMP ingest URL a real encoder would
+| use, so everything downstream (ABR transcoding, AES-128 encryption,
+| viewer analytics, recording archival of the rebroadcast itself) works
+| identically to a genuine live broadcast — no separate code path needed
+| for playback. Deliberately refuses to start if the channel already has
+| a real live source publishing, to avoid two publishers fighting over the
+| same stream_key.
+*/
+
+const fileBroadcastProcesses = new Map(); // channelId -> { proc, recordingId, startedAt }
+
+app.get(
+  "/api/channels/:channelId/file-broadcast/status",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const running = fileBroadcastProcesses.get(channel.id);
+
+      res.json({
+        ok: true,
+        running: Boolean(running),
+        recordingId: running?.recordingId || null,
+        startedAt: running?.startedAt || null,
+      });
+    } catch (error) {
+      console.error("File broadcast status error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to load file broadcast status" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/file-broadcast/start",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      if (fileBroadcastProcesses.has(channel.id)) {
+        return res.status(400).json({
+          ok: false,
+          message: "A file broadcast is already running on this channel.",
+        });
+      }
+
+      const alreadyLive = await isSrsStreamLive(channel.stream_key);
+      if (alreadyLive) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "This channel already has a real broadcast live. Stop it before starting a file broadcast.",
+        });
+      }
+
+      const recordingId = Number(req.body.recording_id || 0);
+      if (!recordingId) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "recording_id is required" });
+      }
+
+      const recordingResult = await pool.query(
+        `SELECT * FROM recordings WHERE id = $1 AND organization_id = $2`,
+        [recordingId, req.organization.id],
+      );
+      const recording = recordingResult.rows[0];
+      if (!recording) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Recording not found" });
+      }
+
+      const sourceFile = recording.mp4_filepath || recording.filepath;
+      if (!sourceFile || !fs.existsSync(sourceFile)) {
+        return res.status(404).json({
+          ok: false,
+          message: "Recording file is missing from disk.",
+        });
+      }
+
+      const loop = req.body.loop === true;
+      const destinationUrl = `rtmp://127.0.0.1/live/${channel.stream_key}`;
+
+      // -re: read the input at its native frame rate, so this genuinely
+      // "streams" the file over the broadcast's real duration instead of
+      // publishing it as fast as disk I/O allows. -stream_loop -1 repeats
+      // indefinitely until manually stopped; without it, the process
+      // exits (and the "live" broadcast ends) when the file finishes.
+      const args = [
+        "-re",
+        ...(loop ? ["-stream_loop", "-1"] : []),
+        "-i",
+        sourceFile,
+        "-c",
+        "copy",
+        "-f",
+        "flv",
+        destinationUrl,
+      ];
+
+      const proc = spawn("ffmpeg", args);
+
+      proc.stderr.on("data", (data) => {
+        console.log(
+          `[FILE-BROADCAST ${channel.stream_key}]`,
+          data.toString().slice(0, 300),
+        );
+      });
+
+      proc.on("exit", (code) => {
+        console.log(
+          `[FILE-BROADCAST ${channel.stream_key}] exited with code ${code}`,
+        );
+        fileBroadcastProcesses.delete(channel.id);
+      });
+
+      fileBroadcastProcesses.set(channel.id, {
+        proc,
+        recordingId,
+        startedAt: new Date().toISOString(),
+      });
+
+      res.json({ ok: true, message: "File broadcast started" });
+    } catch (error) {
+      console.error("Start file broadcast error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to start file broadcast" });
+    }
+  },
+);
+
+app.post(
+  "/api/channels/:channelId/file-broadcast/stop",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole("super_admin", "admin", "operator"),
+  requireOrganizationRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const running = fileBroadcastProcesses.get(channel.id);
+      if (running) {
+        running.proc.kill("SIGTERM");
+        fileBroadcastProcesses.delete(channel.id);
+      }
+
+      res.json({ ok: true, message: "File broadcast stopped" });
+    } catch (error) {
+      console.error("Stop file broadcast error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to stop file broadcast" });
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
 | TRANSCODING
 |--------------------------------------------------------------------------
 */
