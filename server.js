@@ -203,6 +203,83 @@ async function notifySlack(message, context = {}) {
   }
 }
 
+// ══════════════════════════════════════════
+// MAILGUN — outbound email to org admins (plan/quota notices, etc).
+// Separate from the existing external Mailgun-based disk/log-error cron
+// monitors (which alert websupport@ internally) — this sends TO the
+// client organization's own admins, from inside the app. Same
+// never-throw, no-op-if-unconfigured philosophy as notifySlack above: a
+// failed or unconfigured email must never break the request/job that
+// triggered it. Uses the same MAILGUN_ENABLED/MAILGUN_DOMAIN env vars
+// already established for this project — confirm MAILGUN_API_KEY and
+// MAILGUN_FROM_EMAIL are also set before relying on this in production;
+// MAILGUN_REGION defaults to "us" (api.mailgun.net) — set to "eu" for
+// api.eu.mailgun.net if this account is EU-region.
+async function sendMailgunEmail({ to, subject, text }) {
+  if (process.env.MAILGUN_ENABLED !== "true") return false;
+
+  const apiKey = process.env.MAILGUN_API_KEY;
+  const domain = process.env.MAILGUN_DOMAIN;
+  const fromEmail =
+    process.env.MAILGUN_FROM_EMAIL || `no-reply@${domain || ""}`;
+  const region = process.env.MAILGUN_REGION === "eu" ? "eu" : "us";
+  const baseUrl =
+    region === "eu" ? "https://api.eu.mailgun.net" : "https://api.mailgun.net";
+
+  if (!apiKey || !domain || !to) return false;
+
+  try {
+    const body = new URLSearchParams({
+      from: `NLM Streaming Cloud <${fromEmail}>`,
+      to,
+      subject,
+      text,
+    });
+
+    const response = await fetch(`${baseUrl}/v3/${domain}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`api:${apiKey}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      console.warn(`[MAILGUN] Send failed (HTTP ${response.status}) to ${to}`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.warn("[MAILGUN] Send failed:", err.message);
+    return false;
+  }
+}
+
+// Fetches the email address(es) of an organization's owner/admin
+// users — the audience for org-facing notices like storage/bandwidth
+// quota alerts. Returns a comma-separated string ready for Mailgun's
+// `to` field (Mailgun accepts multiple recipients this way), or null if
+// the org somehow has no admin users yet.
+async function getOrganizationAdminEmails(organizationId) {
+  const result = await pool.query(
+    `
+    SELECT DISTINCT a.email
+    FROM organization_users ou
+    JOIN admins a ON a.id = ou.admin_id
+    WHERE ou.organization_id = $1
+      AND ou.role IN ('owner', 'admin')
+      AND a.email IS NOT NULL
+    `,
+    [organizationId],
+  );
+
+  const emails = result.rows.map((r) => r.email).filter(Boolean);
+  return emails.length ? emails.join(",") : null;
+}
+
 const corsOptions = {
   origin(origin, callback) {
     if (!origin || CORS_ORIGINS.includes(origin)) {
@@ -1207,6 +1284,21 @@ const ensureSubscriptionTables = async () => {
       acknowledged_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+
+  // overage_bytes: only set for the 100%+ storage_quota_exceeded tier —
+  // this is the queryable field a billing report pulls from to know how
+  // much to charge, since the storage policy is warn+allow-overage+bill,
+  // not block or auto-delete. email_sent/email_sent_at track whether the
+  // Mailgun send actually succeeded for this alert row, independent of
+  // whether it's been acknowledged in-app — a billing report should trust
+  // this over "acknowledged", since an org can acknowledge without ever
+  // having received the email (Mailgun down, bad address, etc).
+  await pool.query(`
+    ALTER TABLE plan_alerts
+    ADD COLUMN IF NOT EXISTS overage_bytes BIGINT,
+    ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ
   `);
 
   // One-time correction: earlier deploys seeded plans with an arbitrary
@@ -4424,6 +4516,68 @@ app.get(
       res
         .status(500)
         .json({ ok: false, message: "Failed to load plan alerts" });
+    }
+  },
+);
+
+// Storage overage report for billing — per-org peak overage within a date
+// range, for whoever's cutting invoices to reference when billing for
+// storage used past an org's plan limit. This is deliberately a report,
+// not an automated charge: no WHMCS write happens here, since usage-based
+// billing wasn't set up as part of the storage policy (warn + allow
+// overage + bill manually later). `days` defaults to 30 (a billing-cycle
+// window); peak (not sum) overage per org is reported, since overage_bytes
+// on each alert row already reflects usage AT THAT MOMENT, not a delta —
+// summing them would double-count the same overage across multiple
+// cooldown-spaced alerts.
+app.get(
+  "/api/admin/storage-overage-report",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const days = Math.max(1, Number(req.query.days) || 30);
+
+      const result = await pool.query(
+        `
+        SELECT
+          pa.organization_id,
+          o.name AS organization_name,
+          MAX(pa.overage_bytes) AS peak_overage_bytes,
+          COUNT(*) AS alert_count,
+          MIN(pa.created_at) AS first_alert_at,
+          MAX(pa.created_at) AS last_alert_at,
+          BOOL_OR(pa.email_sent) AS was_notified
+        FROM plan_alerts pa
+        JOIN organizations o ON o.id = pa.organization_id
+        WHERE pa.alert_type = 'storage_quota_warning'
+          AND pa.created_at > NOW() - ($1::text || ' days')::interval
+        GROUP BY pa.organization_id, o.name
+        ORDER BY peak_overage_bytes DESC
+        `,
+        [days],
+      );
+
+      res.json({
+        ok: true,
+        days,
+        organizations: result.rows.map((row) => ({
+          organization_id: row.organization_id,
+          organization_name: row.organization_name,
+          peak_overage_gb: Number(
+            (Number(row.peak_overage_bytes || 0) / 1024 ** 3).toFixed(2),
+          ),
+          alert_count: Number(row.alert_count),
+          first_alert_at: row.first_alert_at,
+          last_alert_at: row.last_alert_at,
+          was_notified: row.was_notified,
+        })),
+      });
+    } catch (error) {
+      console.error("Storage overage report error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to load storage overage report" });
     }
   },
 );
@@ -7895,50 +8049,87 @@ const cleanupUnrecordedFilesForOrganization = async (organizationId) => {
 };
 
 const STORAGE_QUOTA_ALERT_COOLDOWN_HOURS = 24;
+const STORAGE_QUOTA_WARNING_THRESHOLD = 0.8; // 80% — "approaching" tier
 
-// Warns an org when they've gone over their plan's storage cap. Does NOT
-// delete or block anything — recorded church/ministry services are real
-// content, not a technical setting like bitrate, so this only notifies.
-// A cooldown prevents re-alerting on every single new recording once
-// already over quota.
+// Warns an org as they approach (80%) and then exceed (100%+) their plan's
+// storage cap. Does NOT delete or block anything — recorded church/
+// ministry services are real content, not a technical setting like
+// bitrate, so this only notifies; overage is tracked for billing to
+// invoice later, not enforced here. A cooldown per tier prevents
+// re-alerting on every single new recording once already past a
+// threshold. Each tier fires at most once per cooldown window, and both
+// an in-app alert (plan_alerts, surfaced via /api/organization/alerts)
+// and an email to the org's admins go out together — acknowledging the
+// in-app alert does not mean the email was ever received, so email
+// success is tracked separately via email_sent/email_sent_at.
 const checkStorageQuota = async (organizationId, summary) => {
   if (!summary) return;
 
   const maxBytes = Number(summary.max_storage_gb || 0) * 1024 ** 3;
   const usedBytes = Number(summary.used_storage_bytes || 0);
 
-  if (!maxBytes || usedBytes <= maxBytes) return;
+  if (!maxBytes || usedBytes < maxBytes * STORAGE_QUOTA_WARNING_THRESHOLD) {
+    return;
+  }
+
+  const isOverQuota = usedBytes >= maxBytes;
+  const alertType = isOverQuota
+    ? "storage_quota_warning"
+    : "storage_quota_approaching";
 
   const recentAlert = await pool.query(
     `
     SELECT 1 FROM plan_alerts
     WHERE organization_id = $1
-      AND alert_type = 'storage_quota_warning'
+      AND alert_type = $2
       AND created_at > NOW() - INTERVAL '${STORAGE_QUOTA_ALERT_COOLDOWN_HOURS} hours'
     LIMIT 1
     `,
-    [organizationId],
+    [organizationId, alertType],
   );
 
   if (recentAlert.rows[0]) return; // already warned recently, don't spam
 
   const usedGb = (usedBytes / 1024 ** 3).toFixed(1);
   const maxGb = Number(summary.max_storage_gb || 0);
+  const overageBytes = isOverQuota ? usedBytes - maxBytes : null;
 
-  await pool.query(
+  const message = isOverQuota
+    ? `You've used ${usedGb}GB of your plan's ${maxGb}GB recording storage limit. New recordings will keep archiving normally — the overage will be billed separately. Delete old recordings or upgrade your plan to bring usage back within your limit.`
+    : `You've used ${usedGb}GB of your plan's ${maxGb}GB recording storage limit (${Math.round((usedBytes / maxBytes) * 100)}%). No action needed yet — this is a heads-up before you reach your limit.`;
+
+  const insertResult = await pool.query(
     `
-    INSERT INTO plan_alerts (organization_id, alert_type, message)
-    VALUES ($1, 'storage_quota_warning', $2)
+    INSERT INTO plan_alerts (organization_id, alert_type, message, overage_bytes)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id
     `,
-    [
-      organizationId,
-      `You've used ${usedGb}GB of your plan's ${maxGb}GB recording storage limit. Delete old recordings or upgrade your plan to keep archiving new ones.`,
-    ],
+    [organizationId, alertType, message, overageBytes],
   );
 
   console.log(
-    `[STORAGE] Quota warning recorded for org ${organizationId} (${usedGb}GB / ${maxGb}GB)`,
+    `[STORAGE] ${isOverQuota ? "Overage" : "Approaching-quota"} alert recorded for org ${organizationId} (${usedGb}GB / ${maxGb}GB)`,
   );
+
+  const adminEmails = await getOrganizationAdminEmails(organizationId);
+  if (adminEmails) {
+    const subject = isOverQuota
+      ? "Storage limit reached — recording storage overage"
+      : "Approaching your recording storage limit";
+
+    const sent = await sendMailgunEmail({
+      to: adminEmails,
+      subject,
+      text: message,
+    });
+
+    if (sent) {
+      await pool.query(
+        `UPDATE plan_alerts SET email_sent = TRUE, email_sent_at = NOW() WHERE id = $1`,
+        [insertResult.rows[0].id],
+      );
+    }
+  }
 };
 
 // ══════════════════════════════════════════

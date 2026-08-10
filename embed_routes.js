@@ -31,6 +31,23 @@
 //   await embedRoutes.ensureEmbedColumns(pool);
 
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+
+// Same generous config as server.js's statusPollLimiter — this endpoint is
+// legitimately polled every few seconds by every active embed viewer, so a
+// tight per-user-action limiter would falsely throttle multiple real
+// viewers behind the same office/NAT IP. Defined locally (rather than
+// passed in via register()'s deps) so this module stays self-contained.
+const statusPollLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,
+  message: {
+    ok: false,
+    message: "Too many requests. Please slow down.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Where the iframe's src should point. Defaults to the API's own public URL
 // since this route is served directly by this backend (not the separately
@@ -827,40 +844,44 @@ module.exports = {
     );
 
     // ── Public: status JSON the embed page's own JS polls ──
-    app.get("/api/public/embed/:embedToken/status", async (req, res) => {
-      try {
-        const channelResult = await pool.query(
-          `SELECT c.id, c.name, c.stream_key, c.organization_id, c.embed_settings
+    app.get(
+      "/api/public/embed/:embedToken/status",
+      statusPollLimiter,
+      async (req, res) => {
+        try {
+          const channelResult = await pool.query(
+            `SELECT c.id, c.name, c.stream_key, c.organization_id, c.embed_settings
            FROM channels c
            JOIN organizations o ON o.id = c.organization_id
            WHERE c.embed_token = $1 AND o.is_active = TRUE
            LIMIT 1`,
-          [req.params.embedToken],
-        );
-        const channel = channelResult.rows[0];
-        if (!channel) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Embed not found" });
+            [req.params.embedToken],
+          );
+          const channel = channelResult.rows[0];
+          if (!channel) {
+            return res
+              .status(404)
+              .json({ ok: false, message: "Embed not found" });
+          }
+
+          const status = await getPublicWatchStatus(channel.stream_key);
+
+          res.set("Cache-Control", "no-store, private");
+          res.json({
+            ok: true,
+            channelName: channel.name,
+            streamKey: channel.stream_key,
+            embedSettings: channel.embed_settings || {},
+            ...status,
+          });
+        } catch (error) {
+          console.error("Public Embed Status Error:", error);
+          res
+            .status(500)
+            .json({ ok: false, message: "Failed to load embed status" });
         }
-
-        const status = await getPublicWatchStatus(channel.stream_key);
-
-        res.set("Cache-Control", "no-store, private");
-        res.json({
-          ok: true,
-          channelName: channel.name,
-          streamKey: channel.stream_key,
-          embedSettings: channel.embed_settings || {},
-          ...status,
-        });
-      } catch (error) {
-        console.error("Public Embed Status Error:", error);
-        res
-          .status(500)
-          .json({ ok: false, message: "Failed to load embed status" });
-      }
-    });
+      },
+    );
 
     // ── Public: the standalone, iframe-able embed page ──
     app.get("/embed/:embedToken", async (req, res) => {
