@@ -11099,11 +11099,21 @@ app.post(
       const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
       const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
 
+      // Same aac_adtstoasc fix as startOauthSimulcast below — see that
+      // function's comment for the full explanation. Manual mode pushes
+      // through this identical ffmpeg shape, so it was equally exposed.
       const proc = spawn("ffmpeg", [
+        ...inputResilienceFlags,
         "-i",
         sourceUrl,
-        "-c",
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-err_detect",
+        "ignore_err",
         "-f",
         "flv",
         destinationUrl,
@@ -11301,11 +11311,27 @@ async function startOauthSimulcast(channel, destination, organizationId) {
     };
   }
 
+  // Same bitstream-filter crash already found and fixed once for manual
+  // mid-broadcast recording: copying AAC straight from an HLS/MPEG-TS
+  // source into FLV requires ffmpeg's aac_adtstoasc filter to reframe it,
+  // and that filter has zero tolerance for a single malformed frame — one
+  // bad frame kills the whole process. Video stays copied (cheap, safe);
+  // audio is re-encoded instead of copied to sidestep the fragile filter
+  // entirely. inputResilienceFlags + err_detect ignore_err match the same
+  // established pattern used everywhere else in this file that reads a
+  // live HLS source (see buildRenditionFfmpegArgs / manual recording).
   const proc = spawn("ffmpeg", [
+    ...inputResilienceFlags,
     "-i",
     sourceUrl,
-    "-c",
+    "-c:v",
     "copy",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-err_detect",
+    "ignore_err",
     "-f",
     "flv",
     destinationUrl,
