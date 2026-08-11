@@ -7,3 +7,4 @@ deploy.sh
 docker-compose.yml
 api.nolimitsmedia.com.conf
 srs.conf
+client.zip
