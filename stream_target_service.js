@@ -49,15 +49,15 @@ const MAX_RECONNECT_DELAY_MS = Number(
 // Set STREAM_TARGET_AUDIO_MODE=transcode only if a future source/destination
 // combination requires AAC normalization.
 const STREAM_TARGET_AUDIO_MODE =
-  String(process.env.STREAM_TARGET_AUDIO_MODE || "copy").toLowerCase() ===
-  "transcode"
-    ? "transcode"
-    : "copy";
+  String(process.env.STREAM_TARGET_AUDIO_MODE || "transcode").toLowerCase() ===
+  "copy"
+    ? "copy"
+    : "transcode";
 
 function getTargetAudioArgs() {
-  return STREAM_TARGET_AUDIO_MODE === "transcode"
-    ? ["-c:a", "aac", "-b:a", "128k"]
-    : ["-c:a", "copy"];
+  return STREAM_TARGET_AUDIO_MODE === "copy"
+    ? ["-c:a", "copy"]
+    : ["-c:a", "aac", "-b:a", "128k", "-af", "aresample=async=1:first_pts=0"];
 }
 
 const STREAM_TARGET_HLS_READY_TIMEOUT_MS = Math.max(
@@ -247,7 +247,7 @@ function createStreamTargetManager({
 
   function classifyTransientSourceFailure(text) {
     const value = String(text || "");
-    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment|Invalid data found when processing input/i.test(
+    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment/i.test(
       value,
     );
   }
@@ -370,6 +370,10 @@ function createStreamTargetManager({
       ...inputResilienceFlags,
       "-i",
       sourceUrl,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
       "-nostats",
       "-progress",
       "pipe:1",
