@@ -7939,12 +7939,22 @@ const archiveRecordingRow = async (recording) => {
     }
 
     const channelSlug = recording.stream_key || "unknown-channel";
-    // Own-zone recordings don't need the org slug in the path (the zone
-    // itself is already org-specific) — kept for the shared zone, where
-    // it's how different orgs' files stay separated within one zone.
-    const remotePath = hasOwnZone
-      ? `${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`
-      : `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
+    const isManualClip = recording.source === "manual_clip";
+
+    // Manual clips get their own top-level folder so they're easy to
+    // find/manage separately from regular auto-archived recordings —
+    // requested explicitly, not the existing structure. Own-zone
+    // recordings still don't need the org slug (the zone itself is
+    // already org-specific); shared-zone ones still need it to keep
+    // different orgs' files separated within one zone, same reasoning
+    // as the existing path below.
+    const remotePath = isManualClip
+      ? hasOwnZone
+        ? `manual recording/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`
+        : `${orgSlug}/manual recording/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`
+      : hasOwnZone
+        ? `${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`
+        : `${orgSlug}/${channelSlug}/${yyyy}/${mm}/${dd}/${fileNameToArchive}`;
 
     await uploadFileToBunnyStorage(fileToArchive, remotePath, zoneCreds);
 
@@ -13284,6 +13294,25 @@ app.post(
         });
       }
 
+      // The frontend button already hides for plans without recording
+      // (planIncludesRecording in ChannelsPanel.jsx), but that's a UI
+      // convenience, not security — this route needs its own real check,
+      // or a direct API call could bypass it entirely and let an
+      // Essential-plan org rack up real Bunny storage costs for a
+      // feature they haven't paid for. Same summary/field this same
+      // gate already uses in checkStorageQuota() and
+      // autoSyncRecordingsDelayed() above.
+      const summary = await getOrganizationSubscriptionSummary(
+        req.organization.id,
+      );
+      if (!summary?.recording_enabled) {
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Recording isn't included on your current plan. Upgrade to Deluxe or Premium to use manual recording.",
+        });
+      }
+
       const isLive = await isSrsStreamLive(channel.stream_key);
       if (!isLive) {
         return res.status(400).json({
@@ -13471,6 +13500,27 @@ app.post(
             `UPDATE recordings SET source = 'manual_clip', started_at = $2, ended_at = $3 WHERE id = $1`,
             [recording.id, startedAt, endedAt.toISOString()],
           );
+
+          // Archive to Bunny + delete the local file(s) IMMEDIATELY,
+          // rather than waiting for archiveReadyRecordingsForOrganization
+          // — that only ever runs 8s after the whole broadcast's
+          // on_unpublish fires, which for a manual clip taken mid-
+          // broadcast could be arbitrarily far in the future (the
+          // broadcast may keep going for hours after this clip is
+          // stopped). Recordings should never sit on local disk longer
+          // than necessary to convert them — this makes manual clips
+          // behave the same way auto-archived recordings already do,
+          // instead of accumulating local disk usage until the source
+          // broadcast happens to end.
+          if (BUNNY_STORAGE_API_KEY) {
+            const freshRow = await pool.query(
+              `SELECT * FROM recordings WHERE id = $1`,
+              [recording.id],
+            );
+            if (freshRow.rows[0]) {
+              await archiveRecordingRow(freshRow.rows[0]);
+            }
+          }
 
           console.log(
             `[MANUAL-RECORDING] Registered clip for ${channel.stream_key}: ${filename}`,
