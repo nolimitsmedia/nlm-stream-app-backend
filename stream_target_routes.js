@@ -13,13 +13,19 @@ function sanitizeTarget(row, runtimeState = null) {
   // per-broadcast credentials. Manual stream_key remains available because the
   // existing UI already manages it and admins need to edit it.
   if (merged.automation_mode === "oauth") merged.active_destination_url = null;
+  const runtimeUptime = Number(runtimeState?.uptime_seconds);
   const startedAt = merged.started_at
     ? new Date(merged.started_at).getTime()
     : null;
-  merged.uptime_seconds =
-    merged.is_running && startedAt
-      ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
-      : 0;
+
+  if (runtimeState && Number.isFinite(runtimeUptime)) {
+    merged.uptime_seconds = Math.max(0, Math.floor(runtimeUptime));
+  } else {
+    merged.uptime_seconds =
+      merged.is_running && startedAt
+        ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        : 0;
+  }
   return merged;
 }
 
@@ -129,13 +135,11 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
       const automationMode =
         req.body.automation_mode === "oauth" ? "oauth" : "manual";
       if (automationMode === "oauth" && !config.oauth) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message:
-              "OAuth automation is only available for Facebook and YouTube",
-          });
+        return res.status(400).json({
+          ok: false,
+          message:
+            "OAuth automation is only available for Facebook and YouTube",
+        });
       }
 
       const protocol = manager.normalizeProtocol(req.body.protocol, targetType);
@@ -233,13 +237,11 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
       });
     } catch (error) {
       console.error("Create Stream Target Error:", error);
-      res
-        .status(500)
-        .json({
-          ok: false,
-          message: "Failed to create stream target",
-          error: error.message,
-        });
+      res.status(500).json({
+        ok: false,
+        message: "Failed to create stream target",
+        error: error.message,
+      });
     }
   }
 
@@ -411,12 +413,10 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
       res.status(result.ok ? 200 : 400).json(result);
     } catch (error) {
       console.error("Start Stream Target Error:", error);
-      res
-        .status(500)
-        .json({
-          ok: false,
-          message: error.message || "Failed to start stream target",
-        });
+      res.status(500).json({
+        ok: false,
+        message: error.message || "Failed to start stream target",
+      });
     }
   }
 

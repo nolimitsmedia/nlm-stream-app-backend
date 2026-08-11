@@ -60,6 +60,30 @@ function getTargetAudioArgs() {
     : ["-c:a", "copy"];
 }
 
+const STREAM_TARGET_HLS_READY_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.STREAM_TARGET_HLS_READY_TIMEOUT_MS || 20000),
+);
+const STREAM_TARGET_HLS_READY_POLL_MS = Math.max(
+  250,
+  Number(process.env.STREAM_TARGET_HLS_READY_POLL_MS || 750),
+);
+const STREAM_TARGET_HLS_READY_CONFIRMATIONS = Math.max(
+  1,
+  Number(process.env.STREAM_TARGET_HLS_READY_CONFIRMATIONS || 2),
+);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function looksLikePlayableHlsPlaylist(text) {
+  const body = String(text || "");
+  return (
+    body.includes("#EXTM3U") &&
+    (body.includes("#EXTINF:") || body.includes("#EXT-X-STREAM-INF:")) &&
+    /(?:\.ts|\.m4s|\.mp4)(?:\?|\s|$)/i.test(body)
+  );
+}
+
 function safeNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -173,6 +197,56 @@ function createStreamTargetManager({
       console.error("[STREAM-TARGET] SRS stream check failed:", error.message);
       return false;
     }
+  }
+
+  async function waitForPlayableHls(
+    streamKey,
+    timeoutMs = STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+  ) {
+    const sourceUrl = getInternalHlsSourceUrl(streamKey);
+    const deadline = Date.now() + Math.max(1000, Number(timeoutMs || 0));
+    let confirmations = 0;
+    let lastReason = "HLS playlist is not ready";
+
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(sourceUrl, {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+          signal: AbortSignal.timeout(4000),
+        });
+
+        if (!response.ok) {
+          confirmations = 0;
+          lastReason = `HLS returned HTTP ${response.status}`;
+        } else {
+          const body = await response.text();
+          if (looksLikePlayableHlsPlaylist(body)) {
+            confirmations += 1;
+            if (confirmations >= STREAM_TARGET_HLS_READY_CONFIRMATIONS) {
+              return { ok: true, sourceUrl };
+            }
+          } else {
+            confirmations = 0;
+            lastReason = "HLS playlist does not contain playable media yet";
+          }
+        }
+      } catch (error) {
+        confirmations = 0;
+        lastReason = error?.message || "HLS readiness check failed";
+      }
+
+      await sleep(STREAM_TARGET_HLS_READY_POLL_MS);
+    }
+
+    return { ok: false, sourceUrl, message: lastReason };
+  }
+
+  function classifyTransientSourceFailure(text) {
+    const value = String(text || "");
+    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment|Invalid data found when processing input/i.test(
+      value,
+    );
   }
 
   async function getDestinationAndChannel(destinationId) {
@@ -315,6 +389,9 @@ function createStreamTargetManager({
       (value === "continue" || value === "end")
     ) {
       state.lastProgressAt = Date.now();
+      state.retryAttempt = 0;
+      state.sourceHlsFault = false;
+      state.lastError = null;
       // Do not advertise STREAMING merely because FFmpeg spawned. The first
       // real progress heartbeat proves media is actually flowing through the
       // target worker.
@@ -329,6 +406,7 @@ function createStreamTargetManager({
          SET current_bitrate_kbps = $1,
              dropped_frames = $2,
              status = CASE WHEN is_running THEN $3 ELSE status END,
+             last_error = CASE WHEN $3 = 'streaming' THEN NULL ELSE last_error END,
              updated_at = now()
          WHERE id = $4`,
         [
@@ -377,6 +455,8 @@ function createStreamTargetManager({
       currentBitrateKbps: 0,
       droppedFrames: safeNumber(target.dropped_frames),
       reconnectCount: safeNumber(target.reconnect_count),
+      retryAttempt: 0,
+      sourceHlsFault: false,
       intentionalStop: false,
     };
     clearStateTimers(state);
@@ -385,10 +465,12 @@ function createStreamTargetManager({
     state.targetType = targetType;
     state.protocol = protocol;
     state.channelStreamKey = channel.stream_key;
-    state.startedAt =
-      reconnect && target.started_at
-        ? new Date(target.started_at).getTime()
-        : Date.now();
+    if (!state.startedAt || !reconnect) {
+      state.startedAt =
+        reconnect && target.started_at
+          ? new Date(target.started_at).getTime()
+          : Date.now();
+    }
 
     const proc = spawn(
       "ffmpeg",
@@ -409,7 +491,11 @@ function createStreamTargetManager({
 
     proc.stderr.on("data", (chunk) => {
       const text = chunk.toString();
-      if (/error|failed|refused|timed out|broken pipe/i.test(text)) {
+      if (classifyTransientSourceFailure(text)) {
+        state.sourceHlsFault = true;
+        state.lastError =
+          "Internal HLS source temporarily unavailable; reconnecting automatically.";
+      } else if (/error|failed|refused|timed out|broken pipe/i.test(text)) {
         state.lastError = text.trim().slice(-1200);
       }
       console.log(
@@ -454,57 +540,83 @@ function createStreamTargetManager({
         (code === 0
           ? null
           : `FFmpeg exited with code ${code}${signal ? ` (${signal})` : ""}`);
-      try {
-        await pool.query(
-          `UPDATE social_destinations
-           SET is_running = false,
-               ffmpeg_pid = NULL,
-               status = $1,
-               current_bitrate_kbps = 0,
-               last_disconnected_at = now(),
-               last_error = $2,
-               updated_at = now()
-           WHERE id = $3`,
-          [
-            wasIntentional ? "stopped" : "disconnected",
-            lastError,
-            destinationId,
-          ],
-        );
-      } catch (error) {
-        console.error(
-          `[STREAM-TARGET #${destinationId}] exit state update failed:`,
-          error.message,
-        );
-      }
 
       if (wasIntentional) {
+        try {
+          await pool.query(
+            `UPDATE social_destinations
+             SET is_running = false,
+                 ffmpeg_pid = NULL,
+                 status = 'stopped',
+                 current_bitrate_kbps = 0,
+                 last_disconnected_at = now(),
+                 last_error = NULL,
+                 updated_at = now()
+             WHERE id = $1`,
+            [destinationId],
+          );
+        } catch (error) {
+          console.error(
+            `[STREAM-TARGET #${destinationId}] stop state update failed:`,
+            error.message,
+          );
+        }
         processStates.delete(destinationId);
         return;
       }
 
       try {
         const fresh = await getDestinationAndChannel(destinationId);
-        if (!fresh || !fresh.enabled || !fresh.auto_reconnect) {
-          processStates.delete(destinationId);
-          return;
-        }
-        const live = await isSrsStreamLive(fresh.channel_stream_key);
-        if (!live) {
+        const canReconnect = Boolean(
+          fresh &&
+          fresh.enabled &&
+          fresh.auto_reconnect &&
+          (await isSrsStreamLive(fresh.channel_stream_key)),
+        );
+
+        if (!canReconnect) {
+          await pool.query(
+            `UPDATE social_destinations
+             SET is_running = false,
+                 ffmpeg_pid = NULL,
+                 status = 'disconnected',
+                 current_bitrate_kbps = 0,
+                 last_disconnected_at = now(),
+                 last_error = $1,
+                 updated_at = now()
+             WHERE id = $2`,
+            [lastError, destinationId],
+          );
           processStates.delete(destinationId);
           return;
         }
 
         state.reconnectCount = safeNumber(fresh.reconnect_count) + 1;
+        state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+        state.status = "reconnecting";
+
         await pool.query(
           `UPDATE social_destinations
-           SET status = 'reconnecting', reconnect_count = $1, updated_at = now()
-           WHERE id = $2`,
-          [state.reconnectCount, destinationId],
+           SET is_running = false,
+               ffmpeg_pid = NULL,
+               status = 'reconnecting',
+               reconnect_count = $1,
+               current_bitrate_kbps = 0,
+               last_disconnected_at = now(),
+               last_error = $2,
+               updated_at = now()
+           WHERE id = $3`,
+          [
+            state.reconnectCount,
+            state.sourceHlsFault
+              ? "Internal HLS source temporarily unavailable; reconnecting automatically."
+              : lastError,
+            destinationId,
+          ],
         );
 
         const delay = Math.min(
-          RECONNECT_DELAY_MS * Math.max(1, state.reconnectCount),
+          RECONNECT_DELAY_MS * Math.max(1, state.retryAttempt),
           MAX_RECONNECT_DELAY_MS,
         );
         state.reconnectTimer = setTimeout(async () => {
@@ -512,6 +624,16 @@ function createStreamTargetManager({
             const latest = await getDestinationAndChannel(destinationId);
             if (!latest || !latest.enabled)
               return processStates.delete(destinationId);
+            const readiness = await waitForPlayableHls(
+              latest.channel_stream_key,
+              STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+            );
+            if (!readiness.ok) {
+              throw new Error(
+                `Source HLS is not ready yet: ${readiness.message}`,
+              );
+            }
+
             const url =
               latest.active_destination_url ||
               state.destinationUrl ||
@@ -541,6 +663,16 @@ function createStreamTargetManager({
               ).catch(() => null);
               if (!latest || !latest.enabled || !latest.auto_reconnect)
                 return processStates.delete(destinationId);
+              const readiness = await waitForPlayableHls(
+                latest.channel_stream_key,
+                STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+              );
+              if (!readiness.ok) {
+                state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+                state.lastError = `Source HLS is not ready yet: ${readiness.message}`;
+                return;
+              }
+
               const url =
                 latest.active_destination_url ||
                 state.destinationUrl ||
@@ -592,6 +724,17 @@ function createStreamTargetManager({
         ok: false,
         message: "Main stream is not live yet. Start streaming first.",
       };
+
+    const readiness = await waitForPlayableHls(
+      channel.stream_key,
+      STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+    );
+    if (!readiness.ok) {
+      return {
+        ok: false,
+        message: `Source is live but HLS media is not ready yet: ${readiness.message}`,
+      };
+    }
 
     const validationError = validateManualTarget(target);
     if (validationError) return { ok: false, message: validationError };
@@ -786,15 +929,19 @@ function createStreamTargetManager({
 
     return {
       pid: state.proc?.pid || null,
+      is_running: Boolean(state.proc),
       current_bitrate_kbps: state.currentBitrateKbps || 0,
       dropped_frames: state.droppedFrames || 0,
       reconnect_count: state.reconnectCount || 0,
       runtime_status: state.proc
         ? state.status || "connecting"
-        : "disconnected",
-      status: state.proc ? state.status || "connecting" : "disconnected",
+        : state.status || "disconnected",
+      status: state.proc
+        ? state.status || "connecting"
+        : state.status || "disconnected",
       uptime_seconds: uptimeSeconds,
       started_at: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : null,
+      source_hls_fault: Boolean(state.sourceHlsFault),
     };
   }
 
@@ -812,6 +959,7 @@ function createStreamTargetManager({
     reconcileDatabaseState,
     getRuntimeState,
     isSrsStreamLive,
+    waitForPlayableHls,
   };
 }
 
