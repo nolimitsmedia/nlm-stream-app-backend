@@ -10,6 +10,15 @@ const PROBE_TIMEOUT_MS = Number(
   process.env.STREAM_ANALYZER_PROBE_TIMEOUT_MS || 9000,
 );
 const HISTORY_MAX_SAMPLES = 20;
+const BITRATE_WARMUP_SECONDS = Number(
+  process.env.STREAM_ANALYZER_BITRATE_WARMUP_SECONDS || 30,
+);
+const BITRATE_MIN_SAMPLES = Number(
+  process.env.STREAM_ANALYZER_BITRATE_MIN_SAMPLES || 6,
+);
+const BITRATE_SAMPLE_MIN_INTERVAL_MS = Number(
+  process.env.STREAM_ANALYZER_BITRATE_SAMPLE_MIN_INTERVAL_MS || 2500,
+);
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -31,49 +40,91 @@ const round = (value, digits = 0) => {
   return Math.round(Number(value) * factor) / factor;
 };
 
-const pushBitrateSample = (streamName, bitrateKbps) => {
+const pushBitrateSample = (streamName, bitrateKbps, uptimeSeconds = null) => {
   if (
     !streamName ||
     !Number.isFinite(Number(bitrateKbps)) ||
     Number(bitrateKbps) <= 0
   ) {
-    return [];
+    return bitrateHistory.get(streamName) || [];
   }
+
+  const uptime = Number(uptimeSeconds);
+  if (
+    Number.isFinite(uptime) &&
+    uptime >= 0 &&
+    uptime < BITRATE_WARMUP_SECONDS
+  ) {
+    return bitrateHistory.get(streamName) || [];
+  }
+
   const now = Date.now();
   const samples = bitrateHistory.get(streamName) || [];
+  const last = samples[samples.length - 1];
+
+  // The streams endpoint can be polled frequently and the analyzer itself can
+  // request a sample at almost the same instant. Do not double-count those reads.
+  if (last && now - last.at < BITRATE_SAMPLE_MIN_INTERVAL_MS) return samples;
+
   samples.push({ at: now, value: Number(bitrateKbps) });
   while (samples.length > HISTORY_MAX_SAMPLES) samples.shift();
   bitrateHistory.set(streamName, samples);
   return samples;
 };
 
-const calculateBitrateStability = (samples = []) => {
-  if (samples.length < 3)
+const calculateBitrateStability = (samples = [], uptimeSeconds = null) => {
+  const uptime = Number(uptimeSeconds);
+  const warmupRemaining = Number.isFinite(uptime)
+    ? Math.max(0, Math.ceil(BITRATE_WARMUP_SECONDS - uptime))
+    : 0;
+
+  if (warmupRemaining > 0) {
     return {
       score: null,
       variation_percent: null,
       sample_count: samples.length,
+      state: "warmup",
+      warmup_remaining_seconds: warmupRemaining,
     };
+  }
+
   const values = samples
-    .map((s) => Number(s.value))
-    .filter((v) => Number.isFinite(v) && v > 0);
-  if (values.length < 3)
+    .map((sample) => Number(sample.value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (values.length < BITRATE_MIN_SAMPLES) {
     return {
       score: null,
       variation_percent: null,
       sample_count: values.length,
+      state: "collecting",
+      samples_needed: Math.max(0, BITRATE_MIN_SAMPLES - values.length),
+      warmup_remaining_seconds: 0,
     };
+  }
+
+  // SRS recv_30s is already a rolling bitrate. CV across a recent window is a
+  // better signal than comparing a single high/low pair and naturally ignores
+  // normal frame-to-frame VBR changes while still exposing sustained drops.
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
   const variance =
     values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
   const stdDev = Math.sqrt(variance);
   const cv = mean > 0 ? stdDev / mean : 1;
   const variationPercent = cv * 100;
-  const score = clamp(Math.round(100 - variationPercent * 2.5), 0, 100);
+
+  // Up to ~10% rolling variation is treated as excellent. Beyond that the
+  // score declines progressively instead of aggressively punishing normal VBR.
+  const score = clamp(
+    Math.round(100 - Math.max(0, variationPercent - 10) * 1.5),
+    0,
+    100,
+  );
   return {
     score,
     variation_percent: round(variationPercent, 1),
     sample_count: values.length,
+    state: "ready",
+    warmup_remaining_seconds: 0,
   };
 };
 
@@ -200,6 +251,29 @@ const estimatePacketBitrate = (probeData, streamIndex) => {
   return round(bits / duration / 1000, 0);
 };
 
+const chooseAudioBitrate = ({ probeData, probedAudio, codec }) => {
+  const metadataKbps =
+    Number(probedAudio?.bit_rate) > 0
+      ? round(Number(probedAudio.bit_rate) / 1000, 0)
+      : null;
+  const packetKbps = estimatePacketBitrate(probeData, probedAudio?.index);
+  const normalizedCodec = String(codec || "").toLowerCase();
+
+  // HLS packet timestamps can span discontinuities/segment boundaries and can
+  // make packet-derived audio bitrate look impossibly low (for example 5 kbps).
+  // Only publish a value when it falls inside a credible range for the codec.
+  const minKbps = normalizedCodec === "opus" ? 12 : 16;
+  const maxKbps = normalizedCodec === "aac" ? 768 : 1024;
+  const candidates = [metadataKbps, packetKbps].filter(
+    (value) =>
+      Number.isFinite(Number(value)) &&
+      Number(value) >= minKbps &&
+      Number(value) <= maxKbps,
+  );
+
+  return candidates.length ? Number(candidates[0]) : null;
+};
+
 const inspectHls = async (url, cacheKey) => {
   const previous = hlsState.get(cacheKey);
   const controller = new AbortController();
@@ -302,7 +376,11 @@ const buildWarnings = ({
       title: "Keyframe interval",
       message: `Current: ${keyframe.seconds} sec. Recommended: approximately 2 sec.`,
     });
-  if (bitrateStability?.score !== null && bitrateStability.score < 70)
+  if (
+    bitrateStability?.state === "ready" &&
+    bitrateStability?.score !== null &&
+    bitrateStability.score < 70
+  )
     warnings.push({
       code: "BITRATE_UNSTABLE",
       severity: "warning",
@@ -348,7 +426,7 @@ const calculateHealth = ({
       key,
       label,
       weight,
-      score: round(score, 0),
+      score: score === null || score === undefined ? null : round(score, 0),
       status,
       detail,
     });
@@ -383,21 +461,31 @@ const calculateHealth = ({
       ? `${String(audio.codec).toUpperCase()} ${audio.sample_rate || "?"} Hz`
       : "Not confirmed",
   );
-  const stabilityScore =
-    bitrateStability?.score === null ? 85 : bitrateStability.score;
+  const stabilityReady =
+    bitrateStability?.state === "ready" && bitrateStability?.score !== null;
+  const stabilityScore = stabilityReady ? bitrateStability.score : null;
+  const stabilityDetail =
+    bitrateStability?.state === "warmup"
+      ? `Warm-up · ${bitrateStability.warmup_remaining_seconds}s remaining`
+      : bitrateStability?.state === "collecting"
+        ? `Collecting samples · ${bitrateStability.sample_count}/${BITRATE_MIN_SAMPLES}`
+        : bitrateStability?.variation_percent !== null &&
+            bitrateStability?.variation_percent !== undefined
+          ? `${bitrateStability.variation_percent}% rolling variation`
+          : "Analyzing";
   add(
     "bitrate",
     "Bitrate stability",
     15,
     stabilityScore,
-    stabilityScore >= 80
-      ? "healthy"
-      : stabilityScore >= 60
-        ? "warning"
-        : "critical",
-    bitrateStability?.variation_percent === null
-      ? "Building history"
-      : `${bitrateStability.variation_percent}% variation`,
+    stabilityReady
+      ? stabilityScore >= 80
+        ? "healthy"
+        : stabilityScore >= 60
+          ? "warning"
+          : "critical"
+      : "unknown",
+    stabilityDetail,
   );
   const fpsScore = !video?.fps
     ? 85
@@ -459,16 +547,22 @@ const calculateHealth = ({
     probeOk ? "FFprobe verified" : "Using SRS telemetry",
   );
 
-  const totalWeight = components.reduce(
+  const scoredComponents = components.filter((component) =>
+    Number.isFinite(Number(component.score)),
+  );
+  const totalWeight = scoredComponents.reduce(
     (sum, component) => sum + component.weight,
     0,
   );
-  const score = Math.round(
-    components.reduce(
-      (sum, component) => sum + component.score * component.weight,
-      0,
-    ) / totalWeight,
-  );
+  const score =
+    totalWeight > 0
+      ? Math.round(
+          scoredComponents.reduce(
+            (sum, component) => sum + component.score * component.weight,
+            0,
+          ) / totalWeight,
+        )
+      : 0;
   const status = score >= 85 ? "healthy" : score >= 65 ? "warning" : "critical";
   return { score, status, components };
 };
@@ -477,8 +571,11 @@ const analyzeLiveStream = async ({ stream, internalHlsBaseUrl }) => {
   const streamName = String(stream?.name || "");
   const cacheKey = `${stream?.app || "live"}:${streamName}`;
   const bitrate = Number(stream?.kbps?.recv_30s || 0);
-  const samples = pushBitrateSample(cacheKey, bitrate);
-  const bitrateStability = calculateBitrateStability(samples);
+  const uptimeSeconds = Number(
+    stream?.uptime_seconds ?? stream?.publish?.active_age ?? 0,
+  );
+  const samples = pushBitrateSample(cacheKey, bitrate, uptimeSeconds);
+  const bitrateStability = calculateBitrateStability(samples, uptimeSeconds);
 
   const cached = analyzerCache.get(cacheKey);
   if (cached && Date.now() - cached.at < ANALYZER_CACHE_MS) {
@@ -517,18 +614,21 @@ const analyzeLiveStream = async ({ stream, internalHlsBaseUrl }) => {
         : null),
   };
 
+  const audioCodec = probedAudio?.codec_name || srsAudio?.codec || null;
   const audio = {
-    codec: probedAudio?.codec_name || srsAudio?.codec || null,
-    bitrate_kbps:
-      estimatePacketBitrate(probe.data, probedAudio?.index) ||
-      (Number(probedAudio?.bit_rate) > 0
-        ? round(Number(probedAudio.bit_rate) / 1000, 0)
-        : null),
+    codec: audioCodec,
+    bitrate_kbps: chooseAudioBitrate({
+      probeData: probe.data,
+      probedAudio,
+      codec: audioCodec,
+    }),
+    bitrate_verified: false,
     sample_rate:
       Number(probedAudio?.sample_rate || srsAudio?.sample_rate || 0) || null,
     channels: Number(probedAudio?.channels || srsAudio?.channels || 0) || null,
     channel_layout: probedAudio?.channel_layout || null,
   };
+  audio.bitrate_verified = Number.isFinite(Number(audio.bitrate_kbps));
 
   const keyframe = deriveKeyframeInterval(probe.data, probedVideo?.index, fps);
   const health = calculateHealth({
@@ -574,8 +674,11 @@ const getCachedStreamAnalysis = (stream) => {
   const streamName = String(stream?.name || "");
   const cacheKey = `${stream?.app || "live"}:${streamName}`;
   const bitrate = Number(stream?.kbps?.recv_30s || 0);
-  const samples = pushBitrateSample(cacheKey, bitrate);
-  const bitrateStability = calculateBitrateStability(samples);
+  const uptimeSeconds = Number(
+    stream?.uptime_seconds ?? stream?.publish?.active_age ?? 0,
+  );
+  const samples = pushBitrateSample(cacheKey, bitrate, uptimeSeconds);
+  const bitrateStability = calculateBitrateStability(samples, uptimeSeconds);
   const cached = analyzerCache.get(cacheKey);
   if (!cached) {
     return {

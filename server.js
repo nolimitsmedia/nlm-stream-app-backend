@@ -6801,11 +6801,15 @@ app.get(
 
           let mediaAnalysis = null;
           if (isPrimaryLiveInput) {
+            const analyzerStream = {
+              ...stream,
+              uptime_seconds: uptimeSeconds,
+            };
             scheduleLiveStreamAnalysis({
-              stream,
+              stream: analyzerStream,
               internalHlsBaseUrl: SRS_INTERNAL_HLS_BASE_URL,
             });
-            mediaAnalysis = getCachedStreamAnalysis(stream);
+            mediaAnalysis = getCachedStreamAnalysis(analyzerStream);
           }
 
           return {
