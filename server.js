@@ -13331,12 +13331,33 @@ app.post(
       // MP4 afterward — see the stop handler below.
       const sourceUrl = `${SRS_HLS_ORIGIN}/live/${channel.stream_key}.m3u8`;
 
+      // CONFIRMED LIVE BUG (2026-08-10), fixed via actual ffmpeg stderr
+      // logs, not guessed: a blanket "-c copy" here killed the whole
+      // process outright on a single malformed AAC frame —
+      // "[aac_adtstoasc] Error parsing ADTS frame header! / Conversion
+      // failed!" — because copying AAC from an MPEG-TS/HLS source into
+      // FLV requires ffmpeg's aac_adtstoasc bitstream filter to reframe
+      // it, and that filter has no tolerance for one bad frame. Video is
+      // still safe to copy (-c:v copy, no re-encode needed), but audio
+      // is now RE-ENCODED (-c:a aac) instead of copied — this sidesteps
+      // the fragile bitstream filter entirely by producing clean AAC
+      // frames of ffmpeg's own making rather than reformatting whatever
+      // the source handed it. This also matches how audio is ALREADY
+      // handled in buildRenditionFfmpegArgs() above for the ABR
+      // transcoders (always -c:a aac, never -c:a copy) — should have
+      // followed that same established pattern from the start.
       const args = [
         ...inputResilienceFlags,
         "-i",
         sourceUrl,
-        "-c",
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-err_detect",
+        "ignore_err",
         "-f",
         "flv",
         outputPath,
