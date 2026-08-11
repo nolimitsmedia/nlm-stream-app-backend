@@ -9175,6 +9175,51 @@ app.post("/api/srs/on_publish", async (req, res) => {
         ),
       );
 
+    // 4b. SOCIAL-OAUTH AUTO GO-LIVE — Wowza-style auto-fire for any
+    // connected (automation_mode = 'oauth') Facebook/YouTube destination on
+    // this channel. Fire-and-forget, same shape as the rendition spawn
+    // above: must never block or throw into the on_publish response SRS is
+    // waiting on to allow/reject the connection. Delayed 5s (longer than
+    // the 3s rendition delay) since this pulls from our own internal HLS
+    // source, which needs a couple of real segments written before it's
+    // pull-able — a bare RTMP passthrough doesn't need that buffer, HLS
+    // does. startOauthSimulcast()'s own socialProcesses.has() guard is what
+    // absorbs a quick reconnect/blip without spinning up a duplicate
+    // platform broadcast — see the function for that reasoning.
+    pool
+      .query(
+        `SELECT * FROM social_destinations
+         WHERE channel_id = $1 AND automation_mode = 'oauth' AND oauth_account_id IS NOT NULL`,
+        [channel.id],
+      )
+      .then((destResult) => {
+        for (const destination of destResult.rows) {
+          const autoGoLiveTimer = setTimeout(() => {
+            startOauthSimulcast(channel, destination, channel.org_id)
+              .then((result) => {
+                if (!result.ok) {
+                  console.log(
+                    `[SOCIAL-OAUTH] Auto go-live skipped for ${destination.platform} #${destination.id}: ${result.message}`,
+                  );
+                }
+              })
+              .catch((err) =>
+                console.error(
+                  `[SOCIAL-OAUTH] Auto go-live failed for ${destination.platform} #${destination.id}:`,
+                  err.message,
+                ),
+              );
+          }, 5000);
+          autoGoLiveTimer.unref?.();
+        }
+      })
+      .catch((err) =>
+        console.error(
+          "[SOCIAL-OAUTH] Failed to load social destinations for auto go-live:",
+          err.message,
+        ),
+      );
+
     // 5. Notify all connected dashboard clients via socket
     if (io) {
       io.emit("stream:live", {
@@ -9289,6 +9334,37 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
 
     const orgId = channelResult.rows[0]?.organization_id;
     const endedChannelId = channelResult.rows[0]?.id;
+
+    // SOCIAL-OAUTH AUTO END-LIVE — mirror of the auto go-live hook in
+    // on_publish. Without this, our ffmpeg push dies on its own once the
+    // source disappears, but the platform-side broadcast (Facebook
+    // especially) is left showing "live" indefinitely until endLiveVideo/
+    // transitionBroadcast is explicitly called. Fire-and-forget, same
+    // reasoning as above — never block this webhook response.
+    if (endedChannelId) {
+      pool
+        .query(
+          `SELECT * FROM social_destinations
+           WHERE channel_id = $1 AND automation_mode = 'oauth' AND is_running = true`,
+          [endedChannelId],
+        )
+        .then((destResult) => {
+          for (const destination of destResult.rows) {
+            endOauthSimulcast(destination).catch((err) =>
+              console.error(
+                `[SOCIAL-OAUTH] Auto end-live failed for ${destination.platform} #${destination.id}:`,
+                err.message,
+              ),
+            );
+          }
+        })
+        .catch((err) =>
+          console.error(
+            "[SOCIAL-OAUTH] Failed to load social destinations for auto end-live:",
+            err.message,
+          ),
+        );
+    }
 
     // Notify dashboard
     if (io) {
@@ -11127,6 +11203,155 @@ app.post(
 | manual-key destinations are completely unaffected.
 */
 
+// Core go-live logic, shared by the manual "Go Live" button route below AND
+// the auto-fire hook in on_publish (see SOCIAL-OAUTH AUTO GO-LIVE section
+// near on_publish). Returns a plain {ok, message} result instead of writing
+// to res directly so both callers can use it — on_publish in particular must
+// never be blocked by or throw from this, since SRS is waiting on that
+// webhook's response to allow/reject the connection.
+async function startOauthSimulcast(channel, destination, organizationId) {
+  if (
+    destination.automation_mode !== "oauth" ||
+    !destination.oauth_account_id
+  ) {
+    return {
+      ok: false,
+      message:
+        "This destination isn't linked to a connected account. Use the manual start instead, or connect an account first.",
+    };
+  }
+  if (socialProcesses.has(destination.id)) {
+    // Reconnect/blip guard: if a push is already running for this
+    // destination, skip rather than spin up a second platform broadcast.
+    return { ok: false, message: "Already simulcasting to this platform" };
+  }
+
+  const live = await isSrsStreamLive(channel.stream_key);
+  if (!live) {
+    return {
+      ok: false,
+      message: "Main stream is not live yet. Start streaming first.",
+    };
+  }
+
+  const accountResult = await pool.query(
+    `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
+    [destination.oauth_account_id, organizationId],
+  );
+  const account = accountResult.rows[0];
+  if (!account) {
+    return { ok: false, message: "Connected account not found" };
+  }
+
+  const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
+  let destinationUrl, platformBroadcastId, platformStreamId;
+
+  try {
+    if (destination.platform === "facebook") {
+      const created = await facebookGraph.createLiveVideo({
+        pageId: account.external_account_id,
+        pageAccessToken: account.access_token,
+        title: channel.name,
+      });
+      destinationUrl = created.rtmpUrl;
+      platformBroadcastId = created.liveVideoId;
+    } else if (destination.platform === "youtube") {
+      // Access tokens are short-lived (~1hr) — refresh proactively rather
+      // than waiting for a 401 mid-request.
+      let accessToken = account.access_token;
+      if (
+        !account.token_expires_at ||
+        new Date(account.token_expires_at) <
+          new Date(Date.now() + 5 * 60 * 1000)
+      ) {
+        const refreshed = await youtubeApi.refreshAccessToken(
+          account.refresh_token,
+        );
+        accessToken = refreshed.access_token;
+        await pool.query(
+          `UPDATE social_oauth_accounts SET access_token = $1, token_expires_at = $2, updated_at = now() WHERE id = $3`,
+          [
+            accessToken,
+            refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
+            account.id,
+          ],
+        );
+      }
+      const oauth2Client = youtubeApi.clientFromTokens({
+        accessToken,
+        refreshToken: account.refresh_token,
+      });
+      const created = await youtubeApi.createBroadcastAndStream(oauth2Client, {
+        title: channel.name,
+      });
+      destinationUrl = created.rtmpUrl;
+      platformBroadcastId = created.broadcastId;
+      platformStreamId = created.streamId;
+    } else {
+      return { ok: false, message: "Unsupported platform for automation" };
+    }
+  } catch (platformErr) {
+    console.error(
+      `[SOCIAL-OAUTH] Failed to create broadcast on ${destination.platform}:`,
+      platformErr.message,
+    );
+    return {
+      ok: false,
+      message: platformErr.message || "Failed to create platform broadcast",
+    };
+  }
+
+  const proc = spawn("ffmpeg", [
+    "-i",
+    sourceUrl,
+    "-c",
+    "copy",
+    "-f",
+    "flv",
+    destinationUrl,
+  ]);
+
+  proc.stderr.on("data", (data) => {
+    console.log(
+      `[SOCIAL-OAUTH ${destination.platform} #${destination.id}]`,
+      data.toString().slice(0, 300),
+    );
+  });
+
+  proc.on("exit", (code) => {
+    console.log(
+      `[SOCIAL-OAUTH ${destination.platform} #${destination.id}] exited with code ${code}`,
+    );
+    socialProcesses.delete(destination.id);
+    pool
+      .query(
+        `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
+        [destination.id],
+      )
+      .catch((err) =>
+        console.error(
+          "[SOCIAL-OAUTH] Failed to update state on exit:",
+          err.message,
+        ),
+      );
+  });
+
+  socialProcesses.set(destination.id, proc);
+
+  await pool.query(
+    `UPDATE social_destinations
+     SET is_running = true, ffmpeg_pid = $1, started_at = now(),
+         platform_broadcast_id = $2, platform_stream_id = $3
+     WHERE id = $4`,
+    [proc.pid, platformBroadcastId, platformStreamId || null, destination.id],
+  );
+
+  return {
+    ok: true,
+    message: `Went live on ${SOCIAL_PLATFORMS[destination.platform].label} automatically`,
+  };
+}
+
 app.post(
   "/api/channels/:channelId/social-destinations/:id/go-live",
   authenticateAdmin,
@@ -11155,146 +11380,13 @@ app.post(
           .status(404)
           .json({ ok: false, message: "Social destination not found" });
       }
-      if (
-        destination.automation_mode !== "oauth" ||
-        !destination.oauth_account_id
-      ) {
-        return res.status(400).json({
-          ok: false,
-          message:
-            "This destination isn't linked to a connected account. Use the manual start instead, or connect an account first.",
-        });
-      }
-      if (socialProcesses.has(destination.id)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Already simulcasting to this platform",
-        });
-      }
 
-      const live = await isSrsStreamLive(channel.stream_key);
-      if (!live) {
-        return res.status(400).json({
-          ok: false,
-          message: "Main stream is not live yet. Start streaming first.",
-        });
-      }
-
-      const accountResult = await pool.query(
-        `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
-        [destination.oauth_account_id, req.organization.id],
+      const result = await startOauthSimulcast(
+        channel,
+        destination,
+        req.organization.id,
       );
-      const account = accountResult.rows[0];
-      if (!account) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Connected account not found" });
-      }
-
-      const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
-      let destinationUrl, platformBroadcastId, platformStreamId;
-
-      if (destination.platform === "facebook") {
-        const created = await facebookGraph.createLiveVideo({
-          pageId: account.external_account_id,
-          pageAccessToken: account.access_token,
-          title: channel.name,
-        });
-        destinationUrl = created.rtmpUrl;
-        platformBroadcastId = created.liveVideoId;
-      } else if (destination.platform === "youtube") {
-        // Access tokens are short-lived (~1hr) — refresh proactively rather
-        // than waiting for a 401 mid-request.
-        let accessToken = account.access_token;
-        if (
-          !account.token_expires_at ||
-          new Date(account.token_expires_at) <
-            new Date(Date.now() + 5 * 60 * 1000)
-        ) {
-          const refreshed = await youtubeApi.refreshAccessToken(
-            account.refresh_token,
-          );
-          accessToken = refreshed.access_token;
-          await pool.query(
-            `UPDATE social_oauth_accounts SET access_token = $1, token_expires_at = $2, updated_at = now() WHERE id = $3`,
-            [
-              accessToken,
-              refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
-              account.id,
-            ],
-          );
-        }
-        const oauth2Client = youtubeApi.clientFromTokens({
-          accessToken,
-          refreshToken: account.refresh_token,
-        });
-        const created = await youtubeApi.createBroadcastAndStream(
-          oauth2Client,
-          { title: channel.name },
-        );
-        destinationUrl = created.rtmpUrl;
-        platformBroadcastId = created.broadcastId;
-        platformStreamId = created.streamId;
-      } else {
-        return res
-          .status(400)
-          .json({ ok: false, message: "Unsupported platform for automation" });
-      }
-
-      const proc = spawn("ffmpeg", [
-        "-i",
-        sourceUrl,
-        "-c",
-        "copy",
-        "-f",
-        "flv",
-        destinationUrl,
-      ]);
-
-      proc.stderr.on("data", (data) => {
-        console.log(
-          `[SOCIAL-OAUTH ${destination.platform} #${destination.id}]`,
-          data.toString().slice(0, 300),
-        );
-      });
-
-      proc.on("exit", (code) => {
-        console.log(
-          `[SOCIAL-OAUTH ${destination.platform} #${destination.id}] exited with code ${code}`,
-        );
-        socialProcesses.delete(destination.id);
-        pool
-          .query(
-            `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
-            [destination.id],
-          )
-          .catch((err) =>
-            console.error(
-              "[SOCIAL-OAUTH] Failed to update state on exit:",
-              err.message,
-            ),
-          );
-      });
-
-      socialProcesses.set(destination.id, proc);
-
-      await pool.query(
-        `UPDATE social_destinations
-         SET is_running = true, ffmpeg_pid = $1, started_at = now(),
-             platform_broadcast_id = $2, platform_stream_id = $3
-         WHERE id = $4`,
-        [
-          proc.pid,
-          platformBroadcastId,
-          platformStreamId || null,
-          destination.id,
-        ],
-      );
-
-      res.json({
-        ok: true,
-        message: `Went live on ${SOCIAL_PLATFORMS[destination.platform].label} automatically`,
-      });
+      res.status(result.ok ? 200 : 400).json(result);
     } catch (error) {
       console.error("Automated Go-Live Error:", error);
       res.status(500).json({
@@ -11304,6 +11396,64 @@ app.post(
     }
   },
 );
+
+// Core end-live logic, shared by the manual "End Live" button route below
+// AND the auto-end hook in on_unpublish (see SOCIAL-OAUTH AUTO END-LIVE
+// section near on_unpublish).
+async function endOauthSimulcast(destination) {
+  const destId = destination.id;
+  const proc = socialProcesses.get(destId);
+  if (proc) {
+    proc.kill("SIGTERM");
+    socialProcesses.delete(destId);
+  }
+
+  // Kill our ffmpeg push first, then tell the platform to end the broadcast —
+  // otherwise Facebook/YouTube can be left showing "live" with a dead feed.
+  if (
+    destination.automation_mode === "oauth" &&
+    destination.platform_broadcast_id
+  ) {
+    try {
+      const accountResult = await pool.query(
+        `SELECT * FROM social_oauth_accounts WHERE id = $1`,
+        [destination.oauth_account_id],
+      );
+      const account = accountResult.rows[0];
+      if (account && destination.platform === "facebook") {
+        await facebookGraph.endLiveVideo({
+          liveVideoId: destination.platform_broadcast_id,
+          pageAccessToken: account.access_token,
+        });
+      } else if (account && destination.platform === "youtube") {
+        const oauth2Client = youtubeApi.clientFromTokens({
+          accessToken: account.access_token,
+          refreshToken: account.refresh_token,
+        });
+        await youtubeApi.transitionBroadcast(
+          oauth2Client,
+          destination.platform_broadcast_id,
+          "complete",
+        );
+      }
+    } catch (platformErr) {
+      // Don't fail the whole call over this — our feed is already stopped,
+      // which is the important part. Log it so a stuck "live" broadcast on
+      // the platform side can be caught.
+      console.error(
+        "[SOCIAL-OAUTH] Failed to end broadcast on platform:",
+        platformErr.message,
+      );
+    }
+  }
+
+  await pool.query(
+    `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
+    [destId],
+  );
+
+  return { ok: true, message: "Broadcast ended" };
+}
 
 app.post(
   "/api/channels/:channelId/social-destinations/:id/end-live",
@@ -11334,58 +11484,8 @@ app.post(
           .json({ ok: false, message: "Social destination not found" });
       }
 
-      const destId = destination.id;
-      const proc = socialProcesses.get(destId);
-      if (proc) {
-        proc.kill("SIGTERM");
-        socialProcesses.delete(destId);
-      }
-
-      // Kill our ffmpeg push first, then tell the platform to end the broadcast —
-      // otherwise Facebook/YouTube can be left showing "live" with a dead feed.
-      if (
-        destination.automation_mode === "oauth" &&
-        destination.platform_broadcast_id
-      ) {
-        try {
-          const accountResult = await pool.query(
-            `SELECT * FROM social_oauth_accounts WHERE id = $1`,
-            [destination.oauth_account_id],
-          );
-          const account = accountResult.rows[0];
-          if (account && destination.platform === "facebook") {
-            await facebookGraph.endLiveVideo({
-              liveVideoId: destination.platform_broadcast_id,
-              pageAccessToken: account.access_token,
-            });
-          } else if (account && destination.platform === "youtube") {
-            const oauth2Client = youtubeApi.clientFromTokens({
-              accessToken: account.access_token,
-              refreshToken: account.refresh_token,
-            });
-            await youtubeApi.transitionBroadcast(
-              oauth2Client,
-              destination.platform_broadcast_id,
-              "complete",
-            );
-          }
-        } catch (platformErr) {
-          // Don't fail the whole request over this — our feed is already
-          // stopped, which is what the user actually asked for. Log it so
-          // a stuck "live" broadcast on the platform side can be caught.
-          console.error(
-            "[SOCIAL-OAUTH] Failed to end broadcast on platform:",
-            platformErr.message,
-          );
-        }
-      }
-
-      await pool.query(
-        `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1 AND channel_id = $2`,
-        [destId, channel.id],
-      );
-
-      res.json({ ok: true, message: "Broadcast ended" });
+      const result = await endOauthSimulcast(destination);
+      res.json(result);
     } catch (error) {
       console.error("End Automated Broadcast Error:", error);
       res.status(500).json({ ok: false, message: "Failed to end broadcast" });
