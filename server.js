@@ -17,6 +17,10 @@ const jwt = require("jsonwebtoken");
 const whmcs = require("./whmcs_client");
 const bunny = require("./bunny_client");
 const embedRoutes = require("./embed_routes"); // Phase 1 — embedded player (Copy Embed Code)
+const {
+  getCachedStreamAnalysis,
+  scheduleLiveStreamAnalysis,
+} = require("./stream_health_service");
 
 let UAParser = null;
 try {
@@ -6792,12 +6796,25 @@ app.get(
                 )
               : 0;
 
+          const isPrimaryLiveInput =
+            stream.publish?.active && String(stream.app || "live") === "live";
+
+          let mediaAnalysis = null;
+          if (isPrimaryLiveInput) {
+            scheduleLiveStreamAnalysis({
+              stream,
+              internalHlsBaseUrl: SRS_INTERNAL_HLS_BASE_URL,
+            });
+            mediaAnalysis = getCachedStreamAnalysis(stream);
+          }
+
           return {
             ...stream,
             srs_clients: Number(stream.clients || 0),
             clients: viewerMetrics.active_viewers,
             viewerMetrics,
             uptime_seconds: uptimeSeconds,
+            mediaAnalysis,
             encoderGeneration:
               bitrateCapEncoderGeneration.get(stream.name) || 0,
             liveStartedAtMs: liveStartedAt

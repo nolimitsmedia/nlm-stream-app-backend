@@ -4,3 +4,6 @@ node_modules/
 serverjsbk.txt
 serverjsbk*.txt
 deploy.sh
+docker-compose.yml
+api.nolimitsmedia.com.conf
+srs.conf
