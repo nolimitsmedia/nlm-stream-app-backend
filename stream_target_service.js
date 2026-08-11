@@ -77,11 +77,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function looksLikePlayableHlsPlaylist(text) {
   const body = String(text || "");
-  return (
-    body.includes("#EXTM3U") &&
-    (body.includes("#EXTINF:") || body.includes("#EXT-X-STREAM-INF:")) &&
-    /(?:\.ts|\.m4s|\.mp4)(?:\?|\s|$)/i.test(body)
-  );
+  if (!body.includes("#EXTM3U")) return false;
+
+  // SRS HLS segment URIs can vary when encryption/hls_ctx is active.
+  // Requiring a .ts/.m4s/.mp4 filename caused valid HTTP 200 playlists to be
+  // rejected even while NLM's ABR FFmpeg workers were already consuming them.
+  // EXTINF proves this is a media playlist; EXT-X-STREAM-INF proves a valid
+  // master playlist.
+  return body.includes("#EXTINF:") || body.includes("#EXT-X-STREAM-INF:");
 }
 
 function safeNumber(value, fallback = 0) {
@@ -725,11 +728,33 @@ function createStreamTargetManager({
         message: "Main stream is not live yet. Start streaming first.",
       };
 
+    await pool.query(
+      `UPDATE social_destinations
+       SET status = 'connecting',
+           last_error = NULL,
+           current_bitrate_kbps = 0,
+           updated_at = now()
+       WHERE id = $1`,
+      [target.id],
+    );
+
     const readiness = await waitForPlayableHls(
       channel.stream_key,
       STREAM_TARGET_HLS_READY_TIMEOUT_MS,
     );
     if (!readiness.ok) {
+      await pool.query(
+        `UPDATE social_destinations
+         SET is_running = false,
+             ffmpeg_pid = NULL,
+             status = 'connecting',
+             last_error = NULL,
+             current_bitrate_kbps = 0,
+             updated_at = now()
+         WHERE id = $1`,
+        [target.id],
+      );
+
       return {
         ok: false,
         message: `Source is live but HLS media is not ready yet: ${readiness.message}`,
@@ -872,10 +897,36 @@ function createStreamTargetManager({
       const timer = setTimeout(() => {
         startTarget(target, channel, organizationId)
           .then((result) => {
-            if (!result.ok)
-              console.log(
-                `[STREAM-TARGET] Auto-start skipped for #${target.id}: ${result.message}`,
+            if (result.ok) return;
+
+            console.log(
+              `[STREAM-TARGET] Auto-start attempt for #${target.id} did not start: ${result.message}`,
+            );
+
+            const shouldRetry =
+              /HLS media is not ready|HLS playlist|HLS returned HTTP/i.test(
+                String(result.message || ""),
               );
+
+            if (!shouldRetry) return;
+
+            const retryTimer = setTimeout(() => {
+              startTarget(target, channel, organizationId)
+                .then((retryResult) => {
+                  if (!retryResult.ok) {
+                    console.log(
+                      `[STREAM-TARGET] Delayed auto-start retry for #${target.id} did not start: ${retryResult.message}`,
+                    );
+                  }
+                })
+                .catch((error) =>
+                  console.error(
+                    `[STREAM-TARGET] Delayed auto-start retry failed for #${target.id}:`,
+                    error.message,
+                  ),
+                );
+            }, 5000);
+            retryTimer.unref?.();
           })
           .catch((error) =>
             console.error(
