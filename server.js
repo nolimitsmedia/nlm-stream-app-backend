@@ -1047,6 +1047,35 @@ const requireOrganizationRole = (...allowedRoles) => {
   };
 };
 
+// Shared tenant-safe channel lookup used by channel feature routes such as
+// recording toggles, file-as-live broadcast, and manual recording clips.
+// This helper was referenced by those routes but was missing from server.js,
+// causing repeated ReferenceError / HTTP 500 responses.
+const getOwnedChannel = async (channelId, organizationId) => {
+  const id = Number(channelId);
+  const orgId = Number(organizationId);
+
+  if (
+    !Number.isInteger(id) ||
+    id <= 0 ||
+    !Number.isInteger(orgId) ||
+    orgId <= 0
+  ) {
+    return null;
+  }
+
+  const result = await queryWithRetry(
+    `SELECT *
+     FROM channels
+     WHERE id = $1
+       AND organization_id = $2
+     LIMIT 1`,
+    [id, orgId],
+  );
+
+  return result.rows[0] || null;
+};
+
 const getOrganizationIdForStreamKey = async (streamKey) => {
   const cleanStreamKey = String(streamKey || "")
     .trim()

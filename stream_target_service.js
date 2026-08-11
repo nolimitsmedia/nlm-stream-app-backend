@@ -41,6 +41,25 @@ const MAX_RECONNECT_DELAY_MS = Number(
   process.env.STREAM_TARGET_MAX_RECONNECT_DELAY_MS || 30000,
 );
 
+// Source HLS produced by SRS is already AAC in the current NLM pipeline.
+// Re-encoding that AAC for every simulcast target needlessly invokes the AAC
+// decoder and was producing intermittent "invalid band type" decode warnings
+// on encrypted HLS segment boundaries. Default to stream-copying audio.
+//
+// Set STREAM_TARGET_AUDIO_MODE=transcode only if a future source/destination
+// combination requires AAC normalization.
+const STREAM_TARGET_AUDIO_MODE =
+  String(process.env.STREAM_TARGET_AUDIO_MODE || "copy").toLowerCase() ===
+  "transcode"
+    ? "transcode"
+    : "copy";
+
+function getTargetAudioArgs() {
+  return STREAM_TARGET_AUDIO_MODE === "transcode"
+    ? ["-c:a", "aac", "-b:a", "128k"]
+    : ["-c:a", "copy"];
+}
+
 function safeNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -246,15 +265,13 @@ function createStreamTargetManager({
   }
 
   function buildFfmpegArgs(sourceUrl, destinationUrl, protocol) {
+    const audioArgs = getTargetAudioArgs();
     const output =
       protocol === "srt"
         ? [
             "-c:v",
             "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
+            ...audioArgs,
             "-err_detect",
             "ignore_err",
             "-f",
@@ -264,10 +281,7 @@ function createStreamTargetManager({
         : [
             "-c:v",
             "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
+            ...audioArgs,
             "-err_detect",
             "ignore_err",
             "-f",
@@ -296,8 +310,15 @@ function createStreamTargetManager({
       if (match) state.currentBitrateKbps = Math.round(Number(match[1]));
     } else if (key === "drop_frames") {
       state.droppedFrames = safeNumber(value, state.droppedFrames || 0);
-    } else if (key === "progress" && value === "continue") {
+    } else if (
+      key === "progress" &&
+      (value === "continue" || value === "end")
+    ) {
       state.lastProgressAt = Date.now();
+      // Do not advertise STREAMING merely because FFmpeg spawned. The first
+      // real progress heartbeat proves media is actually flowing through the
+      // target worker.
+      state.status = "streaming";
     }
   }
 
@@ -307,12 +328,13 @@ function createStreamTargetManager({
         `UPDATE social_destinations
          SET current_bitrate_kbps = $1,
              dropped_frames = $2,
-             status = CASE WHEN is_running THEN 'streaming' ELSE status END,
+             status = CASE WHEN is_running THEN $3 ELSE status END,
              updated_at = now()
-         WHERE id = $3`,
+         WHERE id = $4`,
         [
           state.currentBitrateKbps || 0,
           state.droppedFrames || 0,
+          state.status || "connecting",
           destinationId,
         ],
       );
@@ -406,7 +428,7 @@ function createStreamTargetManager({
       `UPDATE social_destinations
        SET is_running = true,
            ffmpeg_pid = $1,
-           status = 'streaming',
+           status = 'connecting',
            started_at = CASE WHEN $2::boolean THEN COALESCE(started_at, now()) ELSE now() END,
            last_connected_at = now(),
            last_error = NULL,
@@ -416,7 +438,9 @@ function createStreamTargetManager({
        WHERE id = $4`,
       [proc.pid, reconnect, destinationUrl, destinationId],
     );
-    state.status = "streaming";
+    // Remain in CONNECTING until FFmpeg emits its first progress heartbeat.
+    // parseProgressLine() promotes the runtime state to STREAMING once media
+    // is demonstrably flowing.
 
     proc.on("exit", async (code, signal) => {
       if (state.proc !== proc) return;
@@ -753,12 +777,24 @@ function createStreamTargetManager({
   function getRuntimeState(destinationId) {
     const state = processStates.get(Number(destinationId));
     if (!state) return null;
+
+    const startedAtMs = Number(state.startedAt || 0);
+    const uptimeSeconds =
+      state.proc && startedAtMs > 0
+        ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
+        : 0;
+
     return {
       pid: state.proc?.pid || null,
       current_bitrate_kbps: state.currentBitrateKbps || 0,
       dropped_frames: state.droppedFrames || 0,
       reconnect_count: state.reconnectCount || 0,
-      runtime_status: state.proc ? state.status || "streaming" : "disconnected",
+      runtime_status: state.proc
+        ? state.status || "connecting"
+        : "disconnected",
+      status: state.proc ? state.status || "connecting" : "disconnected",
+      uptime_seconds: uptimeSeconds,
+      started_at: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : null,
     };
   }
 

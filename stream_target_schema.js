@@ -7,6 +7,16 @@
 // generic RTMP/RTMPS/SRT/NLM/CDN targets.
 
 async function ensureStreamTargetColumns(pool) {
+  // Phase 2 generic targets use the legacy `platform` column as a unique
+  // internal key for custom destinations (for example custom_rtm_ab12cd).
+  // The pre-Phase-2 CHECK constraint only allowed a fixed social-platform
+  // list and therefore rejects valid generic targets. Remove it idempotently
+  // on every deployment/startup so fresh/older databases migrate safely.
+  await pool.query(`
+    ALTER TABLE social_destinations
+    DROP CONSTRAINT IF EXISTS social_destinations_platform_check
+  `);
+
   await pool.query(`
     ALTER TABLE social_destinations
       ADD COLUMN IF NOT EXISTS name VARCHAR(255),
