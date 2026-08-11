@@ -80,6 +80,8 @@ const queryWithRetry = async (text, params = [], options = {}) => {
   throw lastError;
 };
 const { ensureSocialOAuthTables } = require("./social_oauth_schema");
+const { ensureStreamTargetColumns } = require("./stream_target_schema");
+const registerStreamTargetRoutes = require("./stream_target_routes");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
 const { clear } = require("console");
@@ -9175,50 +9177,21 @@ app.post("/api/srs/on_publish", async (req, res) => {
         ),
       );
 
-    // 4b. SOCIAL-OAUTH AUTO GO-LIVE — Wowza-style auto-fire for any
-    // connected (automation_mode = 'oauth') Facebook/YouTube destination on
-    // this channel. Fire-and-forget, same shape as the rendition spawn
-    // above: must never block or throw into the on_publish response SRS is
-    // waiting on to allow/reject the connection. Delayed 5s (longer than
-    // the 3s rendition delay) since this pulls from our own internal HLS
-    // source, which needs a couple of real segments written before it's
-    // pull-able — a bare RTMP passthrough doesn't need that buffer, HLS
-    // does. startOauthSimulcast()'s own socialProcesses.has() guard is what
-    // absorbs a quick reconnect/blip without spinning up a duplicate
-    // platform broadcast — see the function for that reasoning.
-    pool
-      .query(
-        `SELECT * FROM social_destinations
-         WHERE channel_id = $1 AND automation_mode = 'oauth' AND oauth_account_id IS NOT NULL`,
-        [channel.id],
-      )
-      .then((destResult) => {
-        for (const destination of destResult.rows) {
-          const autoGoLiveTimer = setTimeout(() => {
-            startOauthSimulcast(channel, destination, channel.org_id)
-              .then((result) => {
-                if (!result.ok) {
-                  console.log(
-                    `[SOCIAL-OAUTH] Auto go-live skipped for ${destination.platform} #${destination.id}: ${result.message}`,
-                  );
-                }
-              })
-              .catch((err) =>
-                console.error(
-                  `[SOCIAL-OAUTH] Auto go-live failed for ${destination.platform} #${destination.id}:`,
-                  err.message,
-                ),
-              );
-          }, 5000);
-          autoGoLiveTimer.unref?.();
-        }
-      })
-      .catch((err) =>
-        console.error(
-          "[SOCIAL-OAUTH] Failed to load social destinations for auto go-live:",
-          err.message,
-        ),
-      );
+    // 4b. STREAM TARGET AUTO-START — Phase 2 generic target orchestration.
+    // Targets explicitly configured with enabled + auto_start are started
+    // after HLS has had time to produce real segments. The manager handles
+    // OAuth targets, generic RTMP/RTMPS/SRT targets, reconnects, and metrics.
+    const streamTargetAutoStartTimer = setTimeout(() => {
+      streamTargetManager
+        .startAutoTargets(channel, channel.org_id)
+        .catch((err) =>
+          console.error(
+            `[STREAM-TARGET] Auto-start failed for channel ${channel.id}:`,
+            err.message,
+          ),
+        );
+    }, 5000);
+    streamTargetAutoStartTimer.unref?.();
 
     // 5. Notify all connected dashboard clients via socket
     if (io) {
@@ -9335,32 +9308,14 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     const orgId = channelResult.rows[0]?.organization_id;
     const endedChannelId = channelResult.rows[0]?.id;
 
-    // SOCIAL-OAUTH AUTO END-LIVE — mirror of the auto go-live hook in
-    // on_publish. Without this, our ffmpeg push dies on its own once the
-    // source disappears, but the platform-side broadcast (Facebook
-    // especially) is left showing "live" indefinitely until endLiveVideo/
-    // transitionBroadcast is explicitly called. Fire-and-forget, same
-    // reasoning as above — never block this webhook response.
+    // STREAM TARGET AUTO-STOP — stop every running target for this channel,
+    // including platform-side OAuth broadcasts, when the source unpublishes.
     if (endedChannelId) {
-      pool
-        .query(
-          `SELECT * FROM social_destinations
-           WHERE channel_id = $1 AND automation_mode = 'oauth' AND is_running = true`,
-          [endedChannelId],
-        )
-        .then((destResult) => {
-          for (const destination of destResult.rows) {
-            endOauthSimulcast(destination).catch((err) =>
-              console.error(
-                `[SOCIAL-OAUTH] Auto end-live failed for ${destination.platform} #${destination.id}:`,
-                err.message,
-              ),
-            );
-          }
-        })
+      streamTargetManager
+        .stopChannelTargets(endedChannelId)
         .catch((err) =>
           console.error(
-            "[SOCIAL-OAUTH] Failed to load social destinations for auto end-live:",
+            `[STREAM-TARGET] Auto-stop failed for channel ${endedChannelId}:`,
             err.message,
           ),
         );
@@ -9828,17 +9783,12 @@ app.post(
 
       const socialCorrections = [];
       for (const dest of socialResult.rows) {
-        const actuallyRunning = socialProcesses.has(dest.id);
+        const runtime = streamTargetManager.getRuntimeState(dest.id);
+        const actuallyRunning = Boolean(runtime?.pid);
         if (Boolean(dest.is_running) !== actuallyRunning) {
           await pool.query(
             `UPDATE social_destinations SET is_running = $1, ffmpeg_pid = $2 WHERE id = $3`,
-            [
-              actuallyRunning,
-              actuallyRunning
-                ? (socialProcesses.get(dest.id)?.pid ?? null)
-                : null,
-              dest.id,
-            ],
+            [actuallyRunning, actuallyRunning ? runtime.pid : null, dest.id],
           );
           socialCorrections.push({
             destination_id: dest.id,
@@ -10872,652 +10822,17 @@ embedRoutes.register(app, pool, {
 
 /*
 |--------------------------------------------------------------------------
-| SOCIAL DESTINATIONS (Facebook / YouTube simulcasting)
+| STREAM TARGETS — Phase 2 generic simulcast/output subsystem
 |--------------------------------------------------------------------------
 */
-const socialProcesses = new Map(); // destinationId -> ChildProcess
-
-const SOCIAL_PLATFORMS = {
-  facebook: {
-    label: "Facebook",
-    rtmpBase: "rtmps://live-api-s.facebook.com:443/rtmp",
-  },
-  youtube: {
-    label: "YouTube",
-    rtmpBase: "rtmp://a.rtmp.youtube.com/live2",
-  },
-  // Instagram has no Graph-API equivalent to Facebook/YouTube's "create a
-  // broadcast, get RTMP credentials back" flow — Meta only offers Live
-  // Producer, a manual, browser-only tool (instagram.com, not the app)
-  // that issues a fresh one-time Stream URL + Stream Key per broadcast,
-  // requiring a Business or Creator account. There is no OAuth
-  // automation to build here — this is deliberately manual-key-only,
-  // same as Facebook/YouTube's existing 'manual' automation_mode.
-  // rtmpBase below is Live Producer's documented ingest host; if a real
-  // broadcast fails to connect, check whether Instagram handed back a
-  // materially different host in that session's generated URL and
-  // update this — Instagram doesn't publish a stable public spec for it
-  // the way Facebook/YouTube do.
-  instagram: {
-    label: "Instagram",
-    rtmpBase: "rtmps://live-upload.instagram.com:443/rtmp",
-  },
-};
-
-async function isSrsStreamLive(streamKey) {
-  try {
-    const res = await fetch("http://127.0.0.1:1985/api/v1/streams/", {
-      signal: AbortSignal.timeout(5000),
-    });
-    const data = await res.json();
-    const streams = data.streams || [];
-    return streams.some(
-      (s) => s.name === streamKey && s.publish && s.publish.active,
-    );
-  } catch (err) {
-    console.error("[SOCIAL] SRS stream check failed:", err.message);
-    return false;
-  }
-}
-
-async function getOwnedChannel(channelId, organizationId) {
-  const result = await pool.query(
-    `SELECT * FROM channels WHERE id = $1 AND organization_id = $2`,
-    [channelId, organizationId],
-  );
-  return result.rows[0] || null;
-}
-
-app.get(
-  "/api/channels/:channelId/social-destinations",
+const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   authenticateAdmin,
   resolveOrganizationForRequest,
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const result = await pool.query(
-        `SELECT * FROM social_destinations WHERE channel_id = $1 ORDER BY platform`,
-        [channel.id],
-      );
-
-      res.json({ ok: true, destinations: result.rows });
-    } catch (error) {
-      console.error("Get Social Destinations Error:", error);
-      res
-        .status(500)
-        .json({ ok: false, message: "Failed to fetch social destinations" });
-    }
-  },
-);
-
-app.post(
-  "/api/channels/:channelId/social-destinations",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const { platform, stream_key } = req.body;
-
-      if (!platform || !SOCIAL_PLATFORMS[platform]) {
-        return res.status(400).json({
-          ok: false,
-          message: "platform must be 'facebook' or 'youtube'",
-        });
-      }
-      if (!stream_key) {
-        return res
-          .status(400)
-          .json({ ok: false, message: "stream_key is required" });
-      }
-
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const result = await pool.query(
-        `
-        INSERT INTO social_destinations (channel_id, platform, stream_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (channel_id, platform)
-        DO UPDATE SET stream_key = EXCLUDED.stream_key, updated_at = now()
-        RETURNING *
-        `,
-        [channel.id, platform, stream_key],
-      );
-
-      res.json({ ok: true, destination: result.rows[0] });
-    } catch (error) {
-      console.error("Save Social Destination Error:", error);
-      res
-        .status(500)
-        .json({ ok: false, message: "Failed to save social destination" });
-    }
-  },
-);
-
-app.delete(
-  "/api/channels/:channelId/social-destinations/:id",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const existingProc = socialProcesses.get(Number(req.params.id));
-      if (existingProc) {
-        existingProc.kill("SIGTERM");
-        socialProcesses.delete(Number(req.params.id));
-      }
-
-      await pool.query(
-        `DELETE FROM social_destinations WHERE id = $1 AND channel_id = $2`,
-        [req.params.id, channel.id],
-      );
-
-      res.json({ ok: true, message: "Social destination removed" });
-    } catch (error) {
-      console.error("Delete Social Destination Error:", error);
-      res
-        .status(500)
-        .json({ ok: false, message: "Failed to delete social destination" });
-    }
-  },
-);
-
-app.post(
-  "/api/channels/:channelId/social-destinations/:id/start",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const destResult = await pool.query(
-        `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
-        [req.params.id, channel.id],
-      );
-      const destination = destResult.rows[0];
-      if (!destination) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Social destination not found" });
-      }
-
-      if (socialProcesses.has(destination.id)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Already simulcasting to this platform",
-        });
-      }
-
-      const live = await isSrsStreamLive(channel.stream_key);
-      if (!live) {
-        return res.status(400).json({
-          ok: false,
-          message: "Main stream is not live yet. Start streaming first.",
-        });
-      }
-
-      const platformConfig = SOCIAL_PLATFORMS[destination.platform];
-      const destinationUrl = `${platformConfig.rtmpBase}/${destination.stream_key}`;
-      const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
-
-      // Same aac_adtstoasc fix as startOauthSimulcast below — see that
-      // function's comment for the full explanation. Manual mode pushes
-      // through this identical ffmpeg shape, so it was equally exposed.
-      const proc = spawn("ffmpeg", [
-        ...inputResilienceFlags,
-        "-i",
-        sourceUrl,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-err_detect",
-        "ignore_err",
-        "-f",
-        "flv",
-        destinationUrl,
-      ]);
-
-      proc.stderr.on("data", (data) => {
-        console.log(
-          `[SOCIAL ${destination.platform} #${destination.id}]`,
-          data.toString().slice(0, 300),
-        );
-      });
-
-      proc.on("exit", (code) => {
-        console.log(
-          `[SOCIAL ${destination.platform} #${destination.id}] exited with code ${code}`,
-        );
-        socialProcesses.delete(destination.id);
-        pool
-          .query(
-            `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
-            [destination.id],
-          )
-          .catch((err) =>
-            console.error(
-              "[SOCIAL] Failed to update state on exit:",
-              err.message,
-            ),
-          );
-      });
-
-      socialProcesses.set(destination.id, proc);
-
-      await pool.query(
-        `UPDATE social_destinations SET is_running = true, ffmpeg_pid = $1, started_at = now() WHERE id = $2`,
-        [proc.pid, destination.id],
-      );
-
-      res.json({
-        ok: true,
-        message: `Simulcasting to ${platformConfig.label} started`,
-      });
-    } catch (error) {
-      console.error("Start Social Destination Error:", error);
-      res.status(500).json({ ok: false, message: "Failed to start simulcast" });
-    }
-  },
-);
-
-app.post(
-  "/api/channels/:channelId/social-destinations/:id/stop",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const destId = Number(req.params.id);
-      const proc = socialProcesses.get(destId);
-
-      if (proc) {
-        proc.kill("SIGTERM");
-        socialProcesses.delete(destId);
-      }
-
-      await pool.query(
-        `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1 AND channel_id = $2`,
-        [destId, channel.id],
-      );
-
-      res.json({ ok: true, message: "Simulcast stopped" });
-    } catch (error) {
-      console.error("Stop Social Destination Error:", error);
-      res.status(500).json({ ok: false, message: "Failed to stop simulcast" });
-    }
-  },
-);
-
-/*
-|--------------------------------------------------------------------------
-| SOCIAL DESTINATIONS — OAUTH-AUTOMATED GO LIVE
-|--------------------------------------------------------------------------
-| Same socialProcesses Map and ffmpeg spawn pattern as the manual start/stop
-| routes above. The difference: instead of pushing to a client-pasted
-| persistent stream key, this creates a fresh broadcast on the platform via
-| the connected OAuth account and pushes to whatever RTMP URL it hands back.
-| Gated behind automation_mode = 'oauth' on the destination row, so existing
-| manual-key destinations are completely unaffected.
-*/
-
-// Core go-live logic, shared by the manual "Go Live" button route below AND
-// the auto-fire hook in on_publish (see SOCIAL-OAUTH AUTO GO-LIVE section
-// near on_publish). Returns a plain {ok, message} result instead of writing
-// to res directly so both callers can use it — on_publish in particular must
-// never be blocked by or throw from this, since SRS is waiting on that
-// webhook's response to allow/reject the connection.
-async function startOauthSimulcast(channel, destination, organizationId) {
-  if (
-    destination.automation_mode !== "oauth" ||
-    !destination.oauth_account_id
-  ) {
-    return {
-      ok: false,
-      message:
-        "This destination isn't linked to a connected account. Use the manual start instead, or connect an account first.",
-    };
-  }
-  if (socialProcesses.has(destination.id)) {
-    // Reconnect/blip guard: if a push is already running for this
-    // destination, skip rather than spin up a second platform broadcast.
-    return { ok: false, message: "Already simulcasting to this platform" };
-  }
-
-  const live = await isSrsStreamLive(channel.stream_key);
-  if (!live) {
-    return {
-      ok: false,
-      message: "Main stream is not live yet. Start streaming first.",
-    };
-  }
-
-  const accountResult = await pool.query(
-    `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
-    [destination.oauth_account_id, organizationId],
-  );
-  const account = accountResult.rows[0];
-  if (!account) {
-    return { ok: false, message: "Connected account not found" };
-  }
-
-  const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
-  let destinationUrl, platformBroadcastId, platformStreamId;
-
-  try {
-    if (destination.platform === "facebook") {
-      const created = await facebookGraph.createLiveVideo({
-        pageId: account.external_account_id,
-        pageAccessToken: account.access_token,
-        title: channel.name,
-      });
-      destinationUrl = created.rtmpUrl;
-      platformBroadcastId = created.liveVideoId;
-    } else if (destination.platform === "youtube") {
-      // Access tokens are short-lived (~1hr) — refresh proactively rather
-      // than waiting for a 401 mid-request.
-      let accessToken = account.access_token;
-      if (
-        !account.token_expires_at ||
-        new Date(account.token_expires_at) <
-          new Date(Date.now() + 5 * 60 * 1000)
-      ) {
-        const refreshed = await youtubeApi.refreshAccessToken(
-          account.refresh_token,
-        );
-        accessToken = refreshed.access_token;
-        await pool.query(
-          `UPDATE social_oauth_accounts SET access_token = $1, token_expires_at = $2, updated_at = now() WHERE id = $3`,
-          [
-            accessToken,
-            refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
-            account.id,
-          ],
-        );
-      }
-      const oauth2Client = youtubeApi.clientFromTokens({
-        accessToken,
-        refreshToken: account.refresh_token,
-      });
-      const created = await youtubeApi.createBroadcastAndStream(oauth2Client, {
-        title: channel.name,
-      });
-      destinationUrl = created.rtmpUrl;
-      platformBroadcastId = created.broadcastId;
-      platformStreamId = created.streamId;
-    } else {
-      return { ok: false, message: "Unsupported platform for automation" };
-    }
-  } catch (platformErr) {
-    console.error(
-      `[SOCIAL-OAUTH] Failed to create broadcast on ${destination.platform}:`,
-      platformErr.message,
-    );
-    return {
-      ok: false,
-      message: platformErr.message || "Failed to create platform broadcast",
-    };
-  }
-
-  // Same bitstream-filter crash already found and fixed once for manual
-  // mid-broadcast recording: copying AAC straight from an HLS/MPEG-TS
-  // source into FLV requires ffmpeg's aac_adtstoasc filter to reframe it,
-  // and that filter has zero tolerance for a single malformed frame — one
-  // bad frame kills the whole process. Video stays copied (cheap, safe);
-  // audio is re-encoded instead of copied to sidestep the fragile filter
-  // entirely. inputResilienceFlags + err_detect ignore_err match the same
-  // established pattern used everywhere else in this file that reads a
-  // live HLS source (see buildRenditionFfmpegArgs / manual recording).
-  const proc = spawn("ffmpeg", [
-    ...inputResilienceFlags,
-    "-i",
-    sourceUrl,
-    "-c:v",
-    "copy",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    "-err_detect",
-    "ignore_err",
-    "-f",
-    "flv",
-    destinationUrl,
-  ]);
-
-  proc.stderr.on("data", (data) => {
-    console.log(
-      `[SOCIAL-OAUTH ${destination.platform} #${destination.id}]`,
-      data.toString().slice(0, 300),
-    );
-  });
-
-  proc.on("exit", (code) => {
-    console.log(
-      `[SOCIAL-OAUTH ${destination.platform} #${destination.id}] exited with code ${code}`,
-    );
-    socialProcesses.delete(destination.id);
-    pool
-      .query(
-        `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
-        [destination.id],
-      )
-      .catch((err) =>
-        console.error(
-          "[SOCIAL-OAUTH] Failed to update state on exit:",
-          err.message,
-        ),
-      );
-  });
-
-  socialProcesses.set(destination.id, proc);
-
-  await pool.query(
-    `UPDATE social_destinations
-     SET is_running = true, ffmpeg_pid = $1, started_at = now(),
-         platform_broadcast_id = $2, platform_stream_id = $3
-     WHERE id = $4`,
-    [proc.pid, platformBroadcastId, platformStreamId || null, destination.id],
-  );
-
-  return {
-    ok: true,
-    message: `Went live on ${SOCIAL_PLATFORMS[destination.platform].label} automatically`,
-  };
-}
-
-app.post(
-  "/api/channels/:channelId/social-destinations/:id/go-live",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const destResult = await pool.query(
-        `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
-        [req.params.id, channel.id],
-      );
-      const destination = destResult.rows[0];
-      if (!destination) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Social destination not found" });
-      }
-
-      const result = await startOauthSimulcast(
-        channel,
-        destination,
-        req.organization.id,
-      );
-      res.status(result.ok ? 200 : 400).json(result);
-    } catch (error) {
-      console.error("Automated Go-Live Error:", error);
-      res.status(500).json({
-        ok: false,
-        message: error.message || "Failed to start automated broadcast",
-      });
-    }
-  },
-);
-
-// Core end-live logic, shared by the manual "End Live" button route below
-// AND the auto-end hook in on_unpublish (see SOCIAL-OAUTH AUTO END-LIVE
-// section near on_unpublish).
-async function endOauthSimulcast(destination) {
-  const destId = destination.id;
-  const proc = socialProcesses.get(destId);
-  if (proc) {
-    proc.kill("SIGTERM");
-    socialProcesses.delete(destId);
-  }
-
-  // Kill our ffmpeg push first, then tell the platform to end the broadcast —
-  // otherwise Facebook/YouTube can be left showing "live" with a dead feed.
-  if (
-    destination.automation_mode === "oauth" &&
-    destination.platform_broadcast_id
-  ) {
-    try {
-      const accountResult = await pool.query(
-        `SELECT * FROM social_oauth_accounts WHERE id = $1`,
-        [destination.oauth_account_id],
-      );
-      const account = accountResult.rows[0];
-      if (account && destination.platform === "facebook") {
-        await facebookGraph.endLiveVideo({
-          liveVideoId: destination.platform_broadcast_id,
-          pageAccessToken: account.access_token,
-        });
-      } else if (account && destination.platform === "youtube") {
-        const oauth2Client = youtubeApi.clientFromTokens({
-          accessToken: account.access_token,
-          refreshToken: account.refresh_token,
-        });
-        await youtubeApi.transitionBroadcast(
-          oauth2Client,
-          destination.platform_broadcast_id,
-          "complete",
-        );
-      }
-    } catch (platformErr) {
-      // Don't fail the whole call over this — our feed is already stopped,
-      // which is the important part. Log it so a stuck "live" broadcast on
-      // the platform side can be caught.
-      console.error(
-        "[SOCIAL-OAUTH] Failed to end broadcast on platform:",
-        platformErr.message,
-      );
-    }
-  }
-
-  await pool.query(
-    `UPDATE social_destinations SET is_running = false, ffmpeg_pid = NULL WHERE id = $1`,
-    [destId],
-  );
-
-  return { ok: true, message: "Broadcast ended" };
-}
-
-app.post(
-  "/api/channels/:channelId/social-destinations/:id/end-live",
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole("super_admin", "admin", "operator"),
-  requireOrganizationRole("owner", "admin"),
-  async (req, res) => {
-    try {
-      const channel = await getOwnedChannel(
-        req.params.channelId,
-        req.organization.id,
-      );
-      if (!channel) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Channel not found" });
-      }
-
-      const destResult = await pool.query(
-        `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
-        [req.params.id, channel.id],
-      );
-      const destination = destResult.rows[0];
-      if (!destination) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Social destination not found" });
-      }
-
-      const result = await endOauthSimulcast(destination);
-      res.json(result);
-    } catch (error) {
-      console.error("End Automated Broadcast Error:", error);
-      res.status(500).json({ ok: false, message: "Failed to end broadcast" });
-    }
-  },
-);
+  requireRole,
+  requireOrganizationRole,
+  getInternalHlsSourceUrl,
+  inputResilienceFlags,
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -14326,6 +13641,8 @@ io.on("connection", (socket) => {
   await ensureFeatureFlagsTable();
   await ensureNotificationPreferencesTable();
   await ensureSocialOAuthTables(pool);
+  await ensureStreamTargetColumns(pool);
+  await streamTargetManager.reconcileDatabaseState();
   await ensureRestartAuditTable();
   await ensureApiKeysTable();
   await ensureServerMetricsHistoryTable(pool);

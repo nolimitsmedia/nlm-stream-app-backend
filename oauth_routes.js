@@ -406,8 +406,79 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
   });
 
   // ────────────────────────────────────────────────────────────
-  // Attach a connected account to a channel's social destination
+  // Attach a connected account to a Stream Target.
+  // The legacy social-destinations route is kept as an alias so a frontend
+  // and backend can be deployed in either order without breaking OAuth.
   // ────────────────────────────────────────────────────────────
+
+  const linkOAuthTarget = async (req, res) => {
+    try {
+      const { oauthAccountId } = req.body;
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+      const accountResult = await pool.query(
+        `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
+        [oauthAccountId, req.organization.id],
+      );
+      const account = accountResult.rows[0];
+      if (!account) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Connected account not found" });
+      }
+      const result = await pool.query(
+        `UPDATE social_destinations
+         SET oauth_account_id = $1,
+             automation_mode = 'oauth',
+             target_type = COALESCE(target_type, $2),
+             name = COALESCE(NULLIF(name, ''), $3),
+             enabled = TRUE,
+             auto_start = TRUE,
+             auto_reconnect = TRUE,
+             updated_at = now()
+         WHERE id = $4 AND channel_id = $5
+         RETURNING *`,
+        [
+          oauthAccountId,
+          account.platform,
+          account.external_account_name || account.platform,
+          req.params.id,
+          channel.id,
+        ],
+      );
+      if (!result.rows[0]) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Stream target not found" });
+      }
+      res.json({
+        ok: true,
+        target: result.rows[0],
+        destination: result.rows[0],
+      });
+    } catch (error) {
+      console.error("Link OAuth Account Error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to link connected account" });
+    }
+  };
+
+  app.post(
+    "/api/channels/:channelId/stream-targets/:id/link-oauth",
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    requireRole("super_admin", "admin", "operator"),
+    requireOrganizationRole("owner", "admin"),
+    linkOAuthTarget,
+  );
 
   app.post(
     "/api/channels/:channelId/social-destinations/:id/link-oauth",
@@ -415,46 +486,6 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     resolveOrganizationForRequest,
     requireRole("super_admin", "admin", "operator"),
     requireOrganizationRole("owner", "admin"),
-    async (req, res) => {
-      try {
-        const { oauthAccountId } = req.body;
-        const channel = await getOwnedChannel(
-          req.params.channelId,
-          req.organization.id,
-        );
-        if (!channel) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Channel not found" });
-        }
-        const accountResult = await pool.query(
-          `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
-          [oauthAccountId, req.organization.id],
-        );
-        if (!accountResult.rows[0]) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Connected account not found" });
-        }
-        const result = await pool.query(
-          `UPDATE social_destinations
-           SET oauth_account_id = $1, automation_mode = 'oauth', updated_at = now()
-           WHERE id = $2 AND channel_id = $3
-           RETURNING *`,
-          [oauthAccountId, req.params.id, channel.id],
-        );
-        if (!result.rows[0]) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Social destination not found" });
-        }
-        res.json({ ok: true, destination: result.rows[0] });
-      } catch (error) {
-        console.error("Link OAuth Account Error:", error);
-        res
-          .status(500)
-          .json({ ok: false, message: "Failed to link connected account" });
-      }
-    },
+    linkOAuthTarget,
   );
 };
