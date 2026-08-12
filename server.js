@@ -137,6 +137,12 @@ const BUNNY_RECORDINGS_CDN_URL = process.env.BUNNY_RECORDINGS_CDN_URL || "";
 // unsigned API traffic like login/admin. See bunny-signed-urls.md.
 const HLS_CDN_HOSTNAME = process.env.HLS_CDN_HOSTNAME || "";
 const BUNNY_HLS_TOKEN_KEY = process.env.BUNNY_HLS_TOKEN_KEY || "";
+// Phase 4.1 — rolling HLS DVR origin window.
+const HLS_DVR_WINDOW_SECONDS = Math.max(
+  60,
+  Number(process.env.HLS_DVR_WINDOW_SECONDS || 30 * 60),
+);
+
 const HLS_TOKEN_TTL_SECONDS = 6 * 60 * 60; // not a hard security boundary —
 // bounds how long a dead broadcast's old links keep working; real access
 // control is still whatever gates who receives a playbackUrl at all.
@@ -6377,11 +6383,13 @@ const getPublicWatchStatus = async (streamKey) => {
   // returns null entirely for an org with no subscriptions row yet.
   let reducedLatencyEnabled = false;
   let transcodingEnabled = false;
+  let rewindEnabled = false;
   if (organizationId) {
     try {
       const planFlagsResult = await pool.query(
         `
         SELECT p.reduced_latency_enabled,
+               p.rewind_enabled,
                COALESCE(o.transcoding_override, p.transcoding_enabled) AS transcoding_enabled
         FROM organizations o
         LEFT JOIN subscriptions s ON s.organization_id = o.id
@@ -6396,6 +6404,7 @@ const getPublicWatchStatus = async (streamKey) => {
       transcodingEnabled = Boolean(
         planFlagsResult.rows[0]?.transcoding_enabled,
       );
+      rewindEnabled = Boolean(planFlagsResult.rows[0]?.rewind_enabled);
       // Essential-tier orgs don't have the `transcoding_enabled` plan flag
       // set, but as of the ABR-rendition-ladder fold (2026-08-03) they DO
       // get a real single-rung rendition (see getRenditionPlanForOrg) —
@@ -6631,6 +6640,8 @@ const getPublicWatchStatus = async (streamKey) => {
     hlsAuthQs,
     reducedLatencyEnabled,
     transcodingEnabled,
+    rewindEnabled,
+    rewindWindowSeconds: rewindEnabled ? HLS_DVR_WINDOW_SECONDS : 0,
   };
 };
 
@@ -8679,7 +8690,7 @@ const SEGMENT_CACHE_TTL_MS = 15000;
 // actively-watched streams. Bumped from 30s (2026-08-10, Storage & CDN
 // review) — 30s was a safe-but-conservative default from before the
 // session-tag staleness fix existed to justify going longer.
-const SEGMENT_EDGE_CACHE_SECONDS = 300;
+const SEGMENT_EDGE_CACHE_SECONDS = Math.max(300, HLS_DVR_WINDOW_SECONDS + 300);
 
 // Same idea for the manifest itself: if N viewers are each polling the
 // playlist every ~1-2s, that's N separate ngrok round trips per interval.
