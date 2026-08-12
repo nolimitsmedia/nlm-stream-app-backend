@@ -73,6 +73,16 @@ const STREAM_TARGET_HLS_READY_CONFIRMATIONS = Math.max(
   Number(process.env.STREAM_TARGET_HLS_READY_CONFIRMATIONS || 2),
 );
 
+const STREAM_TARGET_SOURCE_MODE =
+  String(process.env.STREAM_TARGET_SOURCE_MODE || "rtmp").toLowerCase() ===
+  "hls"
+    ? "hls"
+    : "rtmp";
+
+const STREAM_TARGET_INTERNAL_RTMP_BASE = String(
+  process.env.STREAM_TARGET_INTERNAL_RTMP_BASE || "rtmp://127.0.0.1:1935/live",
+).replace(/\/+$/, "");
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function looksLikePlayableHlsPlaylist(text) {
@@ -202,6 +212,43 @@ function createStreamTargetManager({
     }
   }
 
+  function getInternalRtmpSourceUrl(streamKey) {
+    return `${STREAM_TARGET_INTERNAL_RTMP_BASE}/${encodeURIComponent(String(streamKey || "").trim())}`;
+  }
+
+  function getPreferredSource(streamKey, mode = STREAM_TARGET_SOURCE_MODE) {
+    if (String(mode).toLowerCase() === "hls") {
+      return {
+        mode: "hls",
+        url: getInternalHlsSourceUrl(streamKey),
+      };
+    }
+    return {
+      mode: "rtmp",
+      url: getInternalRtmpSourceUrl(streamKey),
+    };
+  }
+
+  async function waitForPreferredSource(
+    streamKey,
+    timeoutMs = STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+  ) {
+    const live = await isSrsStreamLive(streamKey);
+    if (live && STREAM_TARGET_SOURCE_MODE === "rtmp") {
+      return {
+        ok: true,
+        mode: "rtmp",
+        sourceUrl: getInternalRtmpSourceUrl(streamKey),
+      };
+    }
+
+    const hls = await waitForPlayableHls(streamKey, timeoutMs);
+    return {
+      ...hls,
+      mode: "hls",
+    };
+  }
+
   async function waitForPlayableHls(
     streamKey,
     timeoutMs = STREAM_TARGET_HLS_READY_TIMEOUT_MS,
@@ -247,7 +294,7 @@ function createStreamTargetManager({
 
   function classifyTransientSourceFailure(text) {
     const value = String(text || "");
-    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment/i.test(
+    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment|Connection refused|Connection reset by peer|Server error|Input\/output error|End of file/i.test(
       value,
     );
   }
@@ -452,7 +499,11 @@ function createStreamTargetManager({
       target.target_type || target.platform,
     );
     const protocol = normalizeProtocol(target.protocol, targetType);
-    const sourceUrl = getInternalHlsSourceUrl(channel.stream_key);
+    const preferredSource = getPreferredSource(
+      channel.stream_key,
+      target.source_mode || STREAM_TARGET_SOURCE_MODE,
+    );
+    const sourceUrl = preferredSource.url;
 
     const existing = processStates.get(destinationId);
     if (existing?.proc && !existing.proc.killed) {
@@ -474,6 +525,8 @@ function createStreamTargetManager({
     state.targetType = targetType;
     state.protocol = protocol;
     state.channelStreamKey = channel.stream_key;
+    state.sourceMode = preferredSource.mode;
+    state.sourceUrl = sourceUrl;
     if (!state.startedAt || !reconnect) {
       state.startedAt =
         reconnect && target.started_at
@@ -502,8 +555,7 @@ function createStreamTargetManager({
       const text = chunk.toString();
       if (classifyTransientSourceFailure(text)) {
         state.sourceHlsFault = true;
-        state.lastError =
-          "Internal HLS source temporarily unavailable; reconnecting automatically.";
+        state.lastError = `Internal ${String(state.sourceMode || "media").toUpperCase()} source temporarily unavailable; reconnecting automatically.`;
       } else if (/error|failed|refused|timed out|broken pipe/i.test(text)) {
         state.lastError = text.trim().slice(-1200);
       }
@@ -618,7 +670,7 @@ function createStreamTargetManager({
           [
             state.reconnectCount,
             state.sourceHlsFault
-              ? "Internal HLS source temporarily unavailable; reconnecting automatically."
+              ? `Internal ${String(state.sourceMode || "media").toUpperCase()} source temporarily unavailable; reconnecting automatically.`
               : lastError,
             destinationId,
           ],
@@ -633,13 +685,13 @@ function createStreamTargetManager({
             const latest = await getDestinationAndChannel(destinationId);
             if (!latest || !latest.enabled)
               return processStates.delete(destinationId);
-            const readiness = await waitForPlayableHls(
+            const readiness = await waitForPreferredSource(
               latest.channel_stream_key,
               STREAM_TARGET_HLS_READY_TIMEOUT_MS,
             );
             if (!readiness.ok) {
               throw new Error(
-                `Source HLS is not ready yet: ${readiness.message}`,
+                `Source media is not ready yet: ${readiness.message}`,
               );
             }
 
@@ -672,13 +724,13 @@ function createStreamTargetManager({
               ).catch(() => null);
               if (!latest || !latest.enabled || !latest.auto_reconnect)
                 return processStates.delete(destinationId);
-              const readiness = await waitForPlayableHls(
+              const readiness = await waitForPreferredSource(
                 latest.channel_stream_key,
                 STREAM_TARGET_HLS_READY_TIMEOUT_MS,
               );
               if (!readiness.ok) {
                 state.retryAttempt = safeNumber(state.retryAttempt) + 1;
-                state.lastError = `Source HLS is not ready yet: ${readiness.message}`;
+                state.lastError = `Source media is not ready yet: ${readiness.message}`;
                 return;
               }
 
@@ -744,7 +796,7 @@ function createStreamTargetManager({
       [target.id],
     );
 
-    const readiness = await waitForPlayableHls(
+    const readiness = await waitForPreferredSource(
       channel.stream_key,
       STREAM_TARGET_HLS_READY_TIMEOUT_MS,
     );
@@ -763,7 +815,7 @@ function createStreamTargetManager({
 
       return {
         ok: false,
-        message: `Source is live but HLS media is not ready yet: ${readiness.message}`,
+        message: `Source is live but target media is not ready yet: ${readiness.message}`,
       };
     }
 
