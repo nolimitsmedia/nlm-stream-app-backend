@@ -219,7 +219,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           [
             channel.id,
             internalPlatform,
-            req.body.stream_key || null,
+            req.body.stream_key || (protocol === "srt" ? "url-managed" : null),
             req.body.name || config.label,
             targetType,
             req.body.destination_url || null,
