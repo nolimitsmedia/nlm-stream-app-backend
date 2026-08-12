@@ -6,6 +6,36 @@ const {
   TARGET_TYPES,
 } = require("./stream_target_service");
 
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null);
+}
+
+function normalizeTargetRequestBody(body = {}) {
+  const name = String(
+    firstDefined(body.name, body.targetName, body.target_name, "") || "",
+  ).trim();
+  const destinationUrl = String(
+    firstDefined(
+      body.destination_url,
+      body.destinationUrl,
+      body.url,
+      body.server_url,
+      body.serverUrl,
+      "",
+    ) || "",
+  ).trim();
+  const streamKey = String(
+    firstDefined(body.stream_key, body.streamKey, body.key, "") || "",
+  ).trim();
+
+  return {
+    ...body,
+    name,
+    destination_url: destinationUrl,
+    stream_key: streamKey,
+  };
+}
+
 function sanitizeTarget(row, runtimeState = null) {
   if (!row) return row;
   const merged = { ...row, ...(runtimeState || {}) };
@@ -115,6 +145,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
 
   async function createHandler(req, res) {
     try {
+      const body = normalizeTargetRequestBody(req.body);
       const channel = await getOwnedChannel(
         req.params.channelId,
         req.organization.id,
@@ -125,7 +156,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           .json({ ok: false, message: "Channel not found" });
 
       const targetType = manager.normalizeTargetType(
-        req.body.target_type || req.body.platform,
+        body.target_type || body.platform,
       );
       if (!targetType)
         return res
@@ -133,7 +164,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           .json({ ok: false, message: "Unsupported target type" });
       const config = TARGET_TYPES[targetType];
       const automationMode =
-        req.body.automation_mode === "oauth" ? "oauth" : "manual";
+        body.automation_mode === "oauth" ? "oauth" : "manual";
       if (automationMode === "oauth" && !config.oauth) {
         return res.status(400).json({
           ok: false,
@@ -142,14 +173,14 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
         });
       }
 
-      const protocol = manager.normalizeProtocol(req.body.protocol, targetType);
+      const protocol = manager.normalizeProtocol(body.protocol, targetType);
       const targetDraft = {
         target_type: targetType,
         platform: targetType,
         automation_mode: automationMode,
         protocol,
-        destination_url: req.body.destination_url || null,
-        stream_key: req.body.stream_key || null,
+        destination_url: body.destination_url || null,
+        stream_key: body.stream_key || null,
       };
       const validationError = manager.validateManualTarget(targetDraft);
       if (validationError && automationMode !== "oauth") {
@@ -196,16 +227,16 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           [
             channel.id,
             internalPlatform,
-            req.body.stream_key ||
+            body.stream_key ||
               (automationMode === "oauth" ? "oauth-managed" : null),
-            req.body.name || config.label,
+            body.name || config.label,
             targetType,
-            req.body.destination_url || null,
+            body.destination_url || null,
             protocol,
             automationMode,
-            req.body.enabled !== false,
-            Boolean(req.body.auto_start),
-            req.body.auto_reconnect !== false,
+            body.enabled !== false,
+            Boolean(body.auto_start),
+            body.auto_reconnect !== false,
           ],
         );
       } else {
@@ -219,14 +250,14 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           [
             channel.id,
             internalPlatform,
-            req.body.stream_key || (protocol === "srt" ? "url-managed" : null),
-            req.body.name || config.label,
+            body.stream_key || (protocol === "srt" ? "url-managed" : null),
+            body.name || config.label,
             targetType,
-            req.body.destination_url || null,
+            body.destination_url || null,
             protocol,
-            req.body.enabled !== false,
-            Boolean(req.body.auto_start),
-            req.body.auto_reconnect !== false,
+            body.enabled !== false,
+            Boolean(body.auto_start),
+            body.auto_reconnect !== false,
           ],
         );
       }
@@ -261,6 +292,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     ...manageMw,
     async (req, res) => {
       try {
+        const body = normalizeTargetRequestBody(req.body);
         const channel = await getOwnedChannel(
           req.params.channelId,
           req.organization.id,
@@ -276,32 +308,30 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
             .json({ ok: false, message: "Stream target not found" });
 
         const targetType = manager.normalizeTargetType(
-          req.body.target_type || existing.target_type || existing.platform,
+          body.target_type || existing.target_type || existing.platform,
         );
         const protocol = manager.normalizeProtocol(
-          req.body.protocol || existing.protocol,
+          body.protocol || existing.protocol,
           targetType,
         );
         const next = {
           ...existing,
           target_type: targetType,
           protocol,
-          name: req.body.name !== undefined ? req.body.name : existing.name,
+          name: body.name !== "" ? body.name : existing.name,
           destination_url:
-            req.body.destination_url !== undefined
-              ? req.body.destination_url
+            body.destination_url !== ""
+              ? body.destination_url
               : existing.destination_url,
           stream_key:
-            req.body.stream_key !== undefined
-              ? req.body.stream_key
-              : existing.stream_key,
+            body.stream_key !== "" ? body.stream_key : existing.stream_key,
           enabled:
             req.body.enabled !== undefined
               ? Boolean(req.body.enabled)
               : existing.enabled,
           auto_start:
             req.body.auto_start !== undefined
-              ? Boolean(req.body.auto_start)
+              ? Boolean(body.auto_start)
               : existing.auto_start,
           auto_reconnect:
             req.body.auto_reconnect !== undefined

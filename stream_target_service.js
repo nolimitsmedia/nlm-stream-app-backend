@@ -179,23 +179,42 @@ function combineDestinationUrl(destinationUrl, streamKey, protocol) {
 function validateManualTarget(target) {
   const type = normalizeTargetType(target.target_type || target.platform);
   if (!type) return "Unsupported target type";
+
   const protocol = normalizeProtocol(target.protocol, type);
   const config = TARGET_TYPES[type];
   const destinationUrl = String(target.destination_url || "").trim();
   const streamKey = String(target.stream_key || "").trim();
+  const targetName = String(target.name || "").trim();
 
   if (target.automation_mode === "oauth") return null;
   if (!destinationUrl && !config?.baseUrl)
     return "Destination URL is required for this target";
+
   if (protocol === "srt") {
     const full = destinationUrl || config?.baseUrl || "";
     if (!full.toLowerCase().startsWith("srt://"))
       return "SRT targets require an srt:// destination URL";
+    return null;
   }
-  if (["rtmp", "rtmps"].includes(protocol)) {
+
+  if (protocol === "rtmp" || protocol === "rtmps") {
     const full = destinationUrl || config?.baseUrl || "";
-    if (!/^rtmps?:\/\//i.test(full))
-      return "RTMP targets require an rtmp:// or rtmps:// destination URL";
+    const requiredPrefix = protocol === "rtmps" ? "rtmps://" : "rtmp://";
+
+    if (!full.toLowerCase().startsWith(requiredPrefix)) {
+      return `${protocol.toUpperCase()} targets require a ${requiredPrefix} destination URL`;
+    }
+
+    // Catch the exact class of field-crossing bug that previously stored
+    // "Phase 2 RTMPS Test" as the stream key.
+    if (
+      streamKey &&
+      targetName &&
+      streamKey.trim().toLowerCase() === targetName.trim().toLowerCase()
+    ) {
+      return "Stream key cannot be the same value as the target name. Check the Destination URL and Stream Key fields.";
+    }
+
     if (
       !streamKey &&
       !destinationUrl.includes("{stream_key}") &&
@@ -204,6 +223,7 @@ function validateManualTarget(target) {
       return "Stream key is required for this target";
     }
   }
+
   return null;
 }
 
@@ -316,10 +336,45 @@ function createStreamTargetManager({
     return { ok: false, sourceUrl, message: lastReason };
   }
 
-  function classifyTransientSourceFailure(text) {
+  function classifyTransientSourceFailure(text, sourceUrl) {
     const value = String(text || "");
-    return /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment|Connection refused|Connection reset by peer|Server error|Input\/output error|End of file/i.test(
-      value,
+    const source = String(sourceUrl || "");
+
+    // HLS parser/read failures are inherently source-side.
+    if (
+      /HTTP error 404|404 Not Found|Failed to reload playlist|keepalive request failed|when parsing playlist|Error when loading first segment|Failed to open segment/i.test(
+        value,
+      )
+    ) {
+      return true;
+    }
+
+    // Generic transport errors can belong to either FFmpeg input or output.
+    // Only call them source failures when the stderr chunk identifies our
+    // configured source URL. This prevents RTMP/RTMPS destination failures
+    // from being shown in the UI as "Internal RTMP source unavailable".
+    if (
+      source &&
+      value.includes(source) &&
+      /Connection refused|Connection reset by peer|Server error|Input\/output error|End of file|timed out/i.test(
+        value,
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function classifyDestinationFailure(text, destinationUrl) {
+    const value = String(text || "");
+    const destination = String(destinationUrl || "");
+    return Boolean(
+      destination &&
+      value.includes(destination) &&
+      /Connection refused|Connection reset by peer|Server error|Input\/output error|Broken pipe|timed out|TLS|handshake|403|401|denied|rejected/i.test(
+        value,
+      ),
     );
   }
 
@@ -579,10 +634,15 @@ function createStreamTargetManager({
 
     proc.stderr.on("data", (chunk) => {
       const text = chunk.toString();
-      if (classifyTransientSourceFailure(text)) {
+      if (classifyTransientSourceFailure(text, sourceUrl)) {
         state.sourceHlsFault = true;
         state.lastError = `Internal ${String(state.sourceMode || "media").toUpperCase()} source temporarily unavailable; reconnecting automatically.`;
+      } else if (classifyDestinationFailure(text, destinationUrl)) {
+        state.sourceHlsFault = false;
+        state.lastError =
+          "Destination connection failed or was rejected. Verify the destination URL, stream key, TLS settings, and that no other publisher is using the same destination stream.";
       } else if (/error|failed|refused|timed out|broken pipe/i.test(text)) {
+        state.sourceHlsFault = false;
         state.lastError = text.trim().slice(-1200);
       }
       console.log(
