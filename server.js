@@ -6955,12 +6955,18 @@ app.get(
       const data = await response.json();
 
       const allowedResult = await pool.query(
-        "SELECT stream_key, live_started_at FROM channels WHERE organization_id = $1",
+        `SELECT id, name, stream_key, live_started_at
+         FROM channels
+         WHERE organization_id = $1`,
         [req.organization.id],
       );
 
       const allowedStreamKeys = new Set(
         allowedResult.rows.map((row) => String(row.stream_key)),
+      );
+
+      const channelByStreamKey = new Map(
+        allowedResult.rows.map((row) => [String(row.stream_key), row]),
       );
 
       const liveStartedAtByKey = new Map(
@@ -6970,7 +6976,63 @@ app.get(
         ]),
       );
 
-      const filteredStreams = (data.streams || []).filter((stream) => {
+      // Phase 4.3 — resolve organization-wide monitor context once per poll
+      // instead of issuing extra DB queries for every active stream.
+      let monitorPlan = null;
+      try {
+        monitorPlan = await getOrganizationSubscriptionSummary(
+          req.organization.id,
+        );
+      } catch (planError) {
+        console.debug(
+          "[LIVE-MONITOR] Subscription summary unavailable:",
+          planError.message,
+        );
+      }
+
+      let renditionPlan = [];
+      try {
+        renditionPlan = await getRenditionPlanForOrg(req.organization.id);
+      } catch (renditionError) {
+        console.debug(
+          "[LIVE-MONITOR] Rendition plan unavailable:",
+          renditionError.message,
+        );
+      }
+
+      let monitorTargets = [];
+      try {
+        const targetResult = await queryWithRetry(
+          `SELECT sd.*
+           FROM social_destinations sd
+           JOIN channels c ON c.id = sd.channel_id
+           WHERE c.organization_id = $1
+           ORDER BY sd.channel_id ASC, sd.id ASC`,
+          [req.organization.id],
+        );
+        monitorTargets = targetResult.rows || [];
+      } catch (targetError) {
+        console.debug(
+          "[LIVE-MONITOR] Stream targets unavailable:",
+          targetError.message,
+        );
+      }
+
+      const targetsByChannelId = new Map();
+      for (const target of monitorTargets) {
+        const channelId = Number(target.channel_id);
+        if (!targetsByChannelId.has(channelId)) {
+          targetsByChannelId.set(channelId, []);
+        }
+        targetsByChannelId.get(channelId).push(target);
+      }
+
+      const allSrsStreams = data.streams || [];
+      const srsStreamByName = new Map(
+        allSrsStreams.map((item) => [String(item.name), item]),
+      );
+
+      const filteredStreams = allSrsStreams.filter((stream) => {
         return (
           allowedStreamKeys.size === 0 || allowedStreamKeys.has(stream.name)
         );
@@ -7010,15 +7072,209 @@ app.get(
             mediaAnalysis = getCachedStreamAnalysis(analyzerStream);
           }
 
+          const channel = channelByStreamKey.get(String(stream.name)) || null;
+
+          const renditions = (renditionPlan || []).map((planned) => {
+            const renditionName = `${stream.name}_${planned.label}`;
+            const actual = srsStreamByName.get(renditionName) || null;
+            const isLive = Boolean(actual?.publish?.active);
+
+            return {
+              label: planned.label,
+              name: renditionName,
+              planned_bitrate_kbps: Number(planned.bitrateKbps || 0),
+              planned_resolution: planned.resolution || null,
+              live: isLive,
+              bitrate_kbps: Number(actual?.kbps?.recv_30s || 0),
+              frames: Number(actual?.frames || 0),
+              clients: Number(actual?.clients || 0),
+              video: actual?.video
+                ? {
+                    codec: actual.video.codec || null,
+                    profile: actual.video.profile || null,
+                    width: Number(actual.video.width || 0),
+                    height: Number(actual.video.height || 0),
+                  }
+                : null,
+              audio: actual?.audio
+                ? {
+                    codec: actual.audio.codec || null,
+                    sample_rate: Number(actual.audio.sample_rate || 0),
+                    channels: Number(
+                      actual.audio.channel || actual.audio.channels || 0,
+                    ),
+                  }
+                : null,
+            };
+          });
+
+          const rawTargets = channel
+            ? targetsByChannelId.get(Number(channel.id)) || []
+            : [];
+
+          const targets = rawTargets.map((target) => {
+            const runtime = streamTargetManager.getRuntimeState(target.id);
+            const status =
+              runtime?.runtime_status ||
+              runtime?.status ||
+              target.status ||
+              (target.is_running ? "streaming" : "stopped");
+
+            return {
+              id: target.id,
+              name: target.name || target.platform || `Target ${target.id}`,
+              platform: target.platform || null,
+              target_type: target.target_type || null,
+              protocol: target.protocol || null,
+              enabled: Boolean(target.enabled),
+              auto_start: Boolean(target.auto_start),
+              auto_reconnect: Boolean(target.auto_reconnect),
+              status,
+              is_running: Boolean(
+                runtime?.is_running ?? target.is_running ?? false,
+              ),
+              bitrate_kbps: Number(
+                runtime?.current_bitrate_kbps ??
+                  target.current_bitrate_kbps ??
+                  0,
+              ),
+              dropped_frames: Number(
+                runtime?.dropped_frames ?? target.dropped_frames ?? 0,
+              ),
+              reconnect_count: Number(
+                runtime?.reconnect_count ?? target.reconnect_count ?? 0,
+              ),
+              uptime_seconds: Number(runtime?.uptime_seconds || 0),
+              last_error: target.last_error
+                ? String(target.last_error).slice(0, 500)
+                : null,
+            };
+          });
+
+          const monitorIssues = [];
+          const analysisHealth = mediaAnalysis?.health || null;
+          const hls = mediaAnalysis?.hls || {};
+
+          if (uptimeSeconds >= 35 && hls.reachable === false) {
+            monitorIssues.push({
+              severity: "critical",
+              code: "hls_unavailable",
+              title: "HLS delivery unavailable",
+              message:
+                "The ingest is live, but the HLS playlist is not reachable.",
+            });
+          } else if (
+            uptimeSeconds >= 35 &&
+            hls.reachable === true &&
+            hls.fresh === false
+          ) {
+            monitorIssues.push({
+              severity: "warning",
+              code: "hls_stale",
+              title: "HLS playlist is stale",
+              message:
+                "The HLS playlist is reachable but has not refreshed recently.",
+            });
+          }
+
+          for (const rendition of renditions) {
+            if (uptimeSeconds >= 35 && !rendition.live) {
+              monitorIssues.push({
+                severity: "warning",
+                code: `rendition_${rendition.label}_offline`,
+                title: `${rendition.label} rendition unavailable`,
+                message:
+                  "The source is live but this planned ABR rendition is not currently publishing.",
+              });
+            }
+          }
+
+          for (const target of targets) {
+            if (target.status === "reconnecting") {
+              monitorIssues.push({
+                severity: "warning",
+                code: `target_${target.id}_reconnecting`,
+                title: `${target.name} is reconnecting`,
+                message:
+                  target.last_error ||
+                  "The output target lost its connection and is retrying automatically.",
+              });
+            } else if (
+              target.last_error &&
+              !target.is_running &&
+              target.enabled &&
+              target.auto_start
+            ) {
+              monitorIssues.push({
+                severity: "warning",
+                code: `target_${target.id}_error`,
+                title: `${target.name} has a delivery error`,
+                message: target.last_error,
+              });
+            }
+          }
+
+          let monitorStatus = analysisHealth?.status || "unknown";
+          if (monitorIssues.some((issue) => issue.severity === "critical")) {
+            monitorStatus = "critical";
+          } else if (
+            monitorIssues.some((issue) => issue.severity === "warning") &&
+            monitorStatus !== "critical"
+          ) {
+            monitorStatus = "warning";
+          } else if (
+            monitorStatus === "unknown" &&
+            uptimeSeconds >= 35 &&
+            Number(stream.kbps?.recv_30s || 0) > 0
+          ) {
+            monitorStatus = "healthy";
+          }
+
+          const dvrEnabled = Boolean(monitorPlan?.rewind_enabled);
+          const readyRenditions = renditions.filter((item) => item.live);
+
+          const monitor = {
+            status: monitorStatus,
+            score: analysisHealth?.score ?? null,
+            source: {
+              live: Boolean(stream.publish?.active),
+              bitrate_kbps: Number(stream.kbps?.recv_30s || 0),
+              uptime_seconds: uptimeSeconds,
+              frames: Number(stream.frames || 0),
+              srs_clients: Number(stream.clients || 0),
+            },
+            delivery: {
+              hls_reachable:
+                hls.reachable == null ? null : Boolean(hls.reachable),
+              hls_fresh: hls.fresh == null ? null : Boolean(hls.fresh),
+              abr_ready:
+                renditions.length > 0
+                  ? readyRenditions.length === renditions.length
+                  : Boolean(stream.publish?.active),
+              ready_renditions: readyRenditions.length,
+              planned_renditions: renditions.length,
+              dvr_enabled: dvrEnabled,
+              dvr_window_seconds: dvrEnabled ? HLS_DVR_WINDOW_SECONDS : 0,
+            },
+            renditions,
+            targets,
+            issues: monitorIssues.slice(0, 12),
+            generated_at: new Date().toISOString(),
+          };
+
           return {
             ...stream,
+            channel_id: channel?.id || null,
+            channel_name: channel?.name || null,
             srs_clients: Number(stream.clients || 0),
             clients: viewerMetrics.active_viewers,
             viewerMetrics,
             uptime_seconds: uptimeSeconds,
             mediaAnalysis,
+            monitor,
             encoderGeneration:
               bitrateCapEncoderGeneration.get(stream.name) || 0,
+            broadcastGeneration: bitrateCapGeneration.get(stream.name) || 0,
             liveStartedAtMs: liveStartedAt
               ? new Date(liveStartedAt).getTime()
               : 0,
