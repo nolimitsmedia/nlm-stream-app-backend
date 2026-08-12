@@ -5054,6 +5054,111 @@ const ensureScheduledStreamsTable = async () => {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  // Phase 3.1 — durable scheduler state. These columns make automation
+  // idempotent across PM2/backend restarts and keep execution results visible.
+  await pool.query(`
+    ALTER TABLE scheduled_streams
+      ADD COLUMN IF NOT EXISTS automation_enabled BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS automation_start_targets BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS automation_stop_targets BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS automation_started_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS automation_ended_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS automation_last_checked_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS automation_last_error TEXT,
+      ADD COLUMN IF NOT EXISTS automation_attempts INTEGER DEFAULT 0
+  `);
+};
+
+// Convert a browser datetime-local value in an explicit IANA timezone to a
+// real UTC Date. scheduled_streams stores TIMESTAMPTZ, so the scheduler must
+// not depend on the backend host/database timezone.
+const parseScheduledDateTime = (value, timeZone = "America/Los_Angeles") => {
+  if (!value) return null;
+
+  const text = String(value).trim();
+
+  // Already contains an explicit zone/offset — trust it.
+  if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(text)) {
+    const direct = new Date(text);
+    if (Number.isNaN(direct.getTime())) {
+      throw new Error(`Invalid scheduled date/time: ${text}`);
+    }
+    return direct;
+  }
+
+  const match = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/,
+  );
+  if (!match) {
+    throw new Error(`Invalid scheduled date/time: ${text}`);
+  }
+
+  const [, y, mo, d, h, mi, s = "00"] = match;
+  const parts = {
+    year: Number(y),
+    month: Number(mo),
+    day: Number(d),
+    hour: Number(h),
+    minute: Number(mi),
+    second: Number(s),
+  };
+
+  // Validate the IANA timezone before doing conversion.
+  let formatter;
+  try {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+  } catch {
+    throw new Error(`Invalid timezone: ${timeZone}`);
+  }
+
+  const desiredUtcLike = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+
+  let candidate = desiredUtcLike;
+
+  // Two passes are enough to resolve the zone offset for normal dates and
+  // accommodate DST offset changes around the candidate.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const formattedParts = formatter.formatToParts(new Date(candidate));
+    const map = Object.fromEntries(
+      formattedParts
+        .filter((item) => item.type !== "literal")
+        .map((item) => [item.type, item.value]),
+    );
+
+    const representedUtcLike = Date.UTC(
+      Number(map.year),
+      Number(map.month) - 1,
+      Number(map.day),
+      Number(map.hour),
+      Number(map.minute),
+      Number(map.second),
+    );
+
+    candidate += desiredUtcLike - representedUtcLike;
+  }
+
+  const result = new Date(candidate);
+  if (Number.isNaN(result.getTime())) {
+    throw new Error(`Invalid scheduled date/time: ${text}`);
+  }
+  return result;
 };
 
 const getPublicWatchBranding = async (organizationId) => {
@@ -6598,6 +6703,9 @@ app.post(
         scheduled_end,
         timezone,
         status,
+        automation_enabled,
+        automation_start_targets,
+        automation_stop_targets,
       } = req.body;
 
       if (!title || !stream_key || !scheduled_start) {
@@ -6619,9 +6727,12 @@ app.post(
           scheduled_end,
           timezone,
           status,
-          created_by
+          created_by,
+          automation_enabled,
+          automation_start_targets,
+          automation_stop_targets
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING *
         `,
         [
@@ -6630,11 +6741,22 @@ app.post(
           title.trim(),
           stream_key.trim(),
           description || null,
-          scheduled_start,
-          scheduled_end || null,
+          parseScheduledDateTime(
+            scheduled_start,
+            timezone || "America/Los_Angeles",
+          ),
+          scheduled_end
+            ? parseScheduledDateTime(
+                scheduled_end,
+                timezone || "America/Los_Angeles",
+              )
+            : null,
           timezone || "America/Los_Angeles",
           status || "scheduled",
           req.admin.id,
+          Boolean(automation_enabled),
+          automation_start_targets !== false,
+          automation_stop_targets !== false,
         ],
       );
 
@@ -6671,6 +6793,9 @@ app.put(
         scheduled_end,
         timezone,
         status,
+        automation_enabled,
+        automation_start_targets,
+        automation_stop_targets,
       } = req.body;
 
       if (!title || !stream_key || !scheduled_start) {
@@ -6691,9 +6816,29 @@ app.put(
             scheduled_end = $6,
             timezone = $7,
             status = $8,
+            automation_enabled = $9,
+            automation_start_targets = $10,
+            automation_stop_targets = $11,
+            automation_started_at = CASE
+              WHEN $9 = FALSE THEN NULL
+              WHEN scheduled_start IS DISTINCT FROM $5 OR status IN ('ended', 'cancelled') THEN NULL
+              ELSE automation_started_at
+            END,
+            automation_ended_at = CASE
+              WHEN $9 = FALSE THEN NULL
+              WHEN scheduled_end IS DISTINCT FROM $6 OR status IN ('ended', 'cancelled') THEN NULL
+              ELSE automation_ended_at
+            END,
+            automation_last_error = CASE
+              WHEN scheduled_start IS DISTINCT FROM $5
+                OR scheduled_end IS DISTINCT FROM $6
+                OR $9 = FALSE
+              THEN NULL
+              ELSE automation_last_error
+            END,
             updated_at = NOW()
-        WHERE id = $9
-          AND organization_id = $10
+        WHERE id = $12
+          AND organization_id = $13
         RETURNING *
         `,
         [
@@ -6701,10 +6846,21 @@ app.put(
           title.trim(),
           stream_key.trim(),
           description || null,
-          scheduled_start,
-          scheduled_end || null,
+          parseScheduledDateTime(
+            scheduled_start,
+            timezone || "America/Los_Angeles",
+          ),
+          scheduled_end
+            ? parseScheduledDateTime(
+                scheduled_end,
+                timezone || "America/Los_Angeles",
+              )
+            : null,
           timezone || "America/Los_Angeles",
           status || "scheduled",
+          Boolean(automation_enabled),
+          automation_start_targets !== false,
+          automation_stop_targets !== false,
           id,
           req.organization.id,
         ],
@@ -10863,6 +11019,302 @@ const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   inputResilienceFlags,
 });
 
+// ══════════════════════════════════════════
+// PHASE 3.1 — REAL SCHEDULED AUTOMATION
+// Durable DB-driven scheduler. Phase 3.1 intentionally starts with Stream
+// Targets because that subsystem already exposes safe programmatic start/stop
+// methods. File-as-live and manual recording automation will layer on top in
+// later Phase 3 steps after their route-only logic is extracted into services.
+// ══════════════════════════════════════════
+const SCHEDULE_AUTOMATION_POLL_MS = Math.max(
+  2000,
+  Number(process.env.SCHEDULE_AUTOMATION_POLL_MS || 5000),
+);
+const SCHEDULE_AUTOMATION_START_GRACE_MINUTES = Math.max(
+  1,
+  Number(process.env.SCHEDULE_AUTOMATION_START_GRACE_MINUTES || 30),
+);
+
+let scheduleAutomationTickRunning = false;
+
+async function getScheduleChannel(schedule) {
+  if (schedule.channel_id) {
+    return getOwnedChannel(schedule.channel_id, schedule.organization_id);
+  }
+
+  const result = await pool.query(
+    `SELECT *
+     FROM channels
+     WHERE organization_id = $1
+       AND stream_key = $2
+       AND is_active = TRUE
+     LIMIT 1`,
+    [schedule.organization_id, schedule.stream_key],
+  );
+  return result.rows[0] || null;
+}
+
+async function startEnabledTargetsForScheduledChannel(channel, organizationId) {
+  const targetsResult = await pool.query(
+    `SELECT *
+     FROM social_destinations
+     WHERE channel_id = $1
+       AND enabled = TRUE
+     ORDER BY id ASC`,
+    [channel.id],
+  );
+
+  const results = [];
+
+  for (const target of targetsResult.rows) {
+    try {
+      const started = await streamTargetManager.startTarget(
+        target,
+        channel,
+        organizationId,
+        { requestedBy: "scheduler" },
+      );
+
+      const alreadyRunning = /already streaming/i.test(
+        String(started?.message || ""),
+      );
+
+      results.push({
+        id: target.id,
+        ok: Boolean(started?.ok || alreadyRunning),
+        message: started?.message || null,
+      });
+    } catch (error) {
+      results.push({
+        id: target.id,
+        ok: false,
+        message: error.message,
+      });
+    }
+  }
+
+  const failures = results.filter((item) => !item.ok);
+  if (failures.length) {
+    throw new Error(
+      `Failed to start ${failures.length} stream target(s): ` +
+        failures.map((item) => `#${item.id} ${item.message}`).join("; "),
+    );
+  }
+
+  return results;
+}
+
+async function executeScheduledStart(schedule) {
+  const channel = await getScheduleChannel(schedule);
+
+  if (!channel) {
+    throw new Error(
+      `Scheduled channel not found for stream key ${schedule.stream_key}`,
+    );
+  }
+
+  if (schedule.automation_start_targets) {
+    const sourceLive = await streamTargetManager.isSrsStreamLive(
+      channel.stream_key,
+    );
+
+    if (!sourceLive) {
+      const ageMinutes =
+        (Date.now() - new Date(schedule.scheduled_start).getTime()) / 60000;
+
+      if (ageMinutes > SCHEDULE_AUTOMATION_START_GRACE_MINUTES) {
+        throw new Error(
+          `Source did not become live within ${SCHEDULE_AUTOMATION_START_GRACE_MINUTES} minutes of the scheduled start.`,
+        );
+      }
+
+      // This is retryable and expected if OBS is a little late. Keep the
+      // schedule in "scheduled" so the next poll tries again.
+      const retryError = new Error(
+        "Waiting for the channel source to become live before starting Stream Targets.",
+      );
+      retryError.retryable = true;
+      throw retryError;
+    }
+
+    await startEnabledTargetsForScheduledChannel(
+      channel,
+      schedule.organization_id,
+    );
+  }
+
+  await pool.query(
+    `UPDATE scheduled_streams
+     SET status = 'live',
+         automation_started_at = COALESCE(automation_started_at, NOW()),
+         automation_last_checked_at = NOW(),
+         automation_last_error = NULL,
+         updated_at = NOW()
+     WHERE id = $1
+       AND organization_id = $2
+       AND automation_enabled = TRUE
+       AND automation_started_at IS NULL`,
+    [schedule.id, schedule.organization_id],
+  );
+
+  console.log(
+    `[SCHEDULER] Started schedule #${schedule.id} "${schedule.title}" (${channel.stream_key})`,
+  );
+}
+
+async function executeScheduledEnd(schedule) {
+  const channel = await getScheduleChannel(schedule);
+
+  if (channel && schedule.automation_stop_targets) {
+    await streamTargetManager.stopChannelTargets(channel.id);
+  }
+
+  await pool.query(
+    `UPDATE scheduled_streams
+     SET status = 'ended',
+         automation_ended_at = COALESCE(automation_ended_at, NOW()),
+         automation_last_checked_at = NOW(),
+         automation_last_error = NULL,
+         updated_at = NOW()
+     WHERE id = $1
+       AND organization_id = $2
+       AND automation_enabled = TRUE
+       AND automation_ended_at IS NULL`,
+    [schedule.id, schedule.organization_id],
+  );
+
+  console.log(`[SCHEDULER] Ended schedule #${schedule.id} "${schedule.title}"`);
+}
+
+async function recordScheduleAutomationError(schedule, error) {
+  const retryable = Boolean(error?.retryable);
+  await pool.query(
+    `UPDATE scheduled_streams
+     SET automation_attempts = COALESCE(automation_attempts, 0) + 1,
+         automation_last_checked_at = NOW(),
+         automation_last_error = $1,
+         status = CASE
+           WHEN $2 = TRUE THEN status
+           ELSE status
+         END,
+         updated_at = NOW()
+     WHERE id = $3
+       AND organization_id = $4`,
+    [
+      String(error?.message || error || "Unknown scheduler error").slice(
+        0,
+        2000,
+      ),
+      retryable,
+      schedule.id,
+      schedule.organization_id,
+    ],
+  );
+
+  if (retryable) {
+    console.log(
+      `[SCHEDULER] Schedule #${schedule.id} waiting/retrying: ${error.message}`,
+    );
+  } else {
+    console.error(
+      `[SCHEDULER] Schedule #${schedule.id} automation failed:`,
+      error.message,
+    );
+  }
+}
+
+async function runScheduledAutomationTick() {
+  if (scheduleAutomationTickRunning) return;
+  scheduleAutomationTickRunning = true;
+
+  try {
+    const dueStarts = await pool.query(
+      `SELECT *
+       FROM scheduled_streams
+       WHERE automation_enabled = TRUE
+         AND status = 'scheduled'
+         AND automation_started_at IS NULL
+         AND scheduled_start <= NOW()
+         AND (
+           scheduled_end IS NULL
+           OR scheduled_end > NOW()
+         )
+       ORDER BY scheduled_start ASC
+       LIMIT 50`,
+    );
+
+    for (const schedule of dueStarts.rows) {
+      try {
+        await executeScheduledStart(schedule);
+      } catch (error) {
+        await recordScheduleAutomationError(schedule, error);
+      }
+    }
+
+    const dueEnds = await pool.query(
+      `SELECT *
+       FROM scheduled_streams
+       WHERE automation_enabled = TRUE
+         AND automation_ended_at IS NULL
+         AND scheduled_end IS NOT NULL
+         AND scheduled_end <= NOW()
+         AND status <> 'cancelled'
+       ORDER BY scheduled_end ASC
+       LIMIT 50`,
+    );
+
+    for (const schedule of dueEnds.rows) {
+      try {
+        await executeScheduledEnd(schedule);
+      } catch (error) {
+        await recordScheduleAutomationError(schedule, error);
+      }
+    }
+  } catch (error) {
+    console.error("[SCHEDULER] Poll failed:", error.message);
+  } finally {
+    scheduleAutomationTickRunning = false;
+  }
+}
+
+async function recoverActiveScheduledAutomation() {
+  const active = await pool.query(
+    `SELECT *
+     FROM scheduled_streams
+     WHERE automation_enabled = TRUE
+       AND status = 'live'
+       AND automation_started_at IS NOT NULL
+       AND automation_ended_at IS NULL
+       AND (scheduled_end IS NULL OR scheduled_end > NOW())
+     ORDER BY scheduled_start ASC`,
+  );
+
+  for (const schedule of active.rows) {
+    if (!schedule.automation_start_targets) continue;
+
+    try {
+      const channel = await getScheduleChannel(schedule);
+      if (!channel) continue;
+
+      const sourceLive = await streamTargetManager.isSrsStreamLive(
+        channel.stream_key,
+      );
+      if (!sourceLive) continue;
+
+      await startEnabledTargetsForScheduledChannel(
+        channel,
+        schedule.organization_id,
+      );
+
+      console.log(
+        `[SCHEDULER] Recovered active schedule #${schedule.id} after backend restart.`,
+      );
+    } catch (error) {
+      await recordScheduleAutomationError(schedule, error);
+    }
+  }
+}
+
 /*
 |--------------------------------------------------------------------------
 | RECORDINGS DATABASE + ARCHIVE LIBRARY + PROCESSING PIPELINE
@@ -13672,6 +14124,7 @@ io.on("connection", (socket) => {
   await ensureSocialOAuthTables(pool);
   await ensureStreamTargetColumns(pool);
   await streamTargetManager.reconcileDatabaseState();
+  await recoverActiveScheduledAutomation();
   await ensureRestartAuditTable();
   await ensureApiKeysTable();
   await ensureServerMetricsHistoryTable(pool);
@@ -13683,6 +14136,15 @@ io.on("connection", (socket) => {
         `NLM Streaming Manager API running on http://localhost:${PORT}`,
       );
     });
+
+    // Phase 3.1 scheduled automation — execute due starts/ends and recover
+    // missed jobs after normal PM2 restarts. Run once immediately, then poll.
+    runScheduledAutomationTick();
+    const scheduledAutomationTimer = setInterval(
+      runScheduledAutomationTick,
+      SCHEDULE_AUTOMATION_POLL_MS,
+    );
+    scheduledAutomationTimer.unref?.();
 
     // WHMCS billing poller — see pollWhmcsBilling() for why this is a poll
     // rather than a webhook. Runs once immediately, then on an interval.
