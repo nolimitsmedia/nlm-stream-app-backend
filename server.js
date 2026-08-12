@@ -1055,12 +1055,7 @@ const getOwnedChannel = async (channelId, organizationId) => {
   const id = Number(channelId);
   const orgId = Number(organizationId);
 
-  if (
-    !Number.isInteger(id) ||
-    id <= 0 ||
-    !Number.isInteger(orgId) ||
-    orgId <= 0
-  ) {
+  if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(orgId) || orgId <= 0) {
     return null;
   }
 

@@ -54,10 +54,34 @@ const STREAM_TARGET_AUDIO_MODE =
     ? "copy"
     : "transcode";
 
-function getTargetAudioArgs() {
-  return STREAM_TARGET_AUDIO_MODE === "copy"
-    ? ["-c:a", "copy"]
-    : ["-c:a", "aac", "-b:a", "128k", "-af", "aresample=async=1:first_pts=0"];
+const STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE = Math.max(
+  8000,
+  Number(process.env.STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE || 44100),
+);
+const STREAM_TARGET_SRT_AUDIO_CHANNELS = Math.max(
+  1,
+  Math.min(2, Number(process.env.STREAM_TARGET_SRT_AUDIO_CHANNELS || 2)),
+);
+
+function getTargetAudioArgs(protocol) {
+  if (STREAM_TARGET_AUDIO_MODE === "copy") {
+    return ["-c:a", "copy"];
+  }
+
+  const args = ["-c:a", "aac", "-b:a", "128k"];
+
+  if (protocol === "srt") {
+    args.push(
+      "-ar",
+      String(STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE),
+      "-ac",
+      String(STREAM_TARGET_SRT_AUDIO_CHANNELS),
+    );
+  }
+
+  args.push("-af", "aresample=async=1:first_pts=0");
+
+  return args;
 }
 
 const STREAM_TARGET_HLS_READY_TIMEOUT_MS = Math.max(
@@ -389,7 +413,7 @@ function createStreamTargetManager({
   }
 
   function buildFfmpegArgs(sourceUrl, destinationUrl, protocol) {
-    const audioArgs = getTargetAudioArgs();
+    const audioArgs = getTargetAudioArgs(protocol);
     const output =
       protocol === "srt"
         ? [
@@ -400,6 +424,8 @@ function createStreamTargetManager({
             "ignore_err",
             "-pes_payload_size",
             "0",
+            "-flush_packets",
+            "1",
             "-f",
             "mpegts",
             destinationUrl,
