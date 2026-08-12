@@ -351,6 +351,8 @@ function createStreamTargetManager({
             ...audioArgs,
             "-err_detect",
             "ignore_err",
+            "-pes_payload_size",
+            "0",
             "-f",
             "mpegts",
             destinationUrl,
