@@ -143,6 +143,189 @@ const HLS_DVR_WINDOW_SECONDS = Math.max(
   Number(process.env.HLS_DVR_WINDOW_SECONDS || 30 * 60),
 );
 
+// Phase 4.3.1 — actual viewer-delivered HLS rendition bitrate telemetry.
+//
+// SRS `kbps.recv_30s` is useful transport/server telemetry, but it can be much
+// higher than the bitrate a viewer actually receives from HLS. The Live Monitor
+// therefore samples the latest media-segment *sizes* and durations and reports
+// both numbers separately.
+//
+// This deliberately does NOT download whole .ts files on every dashboard poll:
+// - cached for 20 seconds per rendition
+// - samples only the latest 5 completed segments
+// - uses HTTP Range (bytes=0-0) and Content-Range/Content-Length to learn the
+//   object size without transferring the media payload
+const HLS_BITRATE_SAMPLE_TTL_MS = Math.max(
+  5000,
+  Number(process.env.HLS_BITRATE_SAMPLE_TTL_MS || 20000),
+);
+const HLS_BITRATE_SAMPLE_SEGMENTS = Math.max(
+  2,
+  Math.min(10, Number(process.env.HLS_BITRATE_SAMPLE_SEGMENTS || 5)),
+);
+const hlsBitrateSampleCache = new Map();
+
+const parseHlsMediaEntries = (playlistText = "") => {
+  const entries = [];
+  let duration = null;
+
+  for (const rawLine of String(playlistText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (line.startsWith("#EXTINF:")) {
+      const parsed = Number(line.slice("#EXTINF:".length).split(",", 1)[0]);
+      duration = Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      continue;
+    }
+
+    if (!line.startsWith("#") && duration != null) {
+      entries.push({ duration, uri: line });
+      duration = null;
+    }
+  }
+
+  return entries;
+};
+
+const resolveHlsUrl = (baseUrl, childOrSegment) => {
+  try {
+    return new URL(childOrSegment, baseUrl).toString();
+  } catch {
+    return null;
+  }
+};
+
+const getRemoteObjectSize = async (url) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    const contentRange = response.headers.get("content-range");
+    const contentLength = response.headers.get("content-length");
+
+    // We only need headers. Cancel the body immediately so a server that
+    // ignores Range does not cause the monitor to download an entire segment.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // non-fatal
+    }
+
+    if (!response.ok && response.status !== 206) return null;
+
+    if (contentRange) {
+      const match = contentRange.match(/\/(\d+)\s*$/);
+      if (match) return Number(match[1]);
+    }
+
+    const parsedLength = Number(contentLength);
+    return Number.isFinite(parsedLength) && parsedLength > 0
+      ? parsedLength
+      : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const sampleHlsDeliveredBitrate = async (streamName) => {
+  const cacheKey = String(streamName || "");
+  if (!cacheKey) return null;
+
+  const cached = hlsBitrateSampleCache.get(cacheKey);
+  if (cached && Date.now() - cached.sampled_at_ms < HLS_BITRATE_SAMPLE_TTL_MS) {
+    return cached.value;
+  }
+
+  const wrapperUrl =
+    `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live/` +
+    `${encodeURIComponent(cacheKey)}.m3u8`;
+
+  try {
+    const wrapperResponse = await fetch(wrapperUrl, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!wrapperResponse.ok) return cached?.value || null;
+
+    const wrapperText = await wrapperResponse.text();
+
+    // SRS may return a wrapper playlist whose only media line points to the
+    // real hls_ctx-bound media playlist. If EXTINF is already present, the
+    // wrapper itself is the media playlist.
+    let mediaUrl = wrapperUrl;
+    let mediaText = wrapperText;
+
+    if (!/^#EXTINF:/m.test(wrapperText)) {
+      const child = wrapperText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith("#"));
+
+      if (!child) return cached?.value || null;
+
+      mediaUrl = resolveHlsUrl(wrapperUrl, child);
+      if (!mediaUrl) return cached?.value || null;
+
+      const mediaResponse = await fetch(mediaUrl, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!mediaResponse.ok) return cached?.value || null;
+      mediaText = await mediaResponse.text();
+    }
+
+    const entries = parseHlsMediaEntries(mediaText).slice(
+      -HLS_BITRATE_SAMPLE_SEGMENTS,
+    );
+
+    if (entries.length < 2) return cached?.value || null;
+
+    const samples = await Promise.all(
+      entries.map(async (entry) => {
+        const segmentUrl = resolveHlsUrl(mediaUrl, entry.uri);
+        if (!segmentUrl) return null;
+        const bytes = await getRemoteObjectSize(segmentUrl);
+        if (!bytes) return null;
+        return { duration: entry.duration, bytes };
+      }),
+    );
+
+    const valid = samples.filter(Boolean);
+    const totalSeconds = valid.reduce((sum, item) => sum + item.duration, 0);
+    const totalBytes = valid.reduce((sum, item) => sum + item.bytes, 0);
+
+    if (valid.length < 2 || totalSeconds <= 0 || totalBytes <= 0) {
+      return cached?.value || null;
+    }
+
+    const value = {
+      bitrate_kbps: Math.round((totalBytes * 8) / 1000 / totalSeconds),
+      sampled_segments: valid.length,
+      sampled_duration_seconds: Math.round(totalSeconds * 100) / 100,
+      sampled_at: new Date().toISOString(),
+    };
+
+    hlsBitrateSampleCache.set(cacheKey, {
+      sampled_at_ms: Date.now(),
+      value,
+    });
+
+    return value;
+  } catch {
+    return cached?.value || null;
+  }
+};
+
 const HLS_TOKEN_TTL_SECONDS = 6 * 60 * 60; // not a hard security boundary —
 // bounds how long a dead broadcast's old links keep working; real access
 // control is still whatever gates who receives a playbackUrl at all.
@@ -7074,39 +7257,66 @@ app.get(
 
           const channel = channelByStreamKey.get(String(stream.name)) || null;
 
-          const renditions = (renditionPlan || []).map((planned) => {
-            const renditionName = `${stream.name}_${planned.label}`;
-            const actual = srsStreamByName.get(renditionName) || null;
-            const isLive = Boolean(actual?.publish?.active);
+          const renditions = await Promise.all(
+            (renditionPlan || []).map(async (planned) => {
+              const renditionName = `${stream.name}_${planned.label}`;
+              const actual = srsStreamByName.get(renditionName) || null;
+              const isLive = Boolean(actual?.publish?.active);
 
-            return {
-              label: planned.label,
-              name: renditionName,
-              planned_bitrate_kbps: Number(planned.bitrateKbps || 0),
-              planned_resolution: planned.resolution || null,
-              live: isLive,
-              bitrate_kbps: Number(actual?.kbps?.recv_30s || 0),
-              frames: Number(actual?.frames || 0),
-              clients: Number(actual?.clients || 0),
-              video: actual?.video
-                ? {
-                    codec: actual.video.codec || null,
-                    profile: actual.video.profile || null,
-                    width: Number(actual.video.width || 0),
-                    height: Number(actual.video.height || 0),
-                  }
-                : null,
-              audio: actual?.audio
-                ? {
-                    codec: actual.audio.codec || null,
-                    sample_rate: Number(actual.audio.sample_rate || 0),
-                    channels: Number(
-                      actual.audio.channel || actual.audio.channels || 0,
-                    ),
-                  }
-                : null,
-            };
-          });
+              // Transport/server rate and viewer-delivered HLS rate are
+              // intentionally separate. Use HLS as the primary operator
+              // bitrate when a sample is available.
+              const hlsSample = isLive
+                ? await sampleHlsDeliveredBitrate(renditionName)
+                : null;
+              const transportBitrateKbps = Number(actual?.kbps?.recv_30s || 0);
+              const hlsBitrateKbps = Number(hlsSample?.bitrate_kbps || 0);
+
+              return {
+                label: planned.label,
+                name: renditionName,
+                planned_bitrate_kbps: Number(planned.bitrateKbps || 0),
+                planned_resolution: planned.resolution || null,
+                live: isLive,
+
+                // Backward-compatible field: now prefers the real delivered
+                // HLS bitrate, falling back to SRS transport telemetry while
+                // the sampler is warming up.
+                bitrate_kbps:
+                  hlsBitrateKbps > 0 ? hlsBitrateKbps : transportBitrateKbps,
+
+                hls_bitrate_kbps: hlsBitrateKbps,
+                transport_bitrate_kbps: transportBitrateKbps,
+                hls_bitrate_sampled_segments: Number(
+                  hlsSample?.sampled_segments || 0,
+                ),
+                hls_bitrate_sampled_duration_seconds: Number(
+                  hlsSample?.sampled_duration_seconds || 0,
+                ),
+                hls_bitrate_sampled_at: hlsSample?.sampled_at || null,
+
+                frames: Number(actual?.frames || 0),
+                clients: Number(actual?.clients || 0),
+                video: actual?.video
+                  ? {
+                      codec: actual.video.codec || null,
+                      profile: actual.video.profile || null,
+                      width: Number(actual.video.width || 0),
+                      height: Number(actual.video.height || 0),
+                    }
+                  : null,
+                audio: actual?.audio
+                  ? {
+                      codec: actual.audio.codec || null,
+                      sample_rate: Number(actual.audio.sample_rate || 0),
+                      channels: Number(
+                        actual.audio.channel || actual.audio.channels || 0,
+                      ),
+                    }
+                  : null,
+              };
+            }),
+          );
 
           const rawTargets = channel
             ? targetsByChannelId.get(Number(channel.id)) || []
