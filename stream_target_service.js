@@ -67,6 +67,21 @@ const STREAM_TARGET_PREFLIGHT_ENABLED =
     process.env.STREAM_TARGET_PREFLIGHT_ENABLED || "true",
   ).toLowerCase() !== "false";
 
+const STREAM_TARGET_DELIVERY_VERIFY_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.STREAM_TARGET_DELIVERY_VERIFY_TIMEOUT_MS || 15000),
+);
+
+const STREAM_TARGET_MIN_VERIFIED_BYTES = Math.max(
+  1,
+  Number(process.env.STREAM_TARGET_MIN_VERIFIED_BYTES || 1024),
+);
+
+const STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS = Math.max(
+  0,
+  Number(process.env.STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS || 500),
+);
+
 // Source HLS produced by SRS is already AAC in the current NLM pipeline.
 // Re-encoding that AAC for every simulcast target needlessly invokes the AAC
 // decoder and was producing intermittent "invalid band type" decode warnings
@@ -1000,34 +1015,80 @@ function createStreamTargetManager({
     ];
   }
 
+  function hasVerifiedDelivery(state) {
+    const bytes = safeNumber(state.outputBytes, 0);
+    const outTimeMs = safeNumber(state.outputTimeMs, 0);
+    const frames = safeNumber(state.outputFrames, 0);
+    const bitrate = safeNumber(state.currentBitrateKbps, 0);
+
+    return Boolean(
+      bytes >= STREAM_TARGET_MIN_VERIFIED_BYTES &&
+      outTimeMs >= STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS &&
+      (frames > 0 || bitrate > 0),
+    );
+  }
+
+  function markDeliveryVerified(state) {
+    if (state.deliveryVerified) return;
+
+    state.deliveryVerified = true;
+    state.deliveryVerifiedAt = Date.now();
+    state.lastProgressAt = Date.now();
+    state.retryAttempt = 0;
+    state.nextRetryAt = null;
+    state.sourceHlsFault = false;
+    state.lastError = null;
+    state.failureCode = null;
+    state.failureCategory = null;
+    state.failureScope = null;
+    state.failureRetryable = true;
+    state.lastFailureAt = null;
+    state.status = "streaming";
+
+    if (state.deliveryVerifyTimer) {
+      clearTimeout(state.deliveryVerifyTimer);
+      state.deliveryVerifyTimer = null;
+    }
+  }
+
   function parseProgressLine(state, line) {
     const idx = line.indexOf("=");
     if (idx <= 0) return;
+
     const key = line.slice(0, idx).trim();
     const value = line.slice(idx + 1).trim();
+
     if (key === "bitrate") {
       const match = value.match(/([0-9.]+)kbits\/s/i);
-      if (match) state.currentBitrateKbps = Math.round(Number(match[1]));
+      state.currentBitrateKbps = match
+        ? Math.max(0, Math.round(Number(match[1])))
+        : 0;
     } else if (key === "drop_frames") {
       state.droppedFrames = safeNumber(value, state.droppedFrames || 0);
+    } else if (key === "frame") {
+      state.outputFrames = safeNumber(value, state.outputFrames || 0);
+    } else if (key === "total_size") {
+      state.outputBytes = safeNumber(value, state.outputBytes || 0);
+    } else if (key === "out_time_ms") {
+      // FFmpeg's progress protocol calls this out_time_ms although builds
+      // commonly report microseconds. Treat values >= 100000 as microseconds.
+      const raw = safeNumber(value, state.outputTimeMs || 0);
+      state.outputTimeMs = raw >= 100000 ? Math.floor(raw / 1000) : raw;
+    } else if (key === "out_time_us") {
+      state.outputTimeMs = Math.floor(
+        safeNumber(value, state.outputTimeMs || 0) / 1000,
+      );
     } else if (
       key === "progress" &&
       (value === "continue" || value === "end")
     ) {
       state.lastProgressAt = Date.now();
-      state.retryAttempt = 0;
-      state.nextRetryAt = null;
-      state.sourceHlsFault = false;
-      state.lastError = null;
-      state.failureCode = null;
-      state.failureCategory = null;
-      state.failureScope = null;
-      state.failureRetryable = true;
-      state.lastFailureAt = null;
-      // Do not advertise STREAMING merely because FFmpeg spawned. The first
-      // real progress heartbeat proves media is actually flowing through the
-      // target worker.
-      state.status = "streaming";
+
+      // A progress heartbeat by itself is not proof that the destination is
+      // receiving media. Require output bytes + media time + frame/bitrate.
+      if (hasVerifiedDelivery(state)) {
+        markDeliveryVerified(state);
+      }
     }
   }
 
@@ -1060,8 +1121,10 @@ function createStreamTargetManager({
     if (!state) return;
     if (state.metricsTimer) clearInterval(state.metricsTimer);
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    if (state.deliveryVerifyTimer) clearTimeout(state.deliveryVerifyTimer);
     state.metricsTimer = null;
     state.reconnectTimer = null;
+    state.deliveryVerifyTimer = null;
   }
 
   async function spawnPush(
@@ -1102,6 +1165,12 @@ function createStreamTargetManager({
       failureRetryable: true,
       lastFailureAt: null,
       preflight: null,
+      outputBytes: 0,
+      outputTimeMs: 0,
+      outputFrames: 0,
+      deliveryVerified: false,
+      deliveryVerifiedAt: null,
+      deliveryVerifyTimer: null,
     };
     clearStateTimers(state);
     state.intentionalStop = false;
@@ -1111,6 +1180,12 @@ function createStreamTargetManager({
     state.channelStreamKey = channel.stream_key;
     state.sourceMode = preferredSource.mode;
     state.sourceUrl = sourceUrl;
+    state.currentBitrateKbps = 0;
+    state.outputBytes = 0;
+    state.outputTimeMs = 0;
+    state.outputFrames = 0;
+    state.deliveryVerified = false;
+    state.deliveryVerifiedAt = null;
     if (!state.startedAt || !reconnect) {
       state.startedAt =
         reconnect && target.started_at
@@ -1187,9 +1262,35 @@ function createStreamTargetManager({
        WHERE id = $4`,
       [proc.pid, reconnect, destinationUrl, destinationId],
     );
-    // Remain in CONNECTING until FFmpeg emits its first progress heartbeat.
-    // parseProgressLine() promotes the runtime state to STREAMING once media
-    // is demonstrably flowing.
+    // Remain in CONNECTING until actual output delivery is verified.
+    // A live FFmpeg PID or progress heartbeat alone is insufficient.
+    state.deliveryVerifyTimer = setTimeout(() => {
+      if (
+        state.proc !== proc ||
+        state.intentionalStop ||
+        state.deliveryVerified
+      ) {
+        return;
+      }
+
+      state.status = "reconnecting";
+      state.lastError =
+        "Destination delivery could not be verified: FFmpeg produced no confirmed output media.";
+      state.failureCode = "delivery_not_verified";
+      state.failureCategory = "delivery";
+      state.failureScope = "destination";
+      state.failureRetryable = true;
+      state.lastFailureAt = Date.now();
+
+      // Let the existing exit/reconnect path perform bounded backoff and
+      // persistence. Killing only this worker prevents false STREAMING state.
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // Process may already be exiting.
+      }
+    }, STREAM_TARGET_DELIVERY_VERIFY_TIMEOUT_MS);
+    state.deliveryVerifyTimer.unref?.();
 
     proc.on("error", (error) => {
       const failure = classifyTargetFailure(
@@ -1211,7 +1312,9 @@ function createStreamTargetManager({
       if (state.proc !== proc) return;
       state.proc = null;
       if (state.metricsTimer) clearInterval(state.metricsTimer);
+      if (state.deliveryVerifyTimer) clearTimeout(state.deliveryVerifyTimer);
       state.metricsTimer = null;
+      state.deliveryVerifyTimer = null;
 
       const wasIntentional = state.intentionalStop;
       const lastError =
@@ -1583,10 +1686,20 @@ function createStreamTargetManager({
        SET status = 'connecting',
            last_error = NULL,
            current_bitrate_kbps = 0,
+           reconnect_count = CASE WHEN $2::boolean THEN reconnect_count ELSE 0 END,
            updated_at = now()
        WHERE id = $1`,
-      [target.id],
+      [target.id, Boolean(options.reconnect)],
     );
+
+    if (!options.reconnect) {
+      target.reconnect_count = 0;
+      const existingState = processStates.get(Number(target.id));
+      if (existingState) {
+        existingState.reconnectCount = 0;
+        existingState.retryAttempt = 0;
+      }
+    }
 
     const readiness = await waitForPreferredSource(
       channel.stream_key,
@@ -1866,15 +1979,31 @@ function createStreamTargetManager({
 
     return {
       pid: state.proc?.pid || null,
-      is_running: Boolean(state.proc),
+      is_running: Boolean(state.proc && state.deliveryVerified),
+      worker_running: Boolean(state.proc),
+      delivery_verified: Boolean(state.deliveryVerified),
+      delivery_verified_at: state.deliveryVerifiedAt
+        ? new Date(state.deliveryVerifiedAt).toISOString()
+        : null,
+      output_bytes: safeNumber(state.outputBytes),
+      output_time_ms: safeNumber(state.outputTimeMs),
+      output_frames: safeNumber(state.outputFrames),
       current_bitrate_kbps: state.currentBitrateKbps || 0,
       dropped_frames: state.droppedFrames || 0,
       reconnect_count: state.reconnectCount || 0,
       runtime_status: state.proc
-        ? state.status || "connecting"
+        ? state.deliveryVerified
+          ? "streaming"
+          : state.status === "reconnecting"
+            ? "reconnecting"
+            : "connecting"
         : state.status || "disconnected",
       status: state.proc
-        ? state.status || "connecting"
+        ? state.deliveryVerified
+          ? "streaming"
+          : state.status === "reconnecting"
+            ? "reconnecting"
+            : "connecting"
         : state.status || "disconnected",
       uptime_seconds: uptimeSeconds,
       started_at: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : null,
