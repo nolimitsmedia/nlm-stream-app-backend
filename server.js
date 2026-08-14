@@ -9761,10 +9761,6 @@ app.post("/api/srs/on_publish", async (req, res) => {
   // This key is used only to verify generic RTMP stream-target publishing
   // back into this SRS instance without requiring a channels DB row.
   // Remove this exception after the stream-target receiver test is complete.
-  if (streamKey === "nlm-target-test-2") {
-    console.log(`[SRS] TEST TARGET ALLOWED — ${streamKey}`);
-    return res.json({ code: 0 });
-  }
 
   try {
     // 0. Auto-reset stale is_live flags older than 2 hours (cleanup)
