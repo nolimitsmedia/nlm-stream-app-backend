@@ -3,6 +3,9 @@
 
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const net = require("net");
+const tls = require("tls");
+const dns = require("dns").promises;
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
 
@@ -40,6 +43,29 @@ const RECONNECT_DELAY_MS = Number(
 const MAX_RECONNECT_DELAY_MS = Number(
   process.env.STREAM_TARGET_MAX_RECONNECT_DELAY_MS || 30000,
 );
+
+const STREAM_TARGET_MAX_RECONNECT_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.STREAM_TARGET_MAX_RECONNECT_ATTEMPTS || 8),
+);
+
+const STREAM_TARGET_RECONNECT_JITTER_PERCENT = Math.max(
+  0,
+  Math.min(
+    0.5,
+    Number(process.env.STREAM_TARGET_RECONNECT_JITTER_PERCENT || 0.15),
+  ),
+);
+
+const STREAM_TARGET_PREFLIGHT_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.STREAM_TARGET_PREFLIGHT_TIMEOUT_MS || 5000),
+);
+
+const STREAM_TARGET_PREFLIGHT_ENABLED =
+  String(
+    process.env.STREAM_TARGET_PREFLIGHT_ENABLED || "true",
+  ).toLowerCase() !== "false";
 
 // Source HLS produced by SRS is already AAC in the current NLM pipeline.
 // Re-encoding that AAC for every simulcast target needlessly invokes the AAC
@@ -139,6 +165,345 @@ function redactTargetUrl(url) {
   } catch {
     return text.replace(/\/[^/\s?]{8,}(?=\?|$)/, "/***");
   }
+}
+
+function destinationDefaultPort(protocol) {
+  if (protocol === "rtmps") return 443;
+  if (protocol === "rtmp") return 1935;
+  if (protocol === "srt") return null;
+  return null;
+}
+
+function parseDestinationEndpoint(destinationUrl, protocol) {
+  const value = String(destinationUrl || "").trim();
+  if (!value) {
+    return {
+      ok: false,
+      code: "missing_destination",
+      message: "Destination URL is required",
+    };
+  }
+
+  try {
+    const parsed = new URL(value);
+    const expected = `${protocol}:`;
+    if (parsed.protocol.toLowerCase() !== expected) {
+      return {
+        ok: false,
+        code: "protocol_mismatch",
+        message: `Expected ${protocol.toUpperCase()} destination URL`,
+      };
+    }
+
+    const port = parsed.port
+      ? Number(parsed.port)
+      : destinationDefaultPort(protocol);
+
+    if (!parsed.hostname) {
+      return {
+        ok: false,
+        code: "missing_host",
+        message: "Destination host is missing",
+      };
+    }
+
+    if (!port && protocol === "srt") {
+      return {
+        ok: false,
+        code: "missing_port",
+        message: "SRT destinations must include an explicit port",
+      };
+    }
+
+    return {
+      ok: true,
+      hostname: parsed.hostname,
+      port,
+      protocol,
+    };
+  } catch {
+    return {
+      ok: false,
+      code: "invalid_destination_url",
+      message: "Destination URL is invalid",
+    };
+  }
+}
+
+async function tcpPreflight(
+  hostname,
+  port,
+  { tlsMode = false, timeoutMs } = {},
+) {
+  const startedAt = Date.now();
+  const timeout = Math.max(
+    1000,
+    Number(timeoutMs || STREAM_TARGET_PREFLIGHT_TIMEOUT_MS),
+  );
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let socket = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket?.destroy();
+      } catch {
+        // non-fatal
+      }
+      resolve({
+        ...result,
+        latency_ms: Math.max(0, Date.now() - startedAt),
+      });
+    };
+
+    const timer = setTimeout(() => {
+      finish({
+        ok: false,
+        code: "connection_timeout",
+        category: "network",
+        retryable: true,
+        message: `Connection timed out after ${timeout}ms`,
+      });
+    }, timeout);
+
+    const onReady = () => {
+      clearTimeout(timer);
+      finish({
+        ok: true,
+        code: "reachable",
+        category: tlsMode ? "tls" : "network",
+        retryable: true,
+        message: tlsMode
+          ? "TLS connection established"
+          : "TCP connection established",
+      });
+    };
+
+    const onError = (error) => {
+      clearTimeout(timer);
+      const code = String(error?.code || "").toUpperCase();
+      const tlsFailure = /CERT|TLS|SSL|HANDSHAKE/i.test(
+        `${code} ${error?.message || ""}`,
+      );
+
+      finish({
+        ok: false,
+        code:
+          code === "ECONNREFUSED"
+            ? "connection_refused"
+            : code === "ENOTFOUND" || code === "EAI_AGAIN"
+              ? "dns_failure"
+              : tlsFailure
+                ? "tls_failure"
+                : "connection_failed",
+        category: tlsFailure ? "tls" : code.includes("DNS") ? "dns" : "network",
+        retryable:
+          !tlsFailure &&
+          !/CERT_HAS_EXPIRED|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(
+            `${code} ${error?.message || ""}`,
+          ),
+        message: String(
+          error?.message || "Destination connection failed",
+        ).slice(0, 500),
+      });
+    };
+
+    try {
+      socket = tlsMode
+        ? tls.connect(
+            {
+              host: hostname,
+              port,
+              servername: net.isIP(hostname) ? undefined : hostname,
+              rejectUnauthorized: true,
+            },
+            onReady,
+          )
+        : net.createConnection({ host: hostname, port }, onReady);
+
+      socket.once("error", onError);
+    } catch (error) {
+      onError(error);
+    }
+  });
+}
+
+function classifyTargetFailure(
+  text,
+  { sourceUrl = "", destinationUrl = "" } = {},
+) {
+  const value = String(text || "");
+  const lower = value.toLowerCase();
+  const source = String(sourceUrl || "");
+  const destination = String(destinationUrl || "");
+
+  const result = {
+    scope: "worker",
+    code: "ffmpeg_error",
+    category: "media",
+    retryable: true,
+    message: value.trim().slice(-1200) || "FFmpeg target worker failed",
+  };
+
+  if (
+    /404 not found|failed to reload playlist|when parsing playlist|error when loading first segment|failed to open segment/i.test(
+      value,
+    ) ||
+    (source &&
+      value.includes(source) &&
+      /connection refused|connection reset by peer|input\/output error|end of file|timed out|server error/i.test(
+        value,
+      ))
+  ) {
+    return {
+      scope: "source",
+      code: "source_unavailable",
+      category: "source",
+      retryable: true,
+      message: "Internal media source temporarily unavailable",
+    };
+  }
+
+  if (
+    /name or service not known|temporary failure in name resolution|enotfound|eai_again/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "dns_failure",
+      category: "dns",
+      retryable: true,
+      message: "Destination DNS lookup failed",
+    };
+  }
+
+  if (
+    /certificate verify failed|certificate has expired|self signed certificate|unable to verify|unknown ca/i.test(
+      lower,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "tls_certificate_error",
+      category: "tls",
+      retryable: false,
+      message: "Destination TLS certificate validation failed",
+    };
+  }
+
+  if (/tls|ssl|handshake/i.test(value)) {
+    return {
+      scope: "destination",
+      code: "tls_handshake_failed",
+      category: "tls",
+      retryable: true,
+      message: "Destination TLS handshake failed",
+    };
+  }
+
+  if (
+    /401|403|unauthorized|forbidden|permission denied|authentication failed|invalid stream key|bad name|rejected/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "authentication_rejected",
+      category: "authentication",
+      retryable: false,
+      message: "Destination rejected authentication or the stream key",
+    };
+  }
+
+  if (
+    /already publishing|already exists|another publisher|stream is busy|duplicate publisher/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "duplicate_publisher",
+      category: "destination",
+      retryable: false,
+      message: "Another publisher may already be using this destination stream",
+    };
+  }
+
+  if (/connection refused/i.test(value)) {
+    return {
+      scope: "destination",
+      code: "connection_refused",
+      category: "network",
+      retryable: true,
+      message: "Destination refused the connection",
+    };
+  }
+
+  if (/timed out|timeout/i.test(value)) {
+    return {
+      scope: "destination",
+      code: "connection_timeout",
+      category: "network",
+      retryable: true,
+      message: "Destination connection timed out",
+    };
+  }
+
+  if (
+    /connection reset by peer|broken pipe|network is unreachable|i\/o error|input\/output error/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "connection_lost",
+      category: "network",
+      retryable: true,
+      message: "Destination connection was interrupted",
+    };
+  }
+
+  if (
+    /invalid argument|conversion failed|error initializing output|could not write header|muxer does not support/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope:
+        destination && value.includes(destination) ? "destination" : "worker",
+      code: "media_conversion_failed",
+      category: "media",
+      retryable: false,
+      message: "FFmpeg could not initialize the destination media output",
+    };
+  }
+
+  if (destination && value.includes(destination)) {
+    result.scope = "destination";
+    result.category = "destination";
+  }
+
+  return result;
+}
+
+function calculateReconnectDelay(attempt) {
+  const safeAttempt = Math.max(1, Number(attempt || 1));
+  const exponential = Math.min(
+    RECONNECT_DELAY_MS * 2 ** Math.max(0, safeAttempt - 1),
+    MAX_RECONNECT_DELAY_MS,
+  );
+
+  const jitterRange = exponential * STREAM_TARGET_RECONNECT_JITTER_PERCENT;
+  const jitter = jitterRange > 0 ? (Math.random() * 2 - 1) * jitterRange : 0;
+
+  return Math.max(
+    RECONNECT_DELAY_MS,
+    Math.round(Math.min(MAX_RECONNECT_DELAY_MS, exponential + jitter)),
+  );
 }
 
 function makeInternalPlatformKey(targetType) {
@@ -467,6 +832,130 @@ function createStreamTargetManager({
     return combineDestinationUrl(base, target.stream_key, protocol);
   }
 
+  async function preflightDestination(destinationUrl, protocol) {
+    const normalizedProtocol = String(protocol || "").toLowerCase();
+    const endpoint = parseDestinationEndpoint(
+      destinationUrl,
+      normalizedProtocol,
+    );
+
+    if (!endpoint.ok) {
+      return {
+        ok: false,
+        protocol: normalizedProtocol,
+        stage: "validation",
+        ...endpoint,
+      };
+    }
+
+    const startedAt = Date.now();
+
+    try {
+      const records = await Promise.race([
+        dns.lookup(endpoint.hostname, { all: true }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("DNS lookup timed out")),
+            STREAM_TARGET_PREFLIGHT_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+
+      if (!records?.length) {
+        return {
+          ok: false,
+          protocol: normalizedProtocol,
+          stage: "dns",
+          code: "dns_failure",
+          category: "dns",
+          retryable: true,
+          message: "Destination hostname did not resolve",
+        };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        protocol: normalizedProtocol,
+        stage: "dns",
+        code: "dns_failure",
+        category: "dns",
+        retryable: true,
+        message: String(
+          error?.message || "Destination DNS lookup failed",
+        ).slice(0, 500),
+      };
+    }
+
+    // SRT is UDP-based, so a TCP connect test would be misleading. DNS +
+    // endpoint validation is the safe preflight; FFmpeg performs the actual
+    // SRT handshake when the target starts.
+    if (normalizedProtocol === "srt") {
+      return {
+        ok: true,
+        protocol: normalizedProtocol,
+        stage: "ready",
+        code: "dns_resolved",
+        category: "network",
+        retryable: true,
+        latency_ms: Math.max(0, Date.now() - startedAt),
+        message: "SRT endpoint syntax and DNS resolution are valid",
+      };
+    }
+
+    const connection = await tcpPreflight(endpoint.hostname, endpoint.port, {
+      tlsMode: normalizedProtocol === "rtmps",
+      timeoutMs: STREAM_TARGET_PREFLIGHT_TIMEOUT_MS,
+    });
+
+    return {
+      ...connection,
+      protocol: normalizedProtocol,
+      stage: connection.ok ? "ready" : "connect",
+    };
+  }
+
+  async function preflightTarget(target) {
+    if (!target) {
+      return {
+        ok: false,
+        stage: "validation",
+        code: "missing_target",
+        retryable: false,
+        message: "Stream target was not found",
+      };
+    }
+
+    if (target.automation_mode === "oauth") {
+      return {
+        ok: true,
+        skipped: true,
+        stage: "oauth",
+        code: "oauth_runtime_destination",
+        retryable: true,
+        message:
+          "OAuth destination is created at broadcast start; network preflight is deferred until then.",
+      };
+    }
+
+    const type = normalizeTargetType(target.target_type || target.platform);
+    const protocol = normalizeProtocol(target.protocol, type);
+    const validationError = validateManualTarget(target);
+    if (validationError) {
+      return {
+        ok: false,
+        stage: "validation",
+        code: "invalid_target",
+        category: "configuration",
+        retryable: false,
+        protocol,
+        message: validationError,
+      };
+    }
+
+    const destinationUrl = buildManualDestinationUrl(target);
+    return preflightDestination(destinationUrl, protocol);
+  }
+
   function buildFfmpegArgs(sourceUrl, destinationUrl, protocol) {
     const audioArgs = getTargetAudioArgs(protocol);
     const output =
@@ -527,8 +1016,14 @@ function createStreamTargetManager({
     ) {
       state.lastProgressAt = Date.now();
       state.retryAttempt = 0;
+      state.nextRetryAt = null;
       state.sourceHlsFault = false;
       state.lastError = null;
+      state.failureCode = null;
+      state.failureCategory = null;
+      state.failureScope = null;
+      state.failureRetryable = true;
+      state.lastFailureAt = null;
       // Do not advertise STREAMING merely because FFmpeg spawned. The first
       // real progress heartbeat proves media is actually flowing through the
       // target worker.
@@ -597,8 +1092,16 @@ function createStreamTargetManager({
       droppedFrames: safeNumber(target.dropped_frames),
       reconnectCount: safeNumber(target.reconnect_count),
       retryAttempt: 0,
+      nextRetryAt: null,
+      maxReconnectAttempts: STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
       sourceHlsFault: false,
       intentionalStop: false,
+      failureCode: null,
+      failureCategory: null,
+      failureScope: null,
+      failureRetryable: true,
+      lastFailureAt: null,
+      preflight: null,
     };
     clearStateTimers(state);
     state.intentionalStop = false;
@@ -634,17 +1137,30 @@ function createStreamTargetManager({
 
     proc.stderr.on("data", (chunk) => {
       const text = chunk.toString();
-      if (classifyTransientSourceFailure(text, sourceUrl)) {
-        state.sourceHlsFault = true;
-        state.lastError = `Internal ${String(state.sourceMode || "media").toUpperCase()} source temporarily unavailable; reconnecting automatically.`;
-      } else if (classifyDestinationFailure(text, destinationUrl)) {
-        state.sourceHlsFault = false;
+
+      if (
+        /error|failed|refused|timed out|broken pipe|denied|rejected|handshake|401|403/i.test(
+          text,
+        )
+      ) {
+        const failure = classifyTargetFailure(text, {
+          sourceUrl,
+          destinationUrl,
+        });
+
+        state.sourceHlsFault = failure.scope === "source";
+        state.failureCode = failure.code;
+        state.failureCategory = failure.category;
+        state.failureScope = failure.scope;
+        state.failureRetryable = failure.retryable !== false;
+        state.lastFailureAt = Date.now();
+
         state.lastError =
-          "Destination connection failed or was rejected. Verify the destination URL, stream key, TLS settings, and that no other publisher is using the same destination stream.";
-      } else if (/error|failed|refused|timed out|broken pipe/i.test(text)) {
-        state.sourceHlsFault = false;
-        state.lastError = text.trim().slice(-1200);
+          failure.scope === "source"
+            ? `Internal ${String(state.sourceMode || "media").toUpperCase()} source temporarily unavailable; reconnecting automatically.`
+            : failure.message;
       }
+
       console.log(
         `[STREAM-TARGET ${targetType} #${destinationId}]`,
         text.slice(0, 300),
@@ -674,6 +1190,22 @@ function createStreamTargetManager({
     // Remain in CONNECTING until FFmpeg emits its first progress heartbeat.
     // parseProgressLine() promotes the runtime state to STREAMING once media
     // is demonstrably flowing.
+
+    proc.on("error", (error) => {
+      const failure = classifyTargetFailure(
+        error?.message || "FFmpeg spawn failed",
+        {
+          sourceUrl,
+          destinationUrl,
+        },
+      );
+      state.lastError = failure.message;
+      state.failureCode = failure.code;
+      state.failureCategory = failure.category;
+      state.failureScope = failure.scope;
+      state.failureRetryable = failure.retryable !== false;
+      state.lastFailureAt = Date.now();
+    });
 
     proc.on("exit", async (code, signal) => {
       if (state.proc !== proc) return;
@@ -714,33 +1246,65 @@ function createStreamTargetManager({
 
       try {
         const fresh = await getDestinationAndChannel(destinationId);
+        const sourceStillLive = fresh
+          ? await isSrsStreamLive(fresh.channel_stream_key)
+          : false;
+
+        const retryable = state.failureRetryable !== false;
+        const attemptsExhausted =
+          safeNumber(state.retryAttempt) >=
+          STREAM_TARGET_MAX_RECONNECT_ATTEMPTS;
+
         const canReconnect = Boolean(
           fresh &&
           fresh.enabled &&
           fresh.auto_reconnect &&
-          (await isSrsStreamLive(fresh.channel_stream_key)),
+          sourceStillLive &&
+          retryable &&
+          !attemptsExhausted,
         );
 
         if (!canReconnect) {
+          let terminalStatus = "disconnected";
+          let terminalError = lastError;
+
+          if (!retryable) {
+            terminalStatus = "failed";
+            terminalError =
+              state.lastError ||
+              "Target requires operator attention before it can reconnect.";
+          } else if (attemptsExhausted) {
+            terminalStatus = "failed";
+            terminalError =
+              `Automatic reconnect stopped after ${STREAM_TARGET_MAX_RECONNECT_ATTEMPTS} attempts. ${lastError || ""}`.trim();
+          }
+
+          state.status = terminalStatus;
+          state.nextRetryAt = null;
+
           await pool.query(
             `UPDATE social_destinations
              SET is_running = false,
                  ffmpeg_pid = NULL,
-                 status = 'disconnected',
+                 status = $1,
                  current_bitrate_kbps = 0,
                  last_disconnected_at = now(),
-                 last_error = $1,
+                 last_error = $2,
                  updated_at = now()
-             WHERE id = $2`,
-            [lastError, destinationId],
+             WHERE id = $3`,
+            [terminalStatus, terminalError, destinationId],
           );
-          processStates.delete(destinationId);
+
+          processStates.set(destinationId, state);
           return;
         }
 
         state.reconnectCount = safeNumber(fresh.reconnect_count) + 1;
         state.retryAttempt = safeNumber(state.retryAttempt) + 1;
         state.status = "reconnecting";
+
+        const delay = calculateReconnectDelay(state.retryAttempt);
+        state.nextRetryAt = Date.now() + delay;
 
         await pool.query(
           `UPDATE social_destinations
@@ -762,61 +1326,89 @@ function createStreamTargetManager({
           ],
         );
 
-        const delay = Math.min(
-          RECONNECT_DELAY_MS * Math.max(1, state.retryAttempt),
-          MAX_RECONNECT_DELAY_MS,
-        );
-        state.reconnectTimer = setTimeout(async () => {
-          try {
-            const latest = await getDestinationAndChannel(destinationId);
-            if (!latest || !latest.enabled)
-              return processStates.delete(destinationId);
-            const readiness = await waitForPreferredSource(
-              latest.channel_stream_key,
-              STREAM_TARGET_HLS_READY_TIMEOUT_MS,
-            );
-            if (!readiness.ok) {
-              throw new Error(
-                `Source media is not ready yet: ${readiness.message}`,
-              );
-            }
+        const scheduleNextAttempt = () => {
+          if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
 
-            const url =
-              latest.active_destination_url ||
-              state.destinationUrl ||
-              buildManualDestinationUrl(latest);
-            await spawnPush(
-              latest,
-              {
-                id: latest.channel_id,
-                name: latest.channel_name,
-                stream_key: latest.channel_stream_key,
-              },
-              url,
-              { reconnect: true },
-            );
-          } catch (error) {
-            state.lastError = error.message;
-            console.error(
-              `[STREAM-TARGET #${destinationId}] reconnect failed:`,
-              error.message,
-            );
-            // A failed respawn doesn't produce an exit event, so schedule another
-            // attempt through the same exit-style recovery path by marking this
-            // state disconnected and recursively scheduling with a short timer.
-            state.reconnectTimer = setTimeout(async () => {
-              const latest = await getDestinationAndChannel(
-                destinationId,
-              ).catch(() => null);
-              if (!latest || !latest.enabled || !latest.auto_reconnect)
-                return processStates.delete(destinationId);
+          state.reconnectTimer = setTimeout(async () => {
+            state.reconnectTimer = null;
+            state.nextRetryAt = null;
+
+            try {
+              const latest = await getDestinationAndChannel(destinationId);
+              if (!latest || !latest.enabled || !latest.auto_reconnect) {
+                processStates.delete(destinationId);
+                return;
+              }
+
+              const stillLive = await isSrsStreamLive(
+                latest.channel_stream_key,
+              );
+              if (!stillLive) {
+                state.status = "disconnected";
+                await pool.query(
+                  `UPDATE social_destinations
+                   SET status='disconnected', is_running=false, ffmpeg_pid=NULL,
+                       current_bitrate_kbps=0, updated_at=now()
+                   WHERE id=$1`,
+                  [destinationId],
+                );
+                return;
+              }
+
               const readiness = await waitForPreferredSource(
                 latest.channel_stream_key,
                 STREAM_TARGET_HLS_READY_TIMEOUT_MS,
               );
+
               if (!readiness.ok) {
-                state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+                state.failureCode = "source_not_ready";
+                state.failureCategory = "source";
+                state.failureScope = "source";
+                state.failureRetryable = true;
+                state.lastFailureAt = Date.now();
                 state.lastError = `Source media is not ready yet: ${readiness.message}`;
+
+                // Trigger a synthetic exit-style retry decision by increasing
+                // the attempt counter and scheduling the next bounded backoff.
+                if (
+                  safeNumber(state.retryAttempt) >=
+                  STREAM_TARGET_MAX_RECONNECT_ATTEMPTS
+                ) {
+                  state.status = "failed";
+                  state.nextRetryAt = null;
+                  await pool.query(
+                    `UPDATE social_destinations
+                     SET status='failed', is_running=false, ffmpeg_pid=NULL,
+                         current_bitrate_kbps=0,
+                         last_error=$1, updated_at=now()
+                     WHERE id=$2`,
+                    [
+                      `Automatic reconnect stopped after ${STREAM_TARGET_MAX_RECONNECT_ATTEMPTS} attempts. ${state.lastError}`,
+                      destinationId,
+                    ],
+                  );
+                  return;
+                }
+
+                state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+                state.reconnectCount = safeNumber(state.reconnectCount) + 1;
+                state.status = "reconnecting";
+                const retryDelay = calculateReconnectDelay(state.retryAttempt);
+                state.nextRetryAt = Date.now() + retryDelay;
+
+                await pool.query(
+                  `UPDATE social_destinations
+                   SET status='reconnecting', reconnect_count=$1,
+                       last_error=$2, updated_at=now()
+                   WHERE id=$3`,
+                  [state.reconnectCount, state.lastError, destinationId],
+                );
+
+                state.reconnectTimer = setTimeout(
+                  scheduleNextAttempt,
+                  retryDelay,
+                );
+                state.reconnectTimer.unref?.();
                 return;
               }
 
@@ -824,7 +1416,74 @@ function createStreamTargetManager({
                 latest.active_destination_url ||
                 state.destinationUrl ||
                 buildManualDestinationUrl(latest);
-              spawnPush(
+
+              if (
+                STREAM_TARGET_PREFLIGHT_ENABLED &&
+                latest.automation_mode !== "oauth"
+              ) {
+                const preflight = await preflightDestination(
+                  url,
+                  normalizeProtocol(
+                    latest.protocol,
+                    normalizeTargetType(latest.target_type || latest.platform),
+                  ),
+                );
+                state.preflight = {
+                  ...preflight,
+                  checked_at: new Date().toISOString(),
+                };
+
+                if (!preflight.ok) {
+                  state.failureCode = preflight.code || "preflight_failed";
+                  state.failureCategory = preflight.category || "destination";
+                  state.failureScope = "destination";
+                  state.failureRetryable = preflight.retryable !== false;
+                  state.lastFailureAt = Date.now();
+                  state.lastError =
+                    preflight.message || "Destination preflight failed";
+
+                  if (
+                    preflight.retryable === false ||
+                    safeNumber(state.retryAttempt) >=
+                      STREAM_TARGET_MAX_RECONNECT_ATTEMPTS
+                  ) {
+                    state.status = "failed";
+                    state.nextRetryAt = null;
+                    await pool.query(
+                      `UPDATE social_destinations
+                       SET status='failed', is_running=false, ffmpeg_pid=NULL,
+                           current_bitrate_kbps=0, last_error=$1, updated_at=now()
+                       WHERE id=$2`,
+                      [state.lastError, destinationId],
+                    );
+                    return;
+                  }
+
+                  state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+                  state.reconnectCount = safeNumber(state.reconnectCount) + 1;
+                  const retryDelay = calculateReconnectDelay(
+                    state.retryAttempt,
+                  );
+                  state.nextRetryAt = Date.now() + retryDelay;
+
+                  await pool.query(
+                    `UPDATE social_destinations
+                     SET status='reconnecting', reconnect_count=$1,
+                         last_error=$2, updated_at=now()
+                     WHERE id=$3`,
+                    [state.reconnectCount, state.lastError, destinationId],
+                  );
+
+                  state.reconnectTimer = setTimeout(
+                    scheduleNextAttempt,
+                    retryDelay,
+                  );
+                  state.reconnectTimer.unref?.();
+                  return;
+                }
+              }
+
+              await spawnPush(
                 latest,
                 {
                   id: latest.channel_id,
@@ -833,17 +1492,64 @@ function createStreamTargetManager({
                 },
                 url,
                 { reconnect: true },
-              ).catch((err) =>
-                console.error(
-                  `[STREAM-TARGET #${destinationId}] repeated reconnect failed:`,
-                  err.message,
-                ),
               );
-            }, MAX_RECONNECT_DELAY_MS);
-            state.reconnectTimer.unref?.();
-          }
-        }, delay);
-        state.reconnectTimer.unref?.();
+            } catch (error) {
+              state.failureCode = "reconnect_worker_failed";
+              state.failureCategory = "worker";
+              state.failureScope = "worker";
+              state.failureRetryable = true;
+              state.lastFailureAt = Date.now();
+              state.lastError = error.message || "Reconnect worker failed";
+
+              if (
+                safeNumber(state.retryAttempt) >=
+                STREAM_TARGET_MAX_RECONNECT_ATTEMPTS
+              ) {
+                state.status = "failed";
+                state.nextRetryAt = null;
+                await pool
+                  .query(
+                    `UPDATE social_destinations
+                   SET status='failed', is_running=false, ffmpeg_pid=NULL,
+                       current_bitrate_kbps=0, last_error=$1, updated_at=now()
+                   WHERE id=$2`,
+                    [
+                      `Automatic reconnect stopped after ${STREAM_TARGET_MAX_RECONNECT_ATTEMPTS} attempts. ${state.lastError}`,
+                      destinationId,
+                    ],
+                  )
+                  .catch(() => {});
+                return;
+              }
+
+              state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+              state.reconnectCount = safeNumber(state.reconnectCount) + 1;
+              const retryDelay = calculateReconnectDelay(state.retryAttempt);
+              state.status = "reconnecting";
+              state.nextRetryAt = Date.now() + retryDelay;
+
+              await pool
+                .query(
+                  `UPDATE social_destinations
+                 SET status='reconnecting', reconnect_count=$1,
+                     last_error=$2, updated_at=now()
+                 WHERE id=$3`,
+                  [state.reconnectCount, state.lastError, destinationId],
+                )
+                .catch(() => {});
+
+              state.reconnectTimer = setTimeout(
+                scheduleNextAttempt,
+                retryDelay,
+              );
+              state.reconnectTimer.unref?.();
+            }
+          }, delay);
+
+          state.reconnectTimer.unref?.();
+        };
+
+        scheduleNextAttempt();
       } catch (error) {
         console.error(
           `[STREAM-TARGET #${destinationId}] reconnect decision failed:`,
@@ -941,6 +1647,42 @@ function createStreamTargetManager({
 
     if (!destinationUrl)
       return { ok: false, message: "Target destination URL is not configured" };
+
+    if (STREAM_TARGET_PREFLIGHT_ENABLED && target.automation_mode !== "oauth") {
+      const type = normalizeTargetType(target.target_type || target.platform);
+      const protocol = normalizeProtocol(target.protocol, type);
+      const preflight = await preflightDestination(destinationUrl, protocol);
+
+      const existingState = processStates.get(Number(target.id));
+      if (existingState) {
+        existingState.preflight = {
+          ...preflight,
+          checked_at: new Date().toISOString(),
+        };
+      }
+
+      if (!preflight.ok) {
+        await pool.query(
+          `UPDATE social_destinations
+           SET is_running=false, ffmpeg_pid=NULL, status='failed',
+               current_bitrate_kbps=0, last_error=$1, updated_at=now()
+           WHERE id=$2`,
+          [preflight.message || "Destination preflight failed", target.id],
+        );
+
+        return {
+          ok: false,
+          message: preflight.message || "Destination preflight failed",
+          failure: {
+            code: preflight.code || "preflight_failed",
+            category: preflight.category || "destination",
+            retryable: preflight.retryable !== false,
+            stage: preflight.stage || "connect",
+          },
+          preflight,
+        };
+      }
+    }
 
     await pool.query(
       `UPDATE social_destinations
@@ -1137,6 +1879,25 @@ function createStreamTargetManager({
       uptime_seconds: uptimeSeconds,
       started_at: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : null,
       source_hls_fault: Boolean(state.sourceHlsFault),
+      retry_attempt: safeNumber(state.retryAttempt),
+      max_reconnect_attempts: STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
+      next_retry_at:
+        state.nextRetryAt && state.nextRetryAt > Date.now()
+          ? new Date(state.nextRetryAt).toISOString()
+          : null,
+      next_retry_in_seconds:
+        state.nextRetryAt && state.nextRetryAt > Date.now()
+          ? Math.max(0, Math.ceil((state.nextRetryAt - Date.now()) / 1000))
+          : 0,
+      failure_code: state.failureCode || null,
+      failure_category: state.failureCategory || null,
+      failure_scope: state.failureScope || null,
+      failure_retryable:
+        state.failureRetryable == null ? true : Boolean(state.failureRetryable),
+      last_failure_at: state.lastFailureAt
+        ? new Date(state.lastFailureAt).toISOString()
+        : null,
+      preflight: state.preflight || null,
     };
   }
 
@@ -1155,6 +1916,8 @@ function createStreamTargetManager({
     getRuntimeState,
     isSrsStreamLive,
     waitForPlayableHls,
+    preflightDestination,
+    preflightTarget,
   };
 }
 

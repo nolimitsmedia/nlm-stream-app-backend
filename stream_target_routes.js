@@ -420,6 +420,49 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     deleteHandler,
   );
 
+  async function preflightHandler(req, res) {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+
+      if (!channel)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+
+      const target = await loadTarget(req.params.id, channel.id);
+      if (!target)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Stream target not found" });
+
+      const result = await manager.preflightTarget(target);
+
+      res.status(result.ok ? 200 : 400).json({
+        ok: Boolean(result.ok),
+        target_id: target.id,
+        target_name: target.name,
+        target_type: target.target_type,
+        protocol: target.protocol,
+        preflight: result,
+      });
+    } catch (error) {
+      console.error("Stream Target Preflight Error:", error);
+      res.status(500).json({
+        ok: false,
+        message: error.message || "Stream target preflight failed",
+      });
+    }
+  }
+
+  app.post(
+    "/api/channels/:channelId/stream-targets/:id/preflight",
+    ...manageMw,
+    preflightHandler,
+  );
+
   async function startHandler(req, res) {
     try {
       const channel = await getOwnedChannel(
@@ -486,6 +529,12 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     stopHandler,
   );
   // Compatibility aliases for existing SocialDestinations.jsx.
+  app.post(
+    "/api/channels/:channelId/social-destinations/:id/preflight",
+    ...manageMw,
+    preflightHandler,
+  );
+
   app.post(
     "/api/channels/:channelId/social-destinations/:id/start",
     ...manageMw,
