@@ -91,6 +91,32 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     return result.rows[0] || null;
   }
 
+  async function validateOAuthPlatformMatch(
+    oauthAccountId,
+    targetType,
+    organizationId,
+  ) {
+    if (!oauthAccountId) return null;
+    const result = await pool.query(
+      `SELECT id, platform, connection_status
+       FROM social_oauth_accounts
+       WHERE id = $1 AND organization_id = $2`,
+      [oauthAccountId, organizationId],
+    );
+    const account = result.rows[0];
+    if (!account) return "Connected account not found";
+    if (
+      String(account.platform).toLowerCase() !==
+      String(targetType).toLowerCase()
+    ) {
+      return `A ${account.platform} account can only be used with a ${account.platform} target`;
+    }
+    if (account.connection_status === "reconnect_required") {
+      return `${account.platform} connection needs to be reconnected`;
+    }
+    return null;
+  }
+
   const manageMw = [
     authenticateAdmin,
     resolveOrganizationForRequest,
@@ -173,6 +199,17 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
         });
       }
 
+      if (automationMode === "oauth" && body.oauth_account_id) {
+        const oauthError = await validateOAuthPlatformMatch(
+          body.oauth_account_id,
+          targetType,
+          req.organization.id,
+        );
+        if (oauthError) {
+          return res.status(400).json({ ok: false, message: oauthError });
+        }
+      }
+
       const protocol = manager.normalizeProtocol(body.protocol, targetType);
       const targetDraft = {
         target_type: targetType,
@@ -209,8 +246,8 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           `INSERT INTO social_destinations
              (channel_id, platform, stream_key, name, target_type, destination_url,
               protocol, automation_mode, enabled, auto_start, auto_reconnect,
-              status, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'stopped',now())
+              oauth_account_id, status, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'stopped',now())
            ON CONFLICT (channel_id, platform)
            DO UPDATE SET
              name = EXCLUDED.name,
@@ -222,6 +259,11 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
              enabled = EXCLUDED.enabled,
              auto_start = EXCLUDED.auto_start,
              auto_reconnect = EXCLUDED.auto_reconnect,
+             oauth_account_id = CASE
+               WHEN EXCLUDED.automation_mode = 'oauth'
+                 THEN COALESCE(EXCLUDED.oauth_account_id, social_destinations.oauth_account_id)
+               ELSE NULL
+             END,
              updated_at = now()
            RETURNING *`,
           [
@@ -235,8 +277,11 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
             protocol,
             automationMode,
             body.enabled !== false,
-            Boolean(body.auto_start),
+            automationMode === "oauth"
+              ? body.auto_start !== false
+              : Boolean(body.auto_start),
             body.auto_reconnect !== false,
+            automationMode === "oauth" ? body.oauth_account_id || null : null,
           ],
         );
       } else {
@@ -338,6 +383,17 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
               ? Boolean(req.body.auto_reconnect)
               : existing.auto_reconnect,
         };
+        if (next.automation_mode === "oauth" && existing.oauth_account_id) {
+          const oauthError = await validateOAuthPlatformMatch(
+            existing.oauth_account_id,
+            targetType,
+            req.organization.id,
+          );
+          if (oauthError) {
+            return res.status(400).json({ ok: false, message: oauthError });
+          }
+        }
+
         const validationError = manager.validateManualTarget(next);
         if (validationError && next.automation_mode !== "oauth")
           return res.status(400).json({ ok: false, message: validationError });

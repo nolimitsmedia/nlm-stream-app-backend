@@ -19,6 +19,10 @@
 const express = require("express");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
+const {
+  encryptOAuthToken,
+  decryptOAuthToken,
+} = require("./social_oauth_schema");
 
 const STATE_TTL = "10m"; // OAuth dialogs are usually completed within a minute or two
 
@@ -28,6 +32,7 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     resolveOrganizationForRequest,
     requireRole,
     requireOrganizationRole,
+    streamTargetManager = null,
   } = mw;
 
   function signState(payload) {
@@ -66,6 +71,53 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     return result.rows[0] || null;
   }
 
+  async function ensureOAuthTargetForChannel({
+    channelId,
+    organizationId,
+    account,
+  }) {
+    if (!account || !["facebook", "youtube"].includes(account.platform)) {
+      throw new Error("Unsupported OAuth platform");
+    }
+
+    const channel = await getOwnedChannel(channelId, organizationId);
+    if (!channel) throw new Error("Channel not found for OAuth connection");
+
+    const protocol = account.platform === "facebook" ? "rtmps" : "rtmp";
+    const result = await pool.query(
+      `INSERT INTO social_destinations
+         (channel_id, platform, stream_key, name, target_type, destination_url,
+          protocol, automation_mode, oauth_account_id, enabled, auto_start,
+          auto_reconnect, status, updated_at)
+       VALUES ($1,$2,'oauth-managed',$3,$2,NULL,$4,'oauth',$5,TRUE,TRUE,TRUE,'stopped',NOW())
+       ON CONFLICT (channel_id, platform)
+       DO UPDATE SET
+         name = EXCLUDED.name,
+         target_type = EXCLUDED.target_type,
+         destination_url = NULL,
+         stream_key = 'oauth-managed',
+         protocol = EXCLUDED.protocol,
+         automation_mode = 'oauth',
+         oauth_account_id = EXCLUDED.oauth_account_id,
+         enabled = TRUE,
+         auto_start = TRUE,
+         auto_reconnect = TRUE,
+         last_error = NULL,
+         updated_at = NOW()
+       RETURNING *`,
+      [
+        channel.id,
+        account.platform,
+        account.external_account_name ||
+          (account.platform === "youtube" ? "YouTube" : "Facebook"),
+        protocol,
+        account.id,
+      ],
+    );
+
+    return result.rows[0];
+  }
+
   // ────────────────────────────────────────────────────────────
   // List / detach connected accounts for an org
   // ────────────────────────────────────────────────────────────
@@ -77,7 +129,9 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     async (req, res) => {
       try {
         const result = await pool.query(
-          `SELECT id, platform, external_account_id, external_account_name, created_at
+          `SELECT id, platform, external_account_id, external_account_name,
+                  connection_status, token_last_validated_at, token_last_error,
+                  reconnect_required_at, created_at
            FROM social_oauth_accounts WHERE organization_id = $1 ORDER BY platform`,
           [req.organization.id],
         );
@@ -99,11 +153,74 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     requireOrganizationRole("owner", "admin"),
     async (req, res) => {
       try {
-        await pool.query(
-          `DELETE FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
+        const accountResult = await pool.query(
+          `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
           [req.params.id, req.organization.id],
         );
-        res.json({ ok: true, message: "Account disconnected" });
+        const account = accountResult.rows[0];
+        if (!account) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Connected account not found" });
+        }
+
+        const targetsResult = await pool.query(
+          `SELECT sd.*
+           FROM social_destinations sd
+           JOIN channels c ON c.id = sd.channel_id
+           WHERE sd.oauth_account_id = $1 AND c.organization_id = $2`,
+          [account.id, req.organization.id],
+        );
+
+        // Stop active workers/platform broadcasts before severing the account
+        // relationship so endPlatformBroadcast still has access to credentials.
+        if (streamTargetManager) {
+          for (const target of targetsResult.rows) {
+            if (
+              target.is_running ||
+              target.ffmpeg_pid ||
+              target.platform_broadcast_id ||
+              streamTargetManager.getRuntimeState?.(target.id)?.worker_running
+            ) {
+              await streamTargetManager
+                .stopTarget(target)
+                .catch((stopError) => {
+                  console.error(
+                    `[SOCIAL-OAUTH] Failed to stop target #${target.id} before disconnect:`,
+                    stopError.message,
+                  );
+                });
+            }
+          }
+        }
+
+        await pool.query(
+          `UPDATE social_destinations
+           SET oauth_account_id = NULL,
+               enabled = FALSE,
+               auto_start = FALSE,
+               auto_reconnect = FALSE,
+               is_running = FALSE,
+               ffmpeg_pid = NULL,
+               status = 'stopped',
+               current_bitrate_kbps = 0,
+               active_destination_url = NULL,
+               platform_broadcast_id = NULL,
+               platform_stream_id = NULL,
+               last_error = 'Connected account was disconnected',
+               updated_at = NOW()
+           WHERE oauth_account_id = $1`,
+          [account.id],
+        );
+
+        await pool.query(
+          `DELETE FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
+          [account.id, req.organization.id],
+        );
+        res.json({
+          ok: true,
+          message: "Account disconnected and linked targets disabled",
+        });
       } catch (error) {
         console.error("Delete OAuth Account Error:", error);
         res
@@ -191,11 +308,16 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
       }
 
       if (pages.length === 1) {
-        await upsertFacebookAccount(
+        const account = await upsertFacebookAccount(
           claims.organizationId,
           claims.adminId,
           pages[0],
         );
+        await ensureOAuthTargetForChannel({
+          channelId: claims.channelId,
+          organizationId: claims.organizationId,
+          account,
+        });
         return res.send(closePopupHtml({ ok: true, platform: "facebook" }));
       }
 
@@ -205,7 +327,12 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         adminId: claims.adminId,
         organizationId: claims.organizationId,
         channelId: claims.channelId,
-        pages, // small list, fine to round-trip through a signed token
+        // JWT state is signed, not encrypted. Encrypt Page access tokens before
+        // round-tripping the page picker through the browser.
+        pages: pages.map((page) => ({
+          ...page,
+          pageAccessToken: encryptOAuthToken(page.pageAccessToken),
+        })),
       });
 
       const optionsHtml = pages
@@ -244,12 +371,18 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         if (claims.purpose !== "fb_pick_page") throw new Error("Invalid state");
         const chosen = claims.pages[Number(req.body.pageIndex)];
         if (!chosen) throw new Error("Invalid selection");
+        chosen.pageAccessToken = decryptOAuthToken(chosen.pageAccessToken);
 
-        await upsertFacebookAccount(
+        const account = await upsertFacebookAccount(
           claims.organizationId,
           claims.adminId,
           chosen,
         );
+        await ensureOAuthTargetForChannel({
+          channelId: claims.channelId,
+          organizationId: claims.organizationId,
+          account,
+        });
         res.send(closePopupHtml({ ok: true, platform: "facebook" }));
       } catch (error) {
         console.error("Facebook Page Selection Error:", error);
@@ -265,22 +398,34 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
   );
 
   async function upsertFacebookAccount(organizationId, adminId, page) {
-    await pool.query(
+    const encryptedAccessToken = encryptOAuthToken(page.pageAccessToken);
+    const result = await pool.query(
       `INSERT INTO social_oauth_accounts
-         (organization_id, platform, external_account_id, external_account_name, access_token, connected_by_admin_id)
-       VALUES ($1, 'facebook', $2, $3, $4, $5)
+         (organization_id, platform, external_account_id, external_account_name,
+          access_token, connected_by_admin_id, token_encryption_version,
+          connection_status, token_last_validated_at, token_last_error,
+          reconnect_required_at)
+       VALUES ($1, 'facebook', $2, $3, $4, $5, 1, 'connected', NOW(), NULL, NULL)
        ON CONFLICT (organization_id, platform, external_account_id)
        DO UPDATE SET access_token = EXCLUDED.access_token,
                      external_account_name = EXCLUDED.external_account_name,
-                     updated_at = now()`,
+                     connected_by_admin_id = EXCLUDED.connected_by_admin_id,
+                     token_encryption_version = 1,
+                     connection_status = 'connected',
+                     token_last_validated_at = NOW(),
+                     token_last_error = NULL,
+                     reconnect_required_at = NULL,
+                     updated_at = NOW()
+       RETURNING *`,
       [
         organizationId,
         page.pageId,
         page.pageName,
-        page.pageAccessToken,
+        encryptedAccessToken,
         adminId,
       ],
     );
+    return result.rows[0];
   }
 
   // ────────────────────────────────────────────────────────────
@@ -371,26 +516,42 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         );
       }
 
-      await pool.query(
+      const accountResult = await pool.query(
         `INSERT INTO social_oauth_accounts
-           (organization_id, platform, external_account_id, external_account_name, access_token, refresh_token, token_expires_at, connected_by_admin_id)
-         VALUES ($1, 'youtube', $2, $3, $4, $5, $6, $7)
+           (organization_id, platform, external_account_id, external_account_name,
+            access_token, refresh_token, token_expires_at, connected_by_admin_id,
+            token_encryption_version, connection_status, token_last_validated_at,
+            token_last_error, reconnect_required_at)
+         VALUES ($1, 'youtube', $2, $3, $4, $5, $6, $7, 1, 'connected', NOW(), NULL, NULL)
          ON CONFLICT (organization_id, platform, external_account_id)
          DO UPDATE SET access_token = EXCLUDED.access_token,
                        refresh_token = EXCLUDED.refresh_token,
                        token_expires_at = EXCLUDED.token_expires_at,
                        external_account_name = EXCLUDED.external_account_name,
-                       updated_at = now()`,
+                       connected_by_admin_id = EXCLUDED.connected_by_admin_id,
+                       token_encryption_version = 1,
+                       connection_status = 'connected',
+                       token_last_validated_at = NOW(),
+                       token_last_error = NULL,
+                       reconnect_required_at = NULL,
+                       updated_at = NOW()
+         RETURNING *`,
         [
           claims.organizationId,
           channelInfo.channelId,
           channelInfo.channelTitle,
-          tokens.access_token,
-          tokens.refresh_token,
+          encryptOAuthToken(tokens.access_token),
+          encryptOAuthToken(tokens.refresh_token),
           tokens.expiry_date ? new Date(tokens.expiry_date) : null,
           claims.adminId,
         ],
       );
+
+      await ensureOAuthTargetForChannel({
+        channelId: claims.channelId,
+        organizationId: claims.organizationId,
+        account: accountResult.rows[0],
+      });
 
       res.send(closePopupHtml({ ok: true, platform: "youtube" }));
     } catch (error) {
@@ -433,6 +594,27 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           .status(404)
           .json({ ok: false, message: "Connected account not found" });
       }
+
+      const targetResult = await pool.query(
+        `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
+        [req.params.id, channel.id],
+      );
+      const target = targetResult.rows[0];
+      if (!target) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Stream target not found" });
+      }
+      const targetPlatform = String(
+        target.target_type || target.platform || "",
+      ).toLowerCase();
+      if (targetPlatform !== String(account.platform || "").toLowerCase()) {
+        return res.status(400).json({
+          ok: false,
+          message: `A ${account.platform} account can only be linked to a ${account.platform} target`,
+        });
+      }
+
       const result = await pool.query(
         `UPDATE social_destinations
          SET oauth_account_id = $1,

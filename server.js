@@ -79,7 +79,11 @@ const queryWithRetry = async (text, params = [], options = {}) => {
 
   throw lastError;
 };
-const { ensureSocialOAuthTables } = require("./social_oauth_schema");
+const {
+  ensureSocialOAuthTables,
+  encryptOAuthToken,
+  decryptOAuthAccount,
+} = require("./social_oauth_schema");
 const { ensureStreamTargetColumns } = require("./stream_target_schema");
 const registerStreamTargetRoutes = require("./stream_target_routes");
 const facebookGraph = require("./facebook_graph_service");
@@ -11529,13 +11533,6 @@ ${errorEntries.map((e) => `- ${e.timestamp || e.created_at || "?"}: ${e.message 
   },
 );
 
-require("./oauth_routes")(app, pool, jwt, {
-  authenticateAdmin,
-  resolveOrganizationForRequest,
-  requireRole,
-  requireOrganizationRole,
-});
-
 // Phase 1 — embedded player (Copy Embed Code). Registered here (rather than
 // right after getPublicWatchStatus's definition) purely so it sits next to
 // the other feature-module mounts, but it does depend on getPublicWatchStatus
@@ -11560,6 +11557,17 @@ const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   requireOrganizationRole,
   getInternalHlsSourceUrl,
   inputResilienceFlags,
+});
+
+// OAuth routes are mounted AFTER Stream Targets so disconnecting an OAuth
+// account can safely stop any active target/platform broadcast before the
+// credential relationship is removed.
+require("./oauth_routes")(app, pool, jwt, {
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole,
+  requireOrganizationRole,
+  streamTargetManager,
 });
 
 // ══════════════════════════════════════════
@@ -14733,53 +14741,134 @@ io.on("connection", (socket) => {
       setInterval(pollBandwidthCompliance, BANDWIDTH_POLL_INTERVAL_MS);
     }
 
-    // Proactively refresh YouTube access tokens before they expire (~1hr
-    // lifetime), so a scheduled/automated go-live never fails mid-stream
-    // waiting on a lazy refresh. Facebook Page tokens aren't on a refresh
-    // schedule, so nothing to do for them here — see debugToken() in
-    // facebook_graph_service.js if a periodic validity check is wanted later.
-    setInterval(
-      async () => {
-        try {
-          const expiringSoon = await pool.query(
-            `SELECT * FROM social_oauth_accounts
+    // OAuth connection health sweep. YouTube access tokens are refreshed
+    // proactively; Facebook Page tokens are validated with /debug_token so
+    // revoked permissions are surfaced before the next automated broadcast.
+    const runSocialOAuthHealthSweep = async () => {
+      // YouTube
+      try {
+        const expiringSoon = await pool.query(
+          `SELECT * FROM social_oauth_accounts
            WHERE platform = 'youtube'
              AND refresh_token IS NOT NULL
-             AND (token_expires_at IS NULL OR token_expires_at < now() + interval '15 minutes')`,
-          );
-          for (const account of expiringSoon.rows) {
-            try {
-              const refreshed = await youtubeApi.refreshAccessToken(
-                account.refresh_token,
-              );
-              await pool.query(
-                `UPDATE social_oauth_accounts SET access_token = $1, token_expires_at = $2, updated_at = now() WHERE id = $3`,
+             AND (token_expires_at IS NULL OR token_expires_at < NOW() + interval '15 minutes')`,
+        );
+
+        for (const rawAccount of expiringSoon.rows) {
+          try {
+            const account = decryptOAuthAccount(rawAccount);
+            if (!account.refresh_token)
+              throw new Error("Missing refresh token");
+            const refreshed = await youtubeApi.refreshAccessToken(
+              account.refresh_token,
+            );
+            await pool.query(
+              `UPDATE social_oauth_accounts
+               SET access_token = $1,
+                   token_expires_at = $2,
+                   token_encryption_version = 1,
+                   connection_status = 'connected',
+                   token_last_validated_at = NOW(),
+                   token_last_error = NULL,
+                   reconnect_required_at = NULL,
+                   updated_at = NOW()
+               WHERE id = $3`,
+              [
+                encryptOAuthToken(refreshed.access_token),
+                refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
+                account.id,
+              ],
+            );
+          } catch (refreshErr) {
+            console.error(
+              `[SOCIAL-OAUTH] Failed to refresh YouTube token for account ${rawAccount.id}:`,
+              refreshErr.message,
+            );
+            await pool
+              .query(
+                `UPDATE social_oauth_accounts
+               SET connection_status='reconnect_required',
+                   token_last_validated_at=NOW(),
+                   token_last_error=$1,
+                   reconnect_required_at=COALESCE(reconnect_required_at,NOW()),
+                   updated_at=NOW()
+               WHERE id=$2`,
                 [
-                  refreshed.access_token,
-                  refreshed.expiry_date
-                    ? new Date(refreshed.expiry_date)
-                    : null,
-                  account.id,
+                  String(
+                    refreshErr.message || "YouTube token refresh failed",
+                  ).slice(0, 1000),
+                  rawAccount.id,
                 ],
-              );
-            } catch (refreshErr) {
-              // Refresh token itself may have been revoked — log so a stale
-              // connection can be caught before someone tries to go live with it.
-              console.error(
-                `[SOCIAL-OAUTH] Failed to refresh YouTube token for account ${account.id}:`,
-                refreshErr.message,
-              );
-            }
+              )
+              .catch(() => {});
           }
-        } catch (sweepErr) {
-          console.error(
-            "[SOCIAL-OAUTH] Token refresh sweep failed:",
-            sweepErr.message,
-          );
         }
-      },
+      } catch (sweepErr) {
+        console.error(
+          "[SOCIAL-OAUTH] YouTube token refresh sweep failed:",
+          sweepErr.message,
+        );
+      }
+
+      // Facebook
+      try {
+        const facebookAccounts = await pool.query(
+          `SELECT * FROM social_oauth_accounts WHERE platform='facebook'`,
+        );
+        for (const rawAccount of facebookAccounts.rows) {
+          try {
+            const account = decryptOAuthAccount(rawAccount);
+            const debug = await facebookGraph.debugToken(account.access_token);
+            if (!debug?.is_valid)
+              throw new Error("Facebook access token is no longer valid");
+            await pool.query(
+              `UPDATE social_oauth_accounts
+               SET connection_status='connected',
+                   token_last_validated_at=NOW(),
+                   token_last_error=NULL,
+                   reconnect_required_at=NULL,
+                   updated_at=NOW()
+               WHERE id=$1`,
+              [account.id],
+            );
+          } catch (validationErr) {
+            console.error(
+              `[SOCIAL-OAUTH] Facebook token validation failed for account ${rawAccount.id}:`,
+              validationErr.message,
+            );
+            await pool
+              .query(
+                `UPDATE social_oauth_accounts
+               SET connection_status='reconnect_required',
+                   token_last_validated_at=NOW(),
+                   token_last_error=$1,
+                   reconnect_required_at=COALESCE(reconnect_required_at,NOW()),
+                   updated_at=NOW()
+               WHERE id=$2`,
+                [
+                  String(
+                    validationErr.message || "Facebook token validation failed",
+                  ).slice(0, 1000),
+                  rawAccount.id,
+                ],
+              )
+              .catch(() => {});
+          }
+        }
+      } catch (sweepErr) {
+        console.error(
+          "[SOCIAL-OAUTH] Facebook token validation sweep failed:",
+          sweepErr.message,
+        );
+      }
+    };
+
+    runSocialOAuthHealthSweep();
+    const socialOAuthHealthTimer = setInterval(
+      runSocialOAuthHealthSweep,
       30 * 60 * 1000,
-    ); // every 30 minutes
+    );
+    socialOAuthHealthTimer.unref?.();
 
     // ══════════════════════════════════════════
     // SRS health watchdog — auto-recovery layer

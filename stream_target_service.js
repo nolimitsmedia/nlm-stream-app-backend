@@ -8,6 +8,10 @@ const tls = require("tls");
 const dns = require("dns").promises;
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
+const {
+  encryptOAuthToken,
+  decryptOAuthAccount,
+} = require("./social_oauth_schema");
 
 const TARGET_TYPES = {
   facebook: {
@@ -771,7 +775,14 @@ function createStreamTargetManager({
     return result.rows[0] || null;
   }
 
-  async function ensureYoutubeAccessToken(account) {
+  async function ensureYoutubeAccessToken(rawAccount) {
+    const account = decryptOAuthAccount(rawAccount);
+    if (!account) throw new Error("Connected YouTube account not found");
+
+    if (account.connection_status === "reconnect_required") {
+      throw new Error("YouTube connection needs to be reconnected");
+    }
+
     let accessToken = account.access_token;
     if (
       !account.token_expires_at ||
@@ -779,20 +790,50 @@ function createStreamTargetManager({
     ) {
       if (!account.refresh_token)
         throw new Error("YouTube connection needs to be reconnected");
-      const refreshed = await youtubeApi.refreshAccessToken(
-        account.refresh_token,
-      );
-      accessToken = refreshed.access_token;
-      await pool.query(
-        `UPDATE social_oauth_accounts
-         SET access_token = $1, token_expires_at = $2, updated_at = now()
-         WHERE id = $3`,
-        [
-          accessToken,
-          refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
-          account.id,
-        ],
-      );
+
+      try {
+        const refreshed = await youtubeApi.refreshAccessToken(
+          account.refresh_token,
+        );
+        accessToken = refreshed.access_token;
+        await pool.query(
+          `UPDATE social_oauth_accounts
+           SET access_token = $1,
+               token_expires_at = $2,
+               token_encryption_version = 1,
+               connection_status = 'connected',
+               token_last_validated_at = NOW(),
+               token_last_error = NULL,
+               reconnect_required_at = NULL,
+               updated_at = NOW()
+           WHERE id = $3`,
+          [
+            encryptOAuthToken(accessToken),
+            refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
+            account.id,
+          ],
+        );
+      } catch (error) {
+        await pool
+          .query(
+            `UPDATE social_oauth_accounts
+           SET connection_status = 'reconnect_required',
+               token_last_validated_at = NOW(),
+               token_last_error = $1,
+               reconnect_required_at = COALESCE(reconnect_required_at, NOW()),
+               updated_at = NOW()
+           WHERE id = $2`,
+            [
+              String(error.message || "YouTube token refresh failed").slice(
+                0,
+                1000,
+              ),
+              account.id,
+            ],
+          )
+          .catch(() => {});
+        throw new Error("YouTube connection needs to be reconnected");
+      }
     }
     return accessToken;
   }
@@ -802,8 +843,20 @@ function createStreamTargetManager({
       `SELECT * FROM social_oauth_accounts WHERE id = $1 AND organization_id = $2`,
       [target.oauth_account_id, organizationId],
     );
-    const account = accountResult.rows[0];
+    const account = decryptOAuthAccount(accountResult.rows[0]);
     if (!account) throw new Error("Connected account not found");
+
+    const targetPlatform = normalizeTargetType(
+      target.target_type || target.platform,
+    );
+    if (targetPlatform !== String(account.platform || "").toLowerCase()) {
+      throw new Error(
+        `OAuth account platform mismatch: ${account.platform} account cannot be used for ${targetPlatform || "unknown"} target`,
+      );
+    }
+    if (account.connection_status === "reconnect_required") {
+      throw new Error(`${account.platform} connection needs to be reconnected`);
+    }
 
     if (target.target_type === "facebook" || target.platform === "facebook") {
       const created = await facebookGraph.createLiveVideo({
@@ -811,6 +864,15 @@ function createStreamTargetManager({
         pageAccessToken: account.access_token,
         title: channel.name,
       });
+      await pool
+        .query(
+          `UPDATE social_oauth_accounts
+         SET connection_status='connected', token_last_validated_at=NOW(),
+             token_last_error=NULL, reconnect_required_at=NULL, updated_at=NOW()
+         WHERE id=$1`,
+          [account.id],
+        )
+        .catch(() => {});
       return {
         destinationUrl: created.rtmpUrl,
         platformBroadcastId: created.liveVideoId,
@@ -1748,9 +1810,28 @@ function createStreamTargetManager({
           platformBroadcastId = created.platformBroadcastId;
           platformStreamId = created.platformStreamId;
         } catch (error) {
+          const message =
+            error.message || "Failed to create platform broadcast";
+          await pool
+            .query(
+              `UPDATE social_destinations
+             SET is_running=false, ffmpeg_pid=NULL, status='failed',
+                 current_bitrate_kbps=0, last_error=$1, updated_at=NOW()
+             WHERE id=$2`,
+              [message, target.id],
+            )
+            .catch(() => {});
           return {
             ok: false,
-            message: error.message || "Failed to create platform broadcast",
+            message,
+            failure: {
+              code: /reconnected|reconnect/i.test(message)
+                ? "oauth_reconnect_required"
+                : "oauth_broadcast_create_failed",
+              category: "oauth",
+              retryable: !/needs to be reconnected/i.test(message),
+              stage: "platform_broadcast",
+            },
           };
         }
       }
@@ -1825,7 +1906,7 @@ function createStreamTargetManager({
         `SELECT * FROM social_oauth_accounts WHERE id = $1`,
         [target.oauth_account_id],
       );
-      const account = accountResult.rows[0];
+      const account = decryptOAuthAccount(accountResult.rows[0]);
       if (!account) return;
       if ((target.target_type || target.platform) === "facebook") {
         await facebookGraph.endLiveVideo({
