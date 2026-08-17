@@ -9757,10 +9757,62 @@ app.post("/api/srs/on_publish", async (req, res) => {
     return res.json({ code: 0 });
   }
 
-  // Temporary Phase 4.4 loopback receiver test.
-  // This key is used only to verify generic RTMP stream-target publishing
-  // back into this SRS instance without requiring a channels DB row.
-  // Remove this exception after the stream-target receiver test is complete.
+  // Internal Stream Target receiver publishes use a dedicated RTMP app
+  // (`internal-target`) so they never enter the normal customer-ingest path.
+  // The stream key must belong to an enabled, active target whose destination
+  // is explicitly configured as a local loopback internal-target receiver.
+  // This preserves normal channel stream-key validation for /live and avoids
+  // hard-coded test-key bypasses.
+  if (publishApp === "internal-target") {
+    try {
+      const internalTargetResult = await pool.query(
+        `
+        SELECT
+          sd.id,
+          sd.channel_id,
+          sd.stream_key,
+          sd.destination_url,
+          sd.protocol,
+          c.organization_id,
+          o.name AS org_name
+        FROM social_destinations sd
+        JOIN channels c ON c.id = sd.channel_id
+        JOIN organizations o ON o.id = c.organization_id
+        WHERE sd.stream_key = $1
+          AND sd.enabled = TRUE
+          AND c.is_active = TRUE
+          AND o.is_active = TRUE
+          AND COALESCE(sd.protocol, 'rtmp') IN ('rtmp', 'rtmps')
+          AND COALESCE(sd.destination_url, '') ~*
+              '^rtmps?://(127\\.0\\.0\\.1|localhost)(:1935)?/internal-target/?$'
+        LIMIT 1
+        `,
+        [streamKey],
+      );
+
+      const internalTarget = internalTargetResult.rows[0];
+
+      if (!internalTarget) {
+        console.warn(
+          `[SRS] REJECTED internal target — unknown, disabled, or non-loopback target: ${streamKey}`,
+        );
+        return res.json({ code: 403 });
+      }
+
+      console.log(
+        `[SRS] INTERNAL TARGET ALLOWED — ${streamKey} ` +
+          `(target: ${internalTarget.id}, org: ${internalTarget.org_name})`,
+      );
+
+      return res.json({ code: 0 });
+    } catch (err) {
+      console.error(
+        `[SRS] Internal target validation failed for ${streamKey}:`,
+        err.message,
+      );
+      return res.json({ code: 403 });
+    }
+  }
 
   try {
     // 0. Auto-reset stale is_live flags older than 2 hours (cleanup)
@@ -9891,6 +9943,15 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
   );
 
   if (isAbrRenditionStreamKey(streamKey)) {
+    return res.json({ code: 0 });
+  }
+
+  // Internal receiver targets are outputs, not source channels. Their FFmpeg
+  // lifecycle/status is owned by streamTargetManager, so do not run source
+  // shutdown logic (ABR teardown, channel offline state, target auto-stop,
+  // recording sync, etc.) when an internal-target publish ends.
+  if (publishApp === "internal-target") {
+    console.log(`[SRS] INTERNAL TARGET OFFLINE — ${streamKey}`);
     return res.json({ code: 0 });
   }
 
