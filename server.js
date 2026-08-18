@@ -86,6 +86,8 @@ const {
 } = require("./social_oauth_schema");
 const { ensureStreamTargetColumns } = require("./stream_target_schema");
 const registerStreamTargetRoutes = require("./stream_target_routes");
+const { ensurePullSourceTables } = require("./pull_source_schema");
+const registerPullSourceRoutes = require("./pull_source_routes");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
 const { clear } = require("console");
@@ -11559,6 +11561,23 @@ const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   inputResilienceFlags,
 });
 
+/*
+|--------------------------------------------------------------------------
+| PULL SOURCES — external ingest into the channel's normal /live stream key
+|--------------------------------------------------------------------------
+| Pull Sources are intentionally separate from Stream Targets: Targets are
+| outputs, while Pull Sources become first-class NLM inputs. Their FFmpeg
+| worker republishes to /live/<channel.stream_key>, so the existing SRS
+| on_publish lifecycle automatically owns ABR, DVR, recording, analytics and
+| downstream auto-start targets exactly as if OBS had published the stream.
+*/
+const pullSourceManager = registerPullSourceRoutes(app, pool, {
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  requireRole,
+  requireOrganizationRole,
+});
+
 // OAuth routes are mounted AFTER Stream Targets so disconnecting an OAuth
 // account can safely stop any active target/platform broadcast before the
 // credential relationship is removed.
@@ -14674,7 +14693,9 @@ io.on("connection", (socket) => {
   await ensureNotificationPreferencesTable();
   await ensureSocialOAuthTables(pool);
   await ensureStreamTargetColumns(pool);
+  await ensurePullSourceTables(pool);
   await streamTargetManager.reconcileDatabaseState();
+  await pullSourceManager.reconcileDatabaseState();
   await recoverActiveScheduledAutomation();
   await ensureRestartAuditTable();
   await ensureApiKeysTable();
