@@ -240,7 +240,7 @@ function classifyFailure(text) {
     };
   }
   if (
-    /connection reset|broken pipe|network is unreachable|input\/output error|end of file/i.test(
+    /connection reset|broken pipe|network is unreachable|input\/output error/i.test(
       value,
     )
   ) {
@@ -261,6 +261,23 @@ function classifyFailure(text) {
       message: "Source media could not be decoded",
     };
   }
+
+  // Normal end-of-input / FLV trailer warnings.
+  // These commonly appear when a finite HLS/VOD source reaches EOF and
+  // should not be treated as a transport or worker failure.
+  if (
+    /end of file/i.test(value) ||
+    (/failed to update header with correct duration/i.test(value) &&
+      /failed to update header with correct filesize/i.test(value))
+  ) {
+    return {
+      code: "source_ended",
+      retryable: false,
+      clean: true,
+      message: "Source reached the end of the stream",
+    };
+  }
+
   return {
     code: "ffmpeg_error",
     retryable: true,
@@ -480,12 +497,21 @@ function createPullSourceManager({ pool }) {
     ) {
       state.status = "stopped";
       state.isRunning = false;
+
+      const cleanStop =
+        state.manualStop ||
+        failure.clean === true ||
+        failure.code === "source_ended";
+
+      state.lastError = cleanStop ? null : failure.message;
+      state.lastErrorCode = cleanStop ? null : failure.code;
+
       await updateDb(source.id, {
         status: "stopped",
         is_running: false,
         stopped_at: new Date(),
-        last_error: failure.message,
-        last_error_code: failure.code,
+        last_error: cleanStop ? null : failure.message,
+        last_error_code: cleanStop ? null : failure.code,
       });
       return;
     }
