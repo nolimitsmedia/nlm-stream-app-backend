@@ -240,6 +240,20 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
         ? targetType
         : manager.makeInternalPlatformKey(targetType);
 
+      // Preserve existing target preferences during native-platform upserts
+      // when the caller does not explicitly provide them. OAuth reconnect and
+      // account-refresh flows must not silently re-enable a destination or
+      // turn auto-start/auto-reconnect back on.
+      const hasEnabled = Object.prototype.hasOwnProperty.call(body, "enabled");
+      const hasAutoStart = Object.prototype.hasOwnProperty.call(
+        body,
+        "auto_start",
+      );
+      const hasAutoReconnect = Object.prototype.hasOwnProperty.call(
+        body,
+        "auto_reconnect",
+      );
+
       let result;
       if (nativePlatformTypes.includes(targetType)) {
         result = await pool.query(
@@ -256,9 +270,18 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
              stream_key = EXCLUDED.stream_key,
              protocol = EXCLUDED.protocol,
              automation_mode = EXCLUDED.automation_mode,
-             enabled = EXCLUDED.enabled,
-             auto_start = EXCLUDED.auto_start,
-             auto_reconnect = EXCLUDED.auto_reconnect,
+             enabled = CASE
+               WHEN $13::boolean THEN EXCLUDED.enabled
+               ELSE social_destinations.enabled
+             END,
+             auto_start = CASE
+               WHEN $14::boolean THEN EXCLUDED.auto_start
+               ELSE social_destinations.auto_start
+             END,
+             auto_reconnect = CASE
+               WHEN $15::boolean THEN EXCLUDED.auto_reconnect
+               ELSE social_destinations.auto_reconnect
+             END,
              oauth_account_id = CASE
                WHEN EXCLUDED.automation_mode = 'oauth'
                  THEN COALESCE(EXCLUDED.oauth_account_id, social_destinations.oauth_account_id)
@@ -282,6 +305,9 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
               : Boolean(body.auto_start),
             body.auto_reconnect !== false,
             automationMode === "oauth" ? body.oauth_account_id || null : null,
+            hasEnabled,
+            hasAutoStart,
+            hasAutoReconnect,
           ],
         );
       } else {
