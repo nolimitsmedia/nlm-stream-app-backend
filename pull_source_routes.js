@@ -157,13 +157,11 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
         res.json({ ok: true, source: sanitize(result.rows[0]) });
       } catch (error) {
         console.error("Create Pull Source Error:", error);
-        res
-          .status(400)
-          .json({
-            ok: false,
-            message: error.message || "Failed to save Pull Source",
-            code: error.code || null,
-          });
+        res.status(400).json({
+          ok: false,
+          message: error.message || "Failed to save Pull Source",
+          code: error.code || null,
+        });
       }
     },
   );
@@ -256,13 +254,11 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
         });
       } catch (error) {
         console.error("Update Pull Source Error:", error);
-        res
-          .status(400)
-          .json({
-            ok: false,
-            message: error.message || "Failed to update Pull Source",
-            code: error.code || null,
-          });
+        res.status(400).json({
+          ok: false,
+          message: error.message || "Failed to update Pull Source",
+          code: error.code || null,
+        });
       }
     },
   );
@@ -330,13 +326,11 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
           .status(result.ok ? 200 : 400)
           .json({ ok: result.ok, preflight: result });
       } catch (error) {
-        res
-          .status(400)
-          .json({
-            ok: false,
-            message: error.message,
-            code: error.code || null,
-          });
+        res.status(400).json({
+          ok: false,
+          message: error.message,
+          code: error.code || null,
+        });
       }
     },
   );
@@ -367,13 +361,11 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
         res.status(result.ok ? 200 : 409).json(result);
       } catch (error) {
         console.error("Start Pull Source Error:", error);
-        res
-          .status(500)
-          .json({
-            ok: false,
-            message: error.message || "Failed to start Pull Source",
-            code: error.code || null,
-          });
+        res.status(500).json({
+          ok: false,
+          message: error.message || "Failed to start Pull Source",
+          code: error.code || null,
+        });
       }
     },
   );

@@ -11,6 +11,7 @@ const { decryptSourceUrl, maskSourceUrl } = require("./pull_source_schema");
 const SUPPORTED_PROTOCOLS = Object.freeze({
   rtmp: { label: "RTMP", schemes: ["rtmp:"] },
   rtmps: { label: "RTMPS", schemes: ["rtmps:"] },
+  rtsp: { label: "RTSP", schemes: ["rtsp:"] },
   srt: { label: "SRT", schemes: ["srt:"] },
   hls: { label: "HLS", schemes: ["http:", "https:"] },
   http_flv: { label: "HTTP-FLV", schemes: ["http:", "https:"] },
@@ -49,6 +50,15 @@ const INTERNAL_RTMP_BASE = String(
 const SRS_API_URL = String(
   process.env.SRS_API_URL || "http://127.0.0.1:1985",
 ).replace(/\/+$/, "");
+
+const RTSP_TRANSPORT = (() => {
+  const value = String(process.env.PULL_SOURCE_RTSP_TRANSPORT || "tcp")
+    .trim()
+    .toLowerCase();
+  return ["tcp", "udp", "udp_multicast", "http", "https"].includes(value)
+    ? value
+    : "tcp";
+})();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -225,6 +235,34 @@ function classifyFailure(text) {
       message: "Source TLS certificate validation failed",
     };
   }
+  if (/method describe failed:\s*401|401 unauthorized/i.test(lower)) {
+    return {
+      code: "authentication_rejected",
+      retryable: false,
+      message: "RTSP source rejected authentication",
+    };
+  }
+  if (/method describe failed:\s*404|404 not found/i.test(lower)) {
+    return {
+      code: "source_not_found",
+      retryable: false,
+      message: "RTSP source path was not found",
+    };
+  }
+  if (/461 unsupported transport|unsupported transport/i.test(lower)) {
+    return {
+      code: "rtsp_transport_rejected",
+      retryable: false,
+      message: `RTSP source rejected the ${RTSP_TRANSPORT.toUpperCase()} transport`,
+    };
+  }
+  if (/method (describe|setup|play) failed/i.test(lower)) {
+    return {
+      code: "rtsp_handshake_failed",
+      retryable: true,
+      message: "RTSP session negotiation failed",
+    };
+  }
   if (/connection refused/i.test(value)) {
     return {
       code: "connection_refused",
@@ -301,6 +339,15 @@ function inputArgs(protocol) {
   if (protocol === "rtmp" || protocol === "rtmps") {
     return [...common, "-rw_timeout", "15000000"];
   }
+  if (protocol === "rtsp") {
+    return [
+      ...common,
+      "-rtsp_transport",
+      RTSP_TRANSPORT,
+      "-rw_timeout",
+      "15000000",
+    ];
+  }
   if (protocol === "hls" || protocol === "http_flv") {
     return [
       ...common,
@@ -319,12 +366,14 @@ function inputArgs(protocol) {
 
 function buildWorkerArgs(sourceUrl, protocol, streamKey) {
   const normalized = normalizeProtocol(protocol);
-  const normalizeVideo = normalized === "hls" || normalized === "http_flv";
+  const normalizeVideo =
+    normalized === "hls" || normalized === "http_flv" || normalized === "rtsp";
 
   const videoArgs = normalizeVideo
     ? [
-        // HLS/CMAF and HTTP-FLV inputs are not guaranteed to be directly
-        // RTMP/FLV-safe. Normalize them to a conservative H.264 profile so
+        // HLS/CMAF, HTTP-FLV and RTSP inputs are not guaranteed to be directly
+        // RTMP/FLV-safe (RTSP cameras may expose H.265/MPEG-4). Normalize
+        // them to a conservative H.264 profile so
         // SRS receives stable timestamps, frame cadence and keyframes.
         "-c:v",
         "libx264",
@@ -433,9 +482,15 @@ function createPullSourceManager({ pool }) {
     const parsed = await validateSourceUrl(sourceUrl, protocol);
 
     return new Promise((resolve) => {
+      const preflightInputArgs =
+        protocol === "rtsp"
+          ? ["-rtsp_transport", RTSP_TRANSPORT, "-rw_timeout", "15000000"]
+          : [];
+
       const args = [
         "-v",
         "error",
+        ...preflightInputArgs,
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels",
         "-of",
