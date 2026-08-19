@@ -318,20 +318,48 @@ function inputArgs(protocol) {
 }
 
 function buildWorkerArgs(sourceUrl, protocol, streamKey) {
+  const normalized = normalizeProtocol(protocol);
+  const normalizeVideo = normalized === "hls" || normalized === "http_flv";
+
+  const videoArgs = normalizeVideo
+    ? [
+        // HLS/CMAF and HTTP-FLV inputs are not guaranteed to be directly
+        // RTMP/FLV-safe. Normalize them to a conservative H.264 profile so
+        // SRS receives stable timestamps, frame cadence and keyframes.
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "25",
+        "-g",
+        "50",
+        "-keyint_min",
+        "50",
+        "-sc_threshold",
+        "0",
+        "-bf",
+        "0",
+      ]
+    : ["-c:v", "copy"];
+
   return [
-    ...inputArgs(protocol),
+    ...inputArgs(normalized),
     "-i",
     sourceUrl,
     "-map",
     "0:v:0",
     "-map",
     "0:a:0?",
-    "-c:v",
-    "copy",
+    ...videoArgs,
     "-c:a",
     "aac",
     "-b:a",
     "128k",
+    "-ar",
+    "48000",
     "-af",
     "aresample=async=1:first_pts=0",
     "-progress",
