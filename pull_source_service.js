@@ -321,12 +321,23 @@ function classifyFailure(text, protocol) {
     };
   }
 
-  // FLV trailer warnings commonly occur when a finite source ends and are
-  // not, by themselves, evidence of a transport failure.
+  // FLV trailer warnings commonly occur when a finite source ends.
+  // For RTSP, however, they can be emitted when the upstream camera/encoder
+  // disappears and FFmpeg closes the republished FLV output, so treat that
+  // as a retryable transport loss instead of a clean EOF.
   if (
     /failed to update header with correct duration/i.test(value) &&
     /failed to update header with correct filesize/i.test(value)
   ) {
+    if (normalizeProtocol(protocol) === "rtsp") {
+      return {
+        code: "connection_lost",
+        retryable: true,
+        clean: false,
+        message: "RTSP source stream ended unexpectedly",
+      };
+    }
+
     return {
       code: "source_ended",
       retryable: false,
