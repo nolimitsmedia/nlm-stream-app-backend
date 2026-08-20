@@ -245,8 +245,8 @@ function classifyFailure(text) {
   if (/method describe failed:\s*404|404 not found/i.test(lower)) {
     return {
       code: "source_not_found",
-      retryable: false,
-      message: "RTSP source path was not found",
+      retryable: true,
+      message: "RTSP source path is not currently available",
     };
   }
   if (/461 unsupported transport|unsupported transport/i.test(lower)) {
@@ -340,13 +340,7 @@ function inputArgs(protocol) {
     return [...common, "-rw_timeout", "15000000"];
   }
   if (protocol === "rtsp") {
-    return [
-      ...common,
-      "-rtsp_transport",
-      RTSP_TRANSPORT,
-      "-rw_timeout",
-      "15000000",
-    ];
+    return [...common, "-rtsp_transport", RTSP_TRANSPORT];
   }
   if (protocol === "hls" || protocol === "http_flv") {
     return [
@@ -483,9 +477,7 @@ function createPullSourceManager({ pool }) {
 
     return new Promise((resolve) => {
       const preflightInputArgs =
-        protocol === "rtsp"
-          ? ["-rtsp_transport", RTSP_TRANSPORT, "-rw_timeout", "15000000"]
-          : [];
+        protocol === "rtsp" ? ["-rtsp_transport", RTSP_TRANSPORT] : [];
 
       const args = [
         "-v",
