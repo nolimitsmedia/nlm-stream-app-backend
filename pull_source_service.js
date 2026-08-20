@@ -202,7 +202,7 @@ function reconnectDelay(attempt) {
   );
 }
 
-function classifyFailure(text) {
+function classifyFailure(text, protocol) {
   const value = String(text || "");
   const lower = value.toLowerCase();
 
@@ -300,13 +300,32 @@ function classifyFailure(text) {
     };
   }
 
-  // Normal end-of-input / FLV trailer warnings.
-  // These commonly appear when a finite HLS/VOD source reaches EOF and
-  // should not be treated as a transport or worker failure.
+  // EOF is protocol-sensitive. A finite HLS/VOD source can end cleanly,
+  // but an RTSP live source reaching EOF means the upstream camera/encoder
+  // disappeared and should enter the normal auto-reconnect path.
+  if (/end of file/i.test(value)) {
+    if (normalizeProtocol(protocol) === "rtsp") {
+      return {
+        code: "connection_lost",
+        retryable: true,
+        clean: false,
+        message: "RTSP source stream ended unexpectedly",
+      };
+    }
+
+    return {
+      code: "source_ended",
+      retryable: false,
+      clean: true,
+      message: "Source reached the end of the stream",
+    };
+  }
+
+  // FLV trailer warnings commonly occur when a finite source ends and are
+  // not, by themselves, evidence of a transport failure.
   if (
-    /end of file/i.test(value) ||
-    (/failed to update header with correct duration/i.test(value) &&
-      /failed to update header with correct filesize/i.test(value))
+    /failed to update header with correct duration/i.test(value) &&
+    /failed to update header with correct filesize/i.test(value)
   ) {
     return {
       code: "source_ended",
@@ -517,7 +536,7 @@ function createPullSourceManager({ pool }) {
       );
       proc.on("exit", (code) => {
         if (code !== 0) {
-          const failure = classifyFailure(stderr);
+          const failure = classifyFailure(stderr, protocol);
           return finish({ ok: false, ...failure });
         }
         try {
@@ -759,6 +778,7 @@ function createPullSourceManager({ pool }) {
         : classifyFailure(
             state.stderr ||
               `FFmpeg exited code=${code} signal=${signal || "none"}`,
+            protocol,
           );
       await scheduleReconnect(source, channel, state, failure).catch((error) =>
         console.error(
