@@ -300,57 +300,39 @@ function classifyFailure(text, protocol) {
     };
   }
 
-  // Pull Sources are live inputs. EOF on RTSP or HLS means the upstream
-  // live source disappeared and must enter the normal auto-reconnect path.
-  // Other protocols keep the existing finite-source behavior unless their
-  // transport-specific errors above already classified the disconnect.
+  // Pull Sources are live inputs regardless of ingest protocol. A transport
+  // EOF must never be treated as a clean, terminal end for RTMP/RTMPS/RTSP/
+  // SRT/HLS/HTTP-FLV Pull Sources. In particular, SRT can report EOF after the
+  // downstream SRS publisher disappears during an SRS restart. Treat that as
+  // a retryable connection loss so Auto Reconnect can respawn the worker.
   if (/end of file/i.test(value)) {
     const normalizedProtocol = normalizeProtocol(protocol);
-    if (normalizedProtocol === "rtsp" || normalizedProtocol === "hls") {
-      return {
-        code: "connection_lost",
-        retryable: true,
-        clean: false,
-        message:
-          normalizedProtocol === "hls"
-            ? "HLS source stream ended unexpectedly"
-            : "RTSP source stream ended unexpectedly",
-      };
-    }
+    const label = SUPPORTED_PROTOCOLS[normalizedProtocol]?.label || "Source";
 
     return {
-      code: "source_ended",
-      retryable: false,
-      clean: true,
-      message: "Source reached the end of the stream",
+      code: "connection_lost",
+      retryable: true,
+      clean: false,
+      message: `${label} source stream ended unexpectedly`,
     };
   }
 
-  // FFmpeg can emit FLV trailer warnings when the live input disappears and
-  // it closes NLM's republished FLV output. For RTSP and HLS Pull Sources,
-  // treat this as a retryable live-source loss rather than a clean EOF.
+  // FFmpeg may emit FLV trailer warnings while closing NLM's republished
+  // output after SRS restarts or the upstream connection disappears. These
+  // Pull Sources are live inputs, so this is also a retryable interruption for
+  // every supported protocol rather than a terminal source_ended condition.
   if (
     /failed to update header with correct duration/i.test(value) &&
     /failed to update header with correct filesize/i.test(value)
   ) {
     const normalizedProtocol = normalizeProtocol(protocol);
-    if (normalizedProtocol === "rtsp" || normalizedProtocol === "hls") {
-      return {
-        code: "connection_lost",
-        retryable: true,
-        clean: false,
-        message:
-          normalizedProtocol === "hls"
-            ? "HLS source stream ended unexpectedly"
-            : "RTSP source stream ended unexpectedly",
-      };
-    }
+    const label = SUPPORTED_PROTOCOLS[normalizedProtocol]?.label || "Source";
 
     return {
-      code: "source_ended",
-      retryable: false,
-      clean: true,
-      message: "Source reached the end of the stream",
+      code: "connection_lost",
+      retryable: true,
+      clean: false,
+      message: `${label} source stream ended unexpectedly`,
     };
   }
 
