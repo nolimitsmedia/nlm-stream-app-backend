@@ -1246,6 +1246,7 @@ function createStreamTargetManager({
     state.outputBytes = 0;
     state.outputTimeMs = 0;
     state.outputFrames = 0;
+    state.stderr = "";
     state.deliveryVerified = false;
     state.deliveryVerifiedAt = null;
     if (!state.startedAt || !reconnect) {
@@ -1275,12 +1276,17 @@ function createStreamTargetManager({
     proc.stderr.on("data", (chunk) => {
       const text = chunk.toString();
 
+      // FFmpeg can report one transport failure across several stderr chunks.
+      // Keep a bounded recent history so a retryable error such as "Broken pipe"
+      // is not overwritten by a later generic "Conversion failed!" chunk.
+      state.stderr = `${state.stderr || ""}${text}`.slice(-12000);
+
       if (
         /error|failed|refused|timed out|broken pipe|denied|rejected|handshake|401|403/i.test(
-          text,
+          state.stderr,
         )
       ) {
-        const failure = classifyTargetFailure(text, {
+        const failure = classifyTargetFailure(state.stderr, {
           sourceUrl,
           destinationUrl,
         });
