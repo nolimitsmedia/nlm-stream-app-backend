@@ -1417,20 +1417,19 @@ function createStreamTargetManager({
 
       try {
         const fresh = await getDestinationAndChannel(destinationId);
-        const sourceStillLive = fresh
-          ? await isSrsStreamLive(fresh.channel_stream_key)
-          : false;
 
         const retryable = state.failureRetryable !== false;
         const attemptsExhausted =
           safeNumber(state.retryAttempt) >=
           STREAM_TARGET_MAX_RECONNECT_ATTEMPTS;
 
+        // A temporarily missing internal source is not terminal. Once a target
+        // was running and auto_reconnect is enabled, enter the recovery loop
+        // even if SRS/raw media is unavailable at this exact instant.
         const canReconnect = Boolean(
           fresh &&
           fresh.enabled &&
           fresh.auto_reconnect &&
-          sourceStillLive &&
           retryable &&
           !attemptsExhausted,
         );
@@ -1497,8 +1496,11 @@ function createStreamTargetManager({
           ],
         );
 
-        const scheduleNextAttempt = () => {
+        const scheduleNextAttempt = (delayOverride = delay) => {
           if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+
+          const scheduledDelay = Math.max(1000, Number(delayOverride || delay));
+          state.nextRetryAt = Date.now() + scheduledDelay;
 
           state.reconnectTimer = setTimeout(async () => {
             state.reconnectTimer = null;
@@ -1515,14 +1517,30 @@ function createStreamTargetManager({
                 latest.channel_stream_key,
               );
               if (!stillLive) {
-                state.status = "disconnected";
+                // The internal source can legitimately disappear for a short
+                // period while SRS, the Pull Source, or the ABR pipeline
+                // recovers. Auto-reconnect targets must wait rather than
+                // becoming terminal/disconnected. Source-wait cycles do not
+                // consume the destination reconnect-attempt budget.
+                state.status = "reconnecting";
+                state.failureCode = "source_unavailable";
+                state.failureCategory = "source";
+                state.failureScope = "source";
+                state.failureRetryable = true;
+                state.sourceHlsFault = true;
+                state.lastFailureAt = Date.now();
+                state.lastError =
+                  "Internal media source is temporarily unavailable; waiting for automatic recovery.";
+
                 await pool.query(
                   `UPDATE social_destinations
-                   SET status='disconnected', is_running=false, ffmpeg_pid=NULL,
-                       current_bitrate_kbps=0, updated_at=now()
-                   WHERE id=$1`,
-                  [destinationId],
+                   SET status='reconnecting', is_running=false, ffmpeg_pid=NULL,
+                       current_bitrate_kbps=0, last_error=$1, updated_at=now()
+                   WHERE id=$2`,
+                  [state.lastError, destinationId],
                 );
+
+                scheduleNextAttempt(RECONNECT_DELAY_MS);
                 return;
               }
 
@@ -1536,50 +1554,23 @@ function createStreamTargetManager({
                 state.failureCategory = "source";
                 state.failureScope = "source";
                 state.failureRetryable = true;
+                state.sourceHlsFault = true;
                 state.lastFailureAt = Date.now();
+                state.status = "reconnecting";
                 state.lastError = `Source media is not ready yet: ${readiness.message}`;
 
-                // Trigger a synthetic exit-style retry decision by increasing
-                // the attempt counter and scheduling the next bounded backoff.
-                if (
-                  safeNumber(state.retryAttempt) >=
-                  STREAM_TARGET_MAX_RECONNECT_ATTEMPTS
-                ) {
-                  state.status = "failed";
-                  state.nextRetryAt = null;
-                  await pool.query(
-                    `UPDATE social_destinations
-                     SET status='failed', is_running=false, ffmpeg_pid=NULL,
-                         current_bitrate_kbps=0,
-                         last_error=$1, updated_at=now()
-                     WHERE id=$2`,
-                    [
-                      `Automatic reconnect stopped after ${STREAM_TARGET_MAX_RECONNECT_ATTEMPTS} attempts. ${state.lastError}`,
-                      destinationId,
-                    ],
-                  );
-                  return;
-                }
-
-                state.retryAttempt = safeNumber(state.retryAttempt) + 1;
-                state.reconnectCount = safeNumber(state.reconnectCount) + 1;
-                state.status = "reconnecting";
-                const retryDelay = calculateReconnectDelay(state.retryAttempt);
-                state.nextRetryAt = Date.now() + retryDelay;
-
+                // Media readiness is a source-side wait condition, not a
+                // destination failure. Keep waiting without consuming the
+                // destination reconnect-attempt budget.
                 await pool.query(
                   `UPDATE social_destinations
-                   SET status='reconnecting', reconnect_count=$1,
-                       last_error=$2, updated_at=now()
-                   WHERE id=$3`,
-                  [state.reconnectCount, state.lastError, destinationId],
+                   SET status='reconnecting', is_running=false, ffmpeg_pid=NULL,
+                       current_bitrate_kbps=0, last_error=$1, updated_at=now()
+                   WHERE id=$2`,
+                  [state.lastError, destinationId],
                 );
 
-                state.reconnectTimer = setTimeout(
-                  scheduleNextAttempt,
-                  retryDelay,
-                );
-                state.reconnectTimer.unref?.();
+                scheduleNextAttempt(RECONNECT_DELAY_MS);
                 return;
               }
 
@@ -1645,11 +1636,7 @@ function createStreamTargetManager({
                     [state.reconnectCount, state.lastError, destinationId],
                   );
 
-                  state.reconnectTimer = setTimeout(
-                    scheduleNextAttempt,
-                    retryDelay,
-                  );
-                  state.reconnectTimer.unref?.();
+                  scheduleNextAttempt(retryDelay);
                   return;
                 }
               }
@@ -1709,13 +1696,9 @@ function createStreamTargetManager({
                 )
                 .catch(() => {});
 
-              state.reconnectTimer = setTimeout(
-                scheduleNextAttempt,
-                retryDelay,
-              );
-              state.reconnectTimer.unref?.();
+              scheduleNextAttempt(retryDelay);
             }
-          }, delay);
+          }, scheduledDelay);
 
           state.reconnectTimer.unref?.();
         };
