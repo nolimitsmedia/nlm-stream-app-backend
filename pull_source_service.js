@@ -300,16 +300,21 @@ function classifyFailure(text, protocol) {
     };
   }
 
-  // EOF is protocol-sensitive. A finite HLS/VOD source can end cleanly,
-  // but an RTSP live source reaching EOF means the upstream camera/encoder
-  // disappeared and should enter the normal auto-reconnect path.
+  // Pull Sources are live inputs. EOF on RTSP or HLS means the upstream
+  // live source disappeared and must enter the normal auto-reconnect path.
+  // Other protocols keep the existing finite-source behavior unless their
+  // transport-specific errors above already classified the disconnect.
   if (/end of file/i.test(value)) {
-    if (normalizeProtocol(protocol) === "rtsp") {
+    const normalizedProtocol = normalizeProtocol(protocol);
+    if (normalizedProtocol === "rtsp" || normalizedProtocol === "hls") {
       return {
         code: "connection_lost",
         retryable: true,
         clean: false,
-        message: "RTSP source stream ended unexpectedly",
+        message:
+          normalizedProtocol === "hls"
+            ? "HLS source stream ended unexpectedly"
+            : "RTSP source stream ended unexpectedly",
       };
     }
 
@@ -321,20 +326,23 @@ function classifyFailure(text, protocol) {
     };
   }
 
-  // FLV trailer warnings commonly occur when a finite source ends.
-  // For RTSP, however, they can be emitted when the upstream camera/encoder
-  // disappears and FFmpeg closes the republished FLV output, so treat that
-  // as a retryable transport loss instead of a clean EOF.
+  // FFmpeg can emit FLV trailer warnings when the live input disappears and
+  // it closes NLM's republished FLV output. For RTSP and HLS Pull Sources,
+  // treat this as a retryable live-source loss rather than a clean EOF.
   if (
     /failed to update header with correct duration/i.test(value) &&
     /failed to update header with correct filesize/i.test(value)
   ) {
-    if (normalizeProtocol(protocol) === "rtsp") {
+    const normalizedProtocol = normalizeProtocol(protocol);
+    if (normalizedProtocol === "rtsp" || normalizedProtocol === "hls") {
       return {
         code: "connection_lost",
         retryable: true,
         clean: false,
-        message: "RTSP source stream ended unexpectedly",
+        message:
+          normalizedProtocol === "hls"
+            ? "HLS source stream ended unexpectedly"
+            : "RTSP source stream ended unexpectedly",
       };
     }
 
