@@ -61,6 +61,19 @@ const STREAM_TARGET_RECONNECT_JITTER_PERCENT = Math.max(
   ),
 );
 
+// Recovery watchdog for targets whose in-memory reconnect timer/state is lost
+// or interrupted. This is intentionally independent of the normal reconnect
+// backoff so database state can self-heal after SRS/backend/runtime disruption.
+const STREAM_TARGET_RECOVERY_SWEEP_MS = Math.max(
+  5000,
+  Number(process.env.STREAM_TARGET_RECOVERY_SWEEP_MS || 10000),
+);
+
+const STREAM_TARGET_RECOVERY_STALE_MS = Math.max(
+  STREAM_TARGET_RECOVERY_SWEEP_MS,
+  Number(process.env.STREAM_TARGET_RECOVERY_STALE_MS || 15000),
+);
+
 const STREAM_TARGET_PREFLIGHT_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.STREAM_TARGET_PREFLIGHT_TIMEOUT_MS || 5000),
@@ -617,6 +630,8 @@ function createStreamTargetManager({
   inputResilienceFlags = [],
 }) {
   const processStates = new Map();
+  let recoverySweepTimer = null;
+  let recoverySweepRunning = false;
 
   async function isSrsStreamLive(streamKey) {
     try {
@@ -2025,16 +2040,232 @@ function createStreamTargetManager({
     );
   }
 
+  async function runRecoverySweep() {
+    if (recoverySweepRunning) return;
+    recoverySweepRunning = true;
+
+    try {
+      const result = await pool.query(
+        `SELECT sd.*, c.stream_key AS channel_stream_key,
+                c.name AS channel_name, c.organization_id
+         FROM social_destinations sd
+         JOIN channels c ON c.id = sd.channel_id
+         JOIN organizations o ON o.id = c.organization_id
+         WHERE sd.enabled = true
+           AND sd.auto_reconnect = true
+           AND sd.status IN ('reconnecting', 'connecting')
+           AND (sd.is_running = false OR sd.ffmpeg_pid IS NULL)
+           AND c.is_active = true
+           AND o.is_active = true
+           AND sd.updated_at <= NOW() - ($1::bigint * INTERVAL '1 millisecond')
+         ORDER BY sd.updated_at ASC
+         LIMIT 50`,
+        [STREAM_TARGET_RECOVERY_STALE_MS],
+      );
+
+      for (const target of result.rows) {
+        const destinationId = Number(target.id);
+        const existing = processStates.get(destinationId);
+
+        // A live worker owned by this Node process is authoritative.
+        if (existing?.proc && !existing.proc.killed) continue;
+        if (existing?.recoveryInProgress) continue;
+
+        const sourceLive = await isSrsStreamLive(target.channel_stream_key);
+        if (!sourceLive) continue;
+
+        const state = existing || {
+          destinationId,
+          currentBitrateKbps: 0,
+          droppedFrames: safeNumber(target.dropped_frames),
+          reconnectCount: safeNumber(target.reconnect_count),
+          retryAttempt: 0,
+          nextRetryAt: null,
+          maxReconnectAttempts: STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
+          sourceHlsFault: true,
+          intentionalStop: false,
+          failureCode: "recovery_reconcile",
+          failureCategory: "recovery",
+          failureScope: "worker",
+          failureRetryable: true,
+          lastFailureAt: Date.now(),
+          preflight: null,
+          outputBytes: 0,
+          outputTimeMs: 0,
+          outputFrames: 0,
+          deliveryVerified: false,
+          deliveryVerifiedAt: null,
+          deliveryVerifyTimer: null,
+        };
+
+        // Cancel a stale/lost normal reconnect timer before the watchdog takes
+        // ownership of this recovery attempt. spawnPush() will rebuild timers.
+        if (state.reconnectTimer) {
+          clearTimeout(state.reconnectTimer);
+          state.reconnectTimer = null;
+        }
+
+        state.status = "reconnecting";
+        state.recoveryInProgress = true;
+        state.nextRetryAt = null;
+        processStates.set(destinationId, state);
+
+        const channel = {
+          id: target.channel_id,
+          name: target.channel_name,
+          stream_key: target.channel_stream_key,
+        };
+
+        console.warn(
+          `[STREAM-TARGET-RECOVERY] Recovering #${destinationId} (${target.name || target.target_type || target.platform}) because source ${target.channel_stream_key} is live but no target worker exists.`,
+        );
+
+        try {
+          const recoveryResult = await startTarget(
+            target,
+            channel,
+            target.organization_id,
+            {
+              reconnect: true,
+              reuseRuntimeUrl: true,
+            },
+          );
+
+          if (!recoveryResult?.ok) {
+            const retryable =
+              recoveryResult?.failure?.retryable !== false &&
+              !/disabled|not configured|connect an account|unsupported|invalid/i.test(
+                String(recoveryResult?.message || ""),
+              );
+
+            console.warn(
+              `[STREAM-TARGET-RECOVERY] Recovery attempt for #${destinationId} did not start: ${recoveryResult?.message || "unknown error"}`,
+            );
+
+            if (retryable) {
+              state.status = "reconnecting";
+              state.lastError =
+                recoveryResult?.message ||
+                "Automatic recovery is waiting to retry the target.";
+              state.failureCode =
+                recoveryResult?.failure?.code || "recovery_retry_pending";
+              state.failureCategory =
+                recoveryResult?.failure?.category || "recovery";
+              state.failureScope =
+                recoveryResult?.failure?.stage === "platform_broadcast"
+                  ? "destination"
+                  : "worker";
+              state.failureRetryable = true;
+              state.lastFailureAt = Date.now();
+
+              await pool
+                .query(
+                  `UPDATE social_destinations
+                   SET status='reconnecting',
+                       is_running=false,
+                       ffmpeg_pid=NULL,
+                       current_bitrate_kbps=0,
+                       last_error=$1,
+                       updated_at=NOW()
+                   WHERE id=$2`,
+                  [state.lastError, destinationId],
+                )
+                .catch(() => {});
+            }
+          }
+        } catch (error) {
+          state.status = "reconnecting";
+          state.lastError =
+            error?.message || "Automatic stream-target recovery failed";
+          state.failureCode = "recovery_sweep_failed";
+          state.failureCategory = "recovery";
+          state.failureScope = "worker";
+          state.failureRetryable = true;
+          state.lastFailureAt = Date.now();
+
+          console.error(
+            `[STREAM-TARGET-RECOVERY] Recovery attempt for #${destinationId} failed:`,
+            state.lastError,
+          );
+
+          await pool
+            .query(
+              `UPDATE social_destinations
+               SET status='reconnecting',
+                   is_running=false,
+                   ffmpeg_pid=NULL,
+                   current_bitrate_kbps=0,
+                   last_error=$1,
+                   updated_at=NOW()
+               WHERE id=$2`,
+              [state.lastError, destinationId],
+            )
+            .catch(() => {});
+        } finally {
+          state.recoveryInProgress = false;
+        }
+      }
+    } catch (error) {
+      console.error(
+        "[STREAM-TARGET-RECOVERY] Recovery sweep failed:",
+        error.message,
+      );
+    } finally {
+      recoverySweepRunning = false;
+    }
+  }
+
+  function ensureRecoverySweep() {
+    if (recoverySweepTimer) return;
+
+    recoverySweepTimer = setInterval(
+      () => runRecoverySweep(),
+      STREAM_TARGET_RECOVERY_SWEEP_MS,
+    );
+    recoverySweepTimer.unref?.();
+
+    // Run once shortly after startup so stale reconnecting targets do not need
+    // to wait for the first full interval.
+    const initialSweep = setTimeout(
+      () => runRecoverySweep(),
+      Math.min(3000, STREAM_TARGET_RECOVERY_SWEEP_MS),
+    );
+    initialSweep.unref?.();
+  }
+
   async function reconcileDatabaseState() {
     // PIDs from a prior Node process cannot be trusted as ownership state.
-    // Mark them stopped at backend startup; auto-start will recreate them on
-    // the next publisher event, and auto-reconnect handles current-process exits.
+    // Preserve recovery intent for targets that were active when the backend
+    // disappeared: auto_reconnect means an infrastructure interruption should
+    // become RECONNECTING, not an operator-style STOPPED state.
     await pool.query(
       `UPDATE social_destinations
-       SET is_running = false, ffmpeg_pid = NULL, current_bitrate_kbps = 0,
-           status = CASE WHEN status = 'streaming' THEN 'stopped' ELSE COALESCE(status, 'stopped') END
-       WHERE is_running = true OR ffmpeg_pid IS NOT NULL`,
+       SET is_running = false,
+           ffmpeg_pid = NULL,
+           current_bitrate_kbps = 0,
+           status = CASE
+             WHEN auto_reconnect = true
+              AND status IN ('streaming', 'connecting', 'reconnecting')
+               THEN 'reconnecting'
+             WHEN status = 'streaming' THEN 'stopped'
+             ELSE COALESCE(status, 'stopped')
+           END,
+           last_error = CASE
+             WHEN auto_reconnect = true
+              AND status IN ('streaming', 'connecting', 'reconnecting')
+               THEN COALESCE(
+                 last_error,
+                 'Target worker was interrupted; awaiting automatic recovery.'
+               )
+             ELSE last_error
+           END,
+           updated_at = NOW()
+       WHERE is_running = true
+          OR ffmpeg_pid IS NOT NULL
+          OR status IN ('connecting', 'reconnecting')`,
     );
+
+    ensureRecoverySweep();
   }
 
   function getRuntimeState(destinationId) {
