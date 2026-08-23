@@ -115,6 +115,56 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
+
+// Internal Stream Target receiver allow-list.
+//
+// /internal-target is deliberately NOT a general-purpose ingest application.
+// A publish is accepted only when its stream key belongs to an enabled target
+// and that target points at one of the explicitly trusted receiver endpoints.
+//
+// Loopback RTMP/RTMPS on :1935 preserves the original local test/relay path.
+// The dedicated trusted RTMPS gateway is configurable so production does not
+// need to weaken this check or permit arbitrary external RTMP(S) receivers.
+const INTERNAL_TARGET_TRUSTED_RTMPS_HOST = String(
+  process.env.INTERNAL_TARGET_TRUSTED_RTMPS_HOST ||
+    "rtmps-test.nolimitsmedia.com",
+)
+  .trim()
+  .toLowerCase();
+
+const INTERNAL_TARGET_TRUSTED_RTMPS_PORT = String(
+  process.env.INTERNAL_TARGET_TRUSTED_RTMPS_PORT || "1936",
+).trim();
+
+const isAllowedInternalTargetDestination = (destinationUrl, protocol) => {
+  try {
+    const parsed = new URL(String(destinationUrl || "").trim());
+    const configuredProtocol = String(protocol || "rtmp")
+      .trim()
+      .toLowerCase();
+    const urlProtocol = parsed.protocol.replace(/:$/, "").toLowerCase();
+    const hostname = parsed.hostname.toLowerCase();
+    const port = parsed.port || (urlProtocol === "rtmps" ? "443" : "1935");
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+
+    if (!["rtmp", "rtmps"].includes(urlProtocol)) return false;
+    if (!["rtmp", "rtmps"].includes(configuredProtocol)) return false;
+    if (configuredProtocol !== urlProtocol) return false;
+    if (pathname !== "/internal-target") return false;
+
+    const isLoopback =
+      (hostname === "127.0.0.1" || hostname === "localhost") && port === "1935";
+
+    const isTrustedRtmpsGateway =
+      urlProtocol === "rtmps" &&
+      hostname === INTERNAL_TARGET_TRUSTED_RTMPS_HOST &&
+      port === INTERNAL_TARGET_TRUSTED_RTMPS_PORT;
+
+    return isLoopback || isTrustedRtmpsGateway;
+  } catch {
+    return false;
+  }
+};
 // Internal SRS endpoints. RTMP remains the publish/output transport for
 // encoded renditions, while FFmpeg consumers read the raw broadcast through
 // SRS's local HLS endpoint. Live production testing on 2026-08-07 confirmed
@@ -9765,10 +9815,10 @@ app.post("/api/srs/on_publish", async (req, res) => {
 
   // Internal Stream Target receiver publishes use a dedicated RTMP app
   // (`internal-target`) so they never enter the normal customer-ingest path.
-  // The stream key must belong to an enabled, active target whose destination
-  // is explicitly configured as a local loopback internal-target receiver.
-  // This preserves normal channel stream-key validation for /live and avoids
-  // hard-coded test-key bypasses.
+  // The stream key must belong to an enabled target and that target's
+  // destination must match our narrow internal receiver allow-list. This
+  // permits the trusted RTMPS gateway without turning /internal-target into a
+  // general external ingest endpoint.
   if (publishApp === "internal-target") {
     try {
       const internalTargetResult = await pool.query(
@@ -9789,18 +9839,22 @@ app.post("/api/srs/on_publish", async (req, res) => {
           AND c.is_active = TRUE
           AND o.is_active = TRUE
           AND COALESCE(sd.protocol, 'rtmp') IN ('rtmp', 'rtmps')
-          AND COALESCE(sd.destination_url, '') ~*
-              '^rtmps?://(127\\.0\\.0\\.1|localhost)(:1935)?/internal-target/?$'
-        LIMIT 1
+        ORDER BY sd.id DESC
+        LIMIT 10
         `,
         [streamKey],
       );
 
-      const internalTarget = internalTargetResult.rows[0];
+      const internalTarget = internalTargetResult.rows.find((target) =>
+        isAllowedInternalTargetDestination(
+          target.destination_url,
+          target.protocol,
+        ),
+      );
 
       if (!internalTarget) {
         console.warn(
-          `[SRS] REJECTED internal target — unknown, disabled, or non-loopback target: ${streamKey}`,
+          `[SRS] REJECTED internal target — unknown, disabled, or untrusted receiver: ${streamKey}`,
         );
         return res.json({ code: 403 });
       }
