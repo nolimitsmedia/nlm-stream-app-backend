@@ -437,34 +437,10 @@ function classifyTargetFailure(
     };
   }
 
-  if (
-    /401|403|unauthorized|forbidden|permission denied|authentication failed|invalid stream key|bad name|rejected/i.test(
-      value,
-    )
-  ) {
-    return {
-      scope: "destination",
-      code: "authentication_rejected",
-      category: "authentication",
-      retryable: false,
-      message: "Destination rejected authentication or the stream key",
-    };
-  }
-
-  if (
-    /already publishing|already exists|another publisher|stream is busy|duplicate publisher/i.test(
-      value,
-    )
-  ) {
-    return {
-      scope: "destination",
-      code: "duplicate_publisher",
-      category: "destination",
-      retryable: false,
-      message: "Another publisher may already be using this destination stream",
-    };
-  }
-
+  // Transport failures must be classified before generic destination
+  // rejection text. RTMP servers can emit words such as "rejected" while
+  // they are restarting or temporarily unavailable; treating that as an
+  // authentication failure permanently disables auto-reconnect.
   if (/connection refused/i.test(value)) {
     return {
       scope: "destination",
@@ -496,6 +472,34 @@ function classifyTargetFailure(
       category: "network",
       retryable: true,
       message: "Destination connection was interrupted",
+    };
+  }
+
+  if (
+    /401|403|unauthorized|forbidden|permission denied|authentication failed|invalid stream key|bad name/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "authentication_rejected",
+      category: "authentication",
+      retryable: false,
+      message: "Destination rejected authentication or the stream key",
+    };
+  }
+
+  if (
+    /already publishing|already exists|another publisher|stream is busy|duplicate publisher/i.test(
+      value,
+    )
+  ) {
+    return {
+      scope: "destination",
+      code: "duplicate_publisher",
+      category: "destination",
+      retryable: false,
+      message: "Another publisher may already be using this destination stream",
     };
   }
 
@@ -1860,12 +1864,28 @@ function createStreamTargetManager({
       }
 
       if (!preflight.ok) {
+        // A retryable destination outage during automatic recovery must stay
+        // RECONNECTING. Persisting it as FAILED makes the recovery watchdog
+        // ignore the target forever even after the destination comes back.
+        const recoverablePreflightFailure = Boolean(
+          options.reconnect &&
+            target.auto_reconnect &&
+            preflight.retryable !== false,
+        );
+        const preflightStatus = recoverablePreflightFailure
+          ? "reconnecting"
+          : "failed";
+
         await pool.query(
           `UPDATE social_destinations
-           SET is_running=false, ffmpeg_pid=NULL, status='failed',
-               current_bitrate_kbps=0, last_error=$1, updated_at=now()
-           WHERE id=$2`,
-          [preflight.message || "Destination preflight failed", target.id],
+           SET is_running=false, ffmpeg_pid=NULL, status=$1,
+               current_bitrate_kbps=0, last_error=$2, updated_at=now()
+           WHERE id=$3`,
+          [
+            preflightStatus,
+            preflight.message || "Destination preflight failed",
+            target.id,
+          ],
         );
 
         return {
@@ -2053,7 +2073,14 @@ function createStreamTargetManager({
          JOIN organizations o ON o.id = c.organization_id
          WHERE sd.enabled = true
            AND sd.auto_reconnect = true
-           AND sd.status IN ('reconnecting', 'connecting')
+           AND (
+             sd.status IN ('reconnecting', 'connecting')
+             OR (
+               sd.status = 'failed'
+               AND COALESCE(sd.last_error, '') ~*
+                 '(connection (was interrupted|timed out)|refused the connection|connection refused|broken pipe|network is unreachable|temporarily unavailable|source media is not ready|delivery could not be verified|reconnect worker failed|automatic reconnect stopped after)'
+             )
+           )
            AND (sd.is_running = false OR sd.ffmpeg_pid IS NULL)
            AND c.is_active = true
            AND o.is_active = true
@@ -2108,6 +2135,11 @@ function createStreamTargetManager({
         state.status = "reconnecting";
         state.recoveryInProgress = true;
         state.nextRetryAt = null;
+        // The watchdog starts a fresh bounded retry cycle. Without resetting
+        // this in-memory counter, a target that previously exhausted its fast
+        // retry budget can immediately fall back to FAILED on the next exit.
+        state.retryAttempt = 0;
+        state.failureRetryable = true;
         processStates.set(destinationId, state);
 
         const channel = {
