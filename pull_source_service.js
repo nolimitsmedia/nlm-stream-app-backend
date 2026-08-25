@@ -1381,11 +1381,24 @@ function createPullSourceManager({ pool }) {
     }
   }
 
-  const failoverMonitorTimer = setInterval(
-    runFailbackMonitor,
-    FAILOVER_MONITOR_INTERVAL_MS,
-  );
-  failoverMonitorTimer.unref?.();
+  // Do not start the failover/recovery monitor until startup reconciliation has
+  // finished. registerPullSourceRoutes() creates this manager before server.js
+  // completes its async startup sequence. Starting the interval immediately
+  // allowed the monitor to recover a backup while startup was still in flight;
+  // reconcileDatabaseState() then reset the just-recovered DB ownership/status
+  // to stopped/NULL without killing the live FFmpeg worker. That produced the
+  // exact split state seen in production: media live in SRS while the DB said
+  // no active source.
+  let failoverMonitorTimer = null;
+
+  function startFailoverMonitor() {
+    if (failoverMonitorTimer) return;
+    failoverMonitorTimer = setInterval(
+      runFailbackMonitor,
+      FAILOVER_MONITOR_INTERVAL_MS,
+    );
+    failoverMonitorTimer.unref?.();
+  }
 
   async function reconcileDatabaseState() {
     await pool.query(`
@@ -1444,10 +1457,18 @@ function createPullSourceManager({ pool }) {
       }, delay).unref?.();
       delay += 250;
     }
+
+    // Startup DB reconciliation is now complete. Only now may the failover
+    // monitor probe/recover sources, so its ownership writes cannot be erased
+    // by the startup reset above.
+    startFailoverMonitor();
   }
 
   async function shutdown() {
-    clearInterval(failoverMonitorTimer);
+    if (failoverMonitorTimer) {
+      clearInterval(failoverMonitorTimer);
+      failoverMonitorTimer = null;
+    }
     for (const state of states.values()) {
       state.manualStop = true;
       if (state.retryTimer) clearTimeout(state.retryTimer);
