@@ -51,6 +51,11 @@ const SRS_API_URL = String(
   process.env.SRS_API_URL || "http://127.0.0.1:1985",
 ).replace(/\/+$/, "");
 
+const FAILOVER_MONITOR_INTERVAL_MS = Math.max(
+  2000,
+  Number(process.env.PULL_SOURCE_FAILOVER_MONITOR_INTERVAL_MS || 5000),
+);
+
 const RTSP_TRANSPORT = (() => {
   const value = String(process.env.PULL_SOURCE_RTSP_TRANSPORT || "tcp")
     .trim()
@@ -435,6 +440,8 @@ function buildWorkerArgs(sourceUrl, protocol, streamKey) {
 
 function createPullSourceManager({ pool }) {
   const states = new Map();
+  const failbackStableSince = new Map();
+  let failoverMonitorBusy = false;
 
   function getState(id) {
     return states.get(Number(id)) || null;
@@ -583,6 +590,268 @@ function createPullSourceManager({ pool }) {
     });
   }
 
+  async function recordHealth(id, healthStatus) {
+    await updateDb(id, {
+      health_status: healthStatus || "unknown",
+      last_health_check_at: new Date(),
+    });
+  }
+
+  async function getFailoverConfig(channelId, organizationId = null) {
+    const params = [channelId];
+    let where = "channel_id=$1";
+    if (organizationId !== null && organizationId !== undefined) {
+      params.push(organizationId);
+      where += " AND organization_id=$2";
+    }
+    const result = await pool.query(
+      `SELECT * FROM channel_source_failover WHERE ${where} LIMIT 1`,
+      params,
+    );
+    return result.rows[0] || null;
+  }
+
+  async function getChannelSources(channelId, organizationId) {
+    const result = await pool.query(
+      `SELECT * FROM channel_pull_sources
+       WHERE channel_id=$1 AND organization_id=$2
+       ORDER BY CASE WHEN role='primary' THEN 0 ELSE 1 END, priority ASC, id ASC`,
+      [channelId, organizationId],
+    );
+    return result.rows;
+  }
+
+  async function isActiveSource(source) {
+    const result = await pool.query(
+      `SELECT is_active_source FROM channel_pull_sources WHERE id=$1`,
+      [source.id],
+    );
+    return Boolean(result.rows[0]?.is_active_source);
+  }
+
+  async function setActiveSource(source, reason = "source_switch") {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE channel_pull_sources
+         SET is_active_source=FALSE, updated_at=NOW()
+         WHERE channel_id=$1 AND organization_id=$2`,
+        [source.channel_id, source.organization_id],
+      );
+      await client.query(
+        `UPDATE channel_pull_sources
+         SET is_active_source=TRUE, updated_at=NOW()
+         WHERE id=$1`,
+        [source.id],
+      );
+      await client.query(
+        `INSERT INTO channel_source_failover
+           (channel_id, organization_id, active_source_id, last_switch_at, last_switch_reason)
+         VALUES ($1,$2,$3,NOW(),$4)
+         ON CONFLICT (channel_id)
+         DO UPDATE SET
+           organization_id=EXCLUDED.organization_id,
+           active_source_id=EXCLUDED.active_source_id,
+           last_switch_at=NOW(),
+           last_switch_reason=EXCLUDED.last_switch_reason,
+           updated_at=NOW()`,
+        [source.channel_id, source.organization_id, source.id, reason],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function clearActiveSource(source, reason = "source_stopped") {
+    await pool.query(
+      `UPDATE channel_pull_sources
+       SET is_active_source=FALSE, updated_at=NOW()
+       WHERE id=$1`,
+      [source.id],
+    );
+    await pool.query(
+      `UPDATE channel_source_failover
+       SET active_source_id=NULL,
+           last_switch_at=NOW(),
+           last_switch_reason=$2,
+           updated_at=NOW()
+       WHERE channel_id=$1 AND active_source_id=$3`,
+      [source.channel_id, reason, source.id],
+    );
+  }
+
+  async function waitForCanonicalOffline(streamKey, timeoutMs = 6000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (!(await isSrsStreamLive(streamKey))) return true;
+      await sleep(250);
+    }
+    return !(await isSrsStreamLive(streamKey));
+  }
+
+  async function activateSource(source, channel, options = {}) {
+    if (!source?.id) return { ok: false, message: "Pull source is missing" };
+    if (!source.enabled)
+      return { ok: false, message: "Pull source is disabled" };
+
+    const freshResult = await pool.query(
+      `SELECT * FROM channel_pull_sources
+       WHERE id=$1 AND channel_id=$2 AND organization_id=$3`,
+      [source.id, source.channel_id, source.organization_id],
+    );
+    const freshSource = freshResult.rows[0];
+    if (!freshSource) return { ok: false, message: "Pull source not found" };
+
+    const activeResult = await pool.query(
+      `SELECT * FROM channel_pull_sources
+       WHERE channel_id=$1 AND organization_id=$2 AND is_active_source=TRUE
+       ORDER BY id LIMIT 1`,
+      [freshSource.channel_id, freshSource.organization_id],
+    );
+    const current = activeResult.rows[0] || null;
+
+    if (current && Number(current.id) !== Number(freshSource.id)) {
+      await stopSource(current, {
+        clearActive: true,
+        reason: options.reason || "source_switch",
+      });
+      await waitForCanonicalOffline(channel.stream_key, 6000);
+    }
+
+    // Clean up any orphan runtime worker for another source on this channel.
+    const siblings = await getChannelSources(
+      freshSource.channel_id,
+      freshSource.organization_id,
+    );
+    for (const sibling of siblings) {
+      if (Number(sibling.id) === Number(freshSource.id)) continue;
+      const siblingState = getState(sibling.id);
+      if (siblingState?.proc && siblingState.proc.exitCode === null) {
+        await stopSource(sibling, {
+          clearActive: false,
+          reason: "source_switch_cleanup",
+        });
+      }
+    }
+
+    // Direct push ingest (OBS/SRT push) still wins over Pull Sources. The only
+    // canonical publisher we are allowed to replace is another managed Pull Source.
+    if (await isSrsStreamLive(channel.stream_key)) {
+      return {
+        ok: false,
+        code: "channel_already_live",
+        message:
+          "This channel already has a live publisher that is not the selected Pull Source.",
+      };
+    }
+
+    await setActiveSource(freshSource, options.reason || "source_start");
+    const result = await startSource(freshSource, channel, {
+      reconnecting: Boolean(options.reconnecting),
+      activated: true,
+    });
+
+    if (!result.ok) {
+      await clearActiveSource(freshSource, "source_start_failed");
+    } else if (String(freshSource.role || "backup") === "backup") {
+      failbackStableSince.delete(Number(freshSource.channel_id));
+    }
+    return result;
+  }
+
+  async function chooseFailoverCandidate(source, channel) {
+    const sources = await getChannelSources(
+      source.channel_id,
+      source.organization_id,
+    );
+    const candidates = sources.filter(
+      (candidate) =>
+        candidate.enabled && Number(candidate.id) !== Number(source.id),
+    );
+
+    for (const candidate of candidates) {
+      try {
+        const probe = await preflightSource(candidate);
+        await recordHealth(candidate.id, probe.ok ? "ready" : "unhealthy");
+        if (probe.ok) return candidate;
+      } catch {
+        await recordHealth(candidate.id, "unhealthy").catch(() => {});
+      }
+    }
+    return null;
+  }
+
+  async function scheduleFailover(source, channel, state, failure, config) {
+    state.reconnectCount += 1;
+    state.status = "reconnecting";
+    state.lastError = failure.message;
+    state.lastErrorCode = failure.code;
+    const thresholdMs = Math.max(
+      1000,
+      Number(config.failure_threshold_seconds || 5) * 1000,
+    );
+
+    await updateDb(source.id, {
+      status: "reconnecting",
+      is_running: false,
+      reconnect_count: state.reconnectCount,
+      last_error: failure.message,
+      last_error_code: failure.code,
+      health_status: "unhealthy",
+      last_health_check_at: new Date(),
+      stopped_at: new Date(),
+    });
+
+    console.warn(
+      `[PULL-SOURCE-FAILOVER] Active #${source.id} failed. Waiting ${thresholdMs}ms before selecting backup: ${failure.message}`,
+    );
+
+    state.retryTimer = setTimeout(async () => {
+      state.retryTimer = null;
+      if (state.manualStop) return;
+      try {
+        const stillActive = await isActiveSource(source);
+        if (!stillActive) return;
+
+        const candidate = await chooseFailoverCandidate(source, channel);
+        if (candidate) {
+          console.warn(
+            `[PULL-SOURCE-FAILOVER] Switching channel ${channel.id} from #${source.id} to #${candidate.id} (${candidate.name}).`,
+          );
+          await activateSource(candidate, channel, {
+            reason: "automatic_failover",
+            reconnecting: true,
+          });
+          return;
+        }
+
+        // No healthy backup is available. Retry the current active source so a
+        // one-source channel still recovers exactly as it did before failover.
+        console.warn(
+          `[PULL-SOURCE-FAILOVER] No healthy backup available for channel ${channel.id}; retrying #${source.id}.`,
+        );
+        await clearActiveSource(source, "retry_current_source");
+        await activateSource(source, channel, {
+          reason: "retry_current_source",
+          reconnecting: true,
+        });
+      } catch (error) {
+        console.error(
+          `[PULL-SOURCE-FAILOVER] Recovery failed for channel ${channel.id}:`,
+          error.message,
+        );
+      }
+    }, thresholdMs);
+    state.retryTimer.unref?.();
+  }
+
   async function scheduleReconnect(source, channel, state, failure) {
     if (
       state.manualStop ||
@@ -605,9 +874,21 @@ function createPullSourceManager({ pool }) {
         status: "stopped",
         is_running: false,
         stopped_at: new Date(),
+        health_status: cleanStop ? "unknown" : "unhealthy",
+        last_health_check_at: new Date(),
         last_error: cleanStop ? null : failure.message,
         last_error_code: cleanStop ? null : failure.code,
       });
+      return;
+    }
+
+    const config = await getFailoverConfig(
+      source.channel_id,
+      source.organization_id,
+    );
+    const active = await isActiveSource(source);
+    if (config?.enabled && active) {
+      await scheduleFailover(source, channel, state, failure, config);
       return;
     }
 
@@ -623,6 +904,8 @@ function createPullSourceManager({ pool }) {
       reconnect_count: state.reconnectCount,
       last_error: failure.message,
       last_error_code: failure.code,
+      health_status: "unhealthy",
+      last_health_check_at: new Date(),
       stopped_at: new Date(),
     });
 
@@ -804,6 +1087,8 @@ function createPullSourceManager({ pool }) {
           last_error: null,
           last_error_code: null,
           reconnect_count: state.reconnectCount,
+          health_status: "healthy",
+          last_health_check_at: new Date(),
         });
         return {
           ok: true,
@@ -827,7 +1112,7 @@ function createPullSourceManager({ pool }) {
     };
   }
 
-  async function stopSource(source) {
+  async function stopSource(source, options = {}) {
     const id = Number(source.id);
     const state = getState(id);
     if (state) {
@@ -853,17 +1138,111 @@ function createPullSourceManager({ pool }) {
       status: "stopped",
       is_running: false,
       stopped_at: new Date(),
+      health_status: "unknown",
       last_error: null,
       last_error_code: null,
     });
+
+    if (options.clearActive !== false) {
+      await clearActiveSource(source, options.reason || "source_stopped");
+    }
     return { ok: true, message: "Pull source stopped" };
   }
+
+  async function runFailbackMonitor() {
+    if (failoverMonitorBusy) return;
+    failoverMonitorBusy = true;
+    try {
+      const activeBackups = await pool.query(`
+        SELECT
+          f.*,
+          c.stream_key,
+          ps.id AS active_id,
+          ps.role AS active_role
+        FROM channel_source_failover f
+        JOIN channels c ON c.id=f.channel_id
+        JOIN organizations o ON o.id=f.organization_id
+        LEFT JOIN channel_pull_sources ps ON ps.id=f.active_source_id
+        WHERE f.enabled=TRUE
+          AND f.failback_enabled=TRUE
+          AND c.is_active=TRUE
+          AND o.is_active=TRUE
+          AND ps.role='backup'
+      `);
+
+      for (const row of activeBackups.rows) {
+        const primaryResult = await pool.query(
+          `SELECT * FROM channel_pull_sources
+           WHERE channel_id=$1 AND organization_id=$2
+             AND role='primary' AND enabled=TRUE
+           ORDER BY priority,id LIMIT 1`,
+          [row.channel_id, row.organization_id],
+        );
+        const primary = primaryResult.rows[0];
+        if (!primary) continue;
+
+        let probe;
+        try {
+          probe = await preflightSource(primary);
+        } catch (error) {
+          probe = { ok: false, message: error.message };
+        }
+        await recordHealth(primary.id, probe.ok ? "ready" : "unhealthy").catch(
+          () => {},
+        );
+
+        const channelId = Number(row.channel_id);
+        if (!probe.ok) {
+          failbackStableSince.delete(channelId);
+          continue;
+        }
+
+        const firstHealthyAt = failbackStableSince.get(channelId) || Date.now();
+        failbackStableSince.set(channelId, firstHealthyAt);
+        const stableForMs = Date.now() - firstHealthyAt;
+        const requiredMs =
+          Math.max(3, Number(row.failback_stability_seconds || 15)) * 1000;
+        if (stableForMs < requiredMs) continue;
+
+        console.warn(
+          `[PULL-SOURCE-FAILBACK] Primary #${primary.id} has been healthy for ${Math.round(stableForMs / 1000)}s; switching channel ${channelId} back.`,
+        );
+        await activateSource(
+          primary,
+          { id: row.channel_id, stream_key: row.stream_key },
+          { reason: "automatic_failback", reconnecting: true },
+        );
+        failbackStableSince.delete(channelId);
+      }
+    } catch (error) {
+      console.error("[PULL-SOURCE-FAILBACK] Monitor failed:", error.message);
+    } finally {
+      failoverMonitorBusy = false;
+    }
+  }
+
+  const failoverMonitorTimer = setInterval(
+    runFailbackMonitor,
+    FAILOVER_MONITOR_INTERVAL_MS,
+  );
+  failoverMonitorTimer.unref?.();
 
   async function reconcileDatabaseState() {
     await pool.query(`
       UPDATE channel_pull_sources
-      SET status='stopped', is_running=FALSE, started_at=NULL, updated_at=NOW()
-      WHERE is_running=TRUE OR status IN ('starting','streaming','reconnecting','waiting')
+      SET status='stopped',
+          is_running=FALSE,
+          is_active_source=FALSE,
+          started_at=NULL,
+          updated_at=NOW()
+      WHERE is_running=TRUE
+         OR is_active_source=TRUE
+         OR status IN ('starting','streaming','reconnecting','waiting')
+    `);
+    await pool.query(`
+      UPDATE channel_source_failover
+      SET active_source_id=NULL, updated_at=NOW()
+      WHERE active_source_id IS NOT NULL
     `);
 
     const result = await pool.query(`
@@ -873,23 +1252,42 @@ function createPullSourceManager({ pool }) {
       JOIN organizations o ON o.id=ps.organization_id
       WHERE ps.enabled=TRUE AND ps.auto_start=TRUE
         AND c.is_active=TRUE AND o.is_active=TRUE
-      ORDER BY ps.id
+      ORDER BY ps.channel_id,
+               CASE WHEN ps.role='primary' THEN 0 ELSE 1 END,
+               ps.priority,
+               ps.id
     `);
 
+    // Only one Pull Source may own a channel's canonical stream. Even if older
+    // data accidentally has Auto Start enabled on multiple sources, start only
+    // the highest-priority source for each channel.
+    const chosenByChannel = new Map();
     for (const row of result.rows) {
+      if (!chosenByChannel.has(Number(row.channel_id))) {
+        chosenByChannel.set(Number(row.channel_id), row);
+      }
+    }
+
+    let delay = 1000;
+    for (const row of chosenByChannel.values()) {
       const channel = { id: row.channel_id, stream_key: row.stream_key };
       setTimeout(() => {
-        startSource(row, channel, { reconnecting: true }).catch((error) =>
+        activateSource(row, channel, {
+          reason: "backend_restart",
+          reconnecting: true,
+        }).catch((error) =>
           console.error(
             `[PULL-SOURCE] Startup reconcile failed for #${row.id}:`,
             error.message,
           ),
         );
-      }, 1000).unref?.();
+      }, delay).unref?.();
+      delay += 250;
     }
   }
 
   async function shutdown() {
+    clearInterval(failoverMonitorTimer);
     for (const state of states.values()) {
       state.manualStop = true;
       if (state.retryTimer) clearTimeout(state.retryTimer);
@@ -904,7 +1302,9 @@ function createPullSourceManager({ pool }) {
     validateSourceUrl,
     preflightSource,
     startSource,
+    activateSource,
     stopSource,
+    recordHealth,
     getRuntimeState: publicRuntimeState,
     isSrsStreamLive,
     reconcileDatabaseState,
