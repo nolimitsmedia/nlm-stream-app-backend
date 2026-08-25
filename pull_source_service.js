@@ -948,6 +948,50 @@ function createPullSourceManager({ pool }) {
       state.retryTimer = null;
       if (state.manualStop) return;
       try {
+        // If failover is enabled and this channel currently has no active
+        // Pull Source owner, a reconnect must go through activateSource(),
+        // not startSource() directly. startSource() can restore media by
+        // itself, but it intentionally does not assign channel ownership.
+        // Using it directly here caused the exact split-brain DB state seen
+        // during recovery: status=streaming/is_running=true while
+        // is_active_source=false and channel_source_failover.active_source_id
+        // stayed NULL.
+        const reconnectConfig = await getFailoverConfig(
+          source.channel_id,
+          source.organization_id,
+        );
+
+        if (reconnectConfig?.enabled) {
+          const ownerResult = await pool.query(
+            `SELECT id FROM channel_pull_sources
+             WHERE channel_id=$1 AND organization_id=$2
+               AND is_active_source=TRUE
+             ORDER BY id LIMIT 1`,
+            [source.channel_id, source.organization_id],
+          );
+          const ownerId = Number(ownerResult.rows[0]?.id || 0);
+
+          if (!ownerId) {
+            console.warn(
+              `[PULL-SOURCE-RECOVERY] Reconnect for #${source.id} has no active channel owner; re-activating through ownership recovery.`,
+            );
+            await activateSource(source, channel, {
+              reason: "automatic_reconnect_recovery",
+              reconnecting: true,
+            });
+            return;
+          }
+
+          // Another source already owns the channel. Never let an old retry
+          // timer wake up and publish behind that owner's back.
+          if (ownerId !== Number(source.id)) {
+            console.warn(
+              `[PULL-SOURCE] Skipping reconnect for #${source.id}; source #${ownerId} already owns channel ${source.channel_id}.`,
+            );
+            return;
+          }
+        }
+
         await startSource(source, channel, { reconnecting: true });
       } catch (error) {
         console.error(
