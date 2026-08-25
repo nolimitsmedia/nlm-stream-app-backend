@@ -733,7 +733,17 @@ function createPullSourceManager({ pool }) {
     for (const sibling of siblings) {
       if (Number(sibling.id) === Number(freshSource.id)) continue;
       const siblingState = getState(sibling.id);
-      if (siblingState?.proc && siblingState.proc.exitCode === null) {
+
+      // A sibling can have a pending reconnect timer even when it has no live
+      // FFmpeg process. If we promote another source without cancelling that
+      // timer, the old source may wake up later and repeatedly contend with
+      // the now-active canonical publisher. Stop/cancel any managed sibling
+      // runtime before assigning ownership to the selected source.
+      if (
+        siblingState &&
+        ((siblingState.proc && siblingState.proc.exitCode === null) ||
+          siblingState.retryTimer)
+      ) {
         await stopSource(sibling, {
           clearActive: false,
           reason: "source_switch_cleanup",
@@ -1153,6 +1163,91 @@ function createPullSourceManager({ pool }) {
     if (failoverMonitorBusy) return;
     failoverMonitorBusy = true;
     try {
+      // Recovery path for a channel that currently has NO active Pull Source.
+      // This is the state reached when the active source fails and every other
+      // configured source is unavailable at that moment. Previously the code
+      // retried only the failed source, so a backup that came online later
+      // could remain permanently unused. Probe enabled sources in preference
+      // order and promote the first source that has actually recovered.
+      const noActiveChannels = await pool.query(`
+        SELECT
+          f.*,
+          c.stream_key
+        FROM channel_source_failover f
+        JOIN channels c ON c.id=f.channel_id
+          AND c.organization_id=f.organization_id
+        JOIN organizations o ON o.id=f.organization_id
+        WHERE f.enabled=TRUE
+          AND c.is_active=TRUE
+          AND o.is_active=TRUE
+          AND f.active_source_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM channel_pull_sources active_ps
+            WHERE active_ps.channel_id=f.channel_id
+              AND active_ps.organization_id=f.organization_id
+              AND active_ps.is_active_source=TRUE
+          )
+      `);
+
+      for (const row of noActiveChannels.rows) {
+        const channelId = Number(row.channel_id);
+        const channel = { id: row.channel_id, stream_key: row.stream_key };
+
+        // Direct push ingest (OBS/SRT push) still wins. If SRS already has the
+        // canonical stream while no Pull Source owns it, do not compete with it.
+        if (await isSrsStreamLive(row.stream_key)) continue;
+
+        const sources = await getChannelSources(
+          row.channel_id,
+          row.organization_id,
+        );
+        const candidates = sources.filter((source) => source.enabled);
+
+        let recovered = null;
+        for (const candidate of candidates) {
+          let probe;
+          try {
+            probe = await preflightSource(candidate);
+          } catch (error) {
+            probe = { ok: false, message: error.message };
+          }
+
+          await recordHealth(
+            candidate.id,
+            probe.ok ? "ready" : "unhealthy",
+          ).catch(() => {});
+
+          if (probe.ok) {
+            recovered = candidate;
+            break;
+          }
+        }
+
+        if (!recovered) {
+          failbackStableSince.delete(channelId);
+          continue;
+        }
+
+        console.warn(
+          `[PULL-SOURCE-RECOVERY] Channel ${channelId} has no active source; recovered #${recovered.id} (${recovered.name}).`,
+        );
+
+        const result = await activateSource(recovered, channel, {
+          reason: "automatic_source_recovery",
+          reconnecting: true,
+        });
+
+        if (!result?.ok) {
+          console.warn(
+            `[PULL-SOURCE-RECOVERY] Could not activate recovered #${recovered.id} for channel ${channelId}: ${result?.message || "unknown error"}`,
+          );
+        }
+      }
+
+      // Existing failback behavior: when a backup owns the canonical stream,
+      // continuously probe the preferred primary and switch back only after it
+      // has remained healthy for the configured stability window.
       const activeBackups = await pool.query(`
         SELECT
           f.*,
@@ -1215,7 +1310,7 @@ function createPullSourceManager({ pool }) {
         failbackStableSince.delete(channelId);
       }
     } catch (error) {
-      console.error("[PULL-SOURCE-FAILBACK] Monitor failed:", error.message);
+      console.error("[PULL-SOURCE-FAILOVER] Monitor failed:", error.message);
     } finally {
       failoverMonitorBusy = false;
     }
