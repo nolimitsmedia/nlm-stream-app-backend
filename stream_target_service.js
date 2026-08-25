@@ -384,6 +384,9 @@ function classifyTargetFailure(
     /404 not found|failed to reload playlist|when parsing playlist|error when loading first segment|failed to open segment/i.test(
       value,
     ) ||
+    /non-monotonous dts|dts .* out of order|timestamp discontinuity/i.test(
+      value,
+    ) ||
     (source &&
       value.includes(source) &&
       /connection refused|connection reset by peer|input\/output error|end of file|timed out|server error/i.test(
@@ -674,6 +677,28 @@ function createStreamTargetManager({
       mode: "rtmp",
       url: getInternalRtmpSourceUrl(streamKey),
     };
+  }
+
+  // RTMP/RTMPS stream targets should consume the canonical SRS RTMP stream,
+  // not HLS, even when an older target/source_mode was persisted as "hls".
+  //
+  // During Pull Source failover/failback, SRS inserts HLS discontinuities and
+  // the replacement publisher can restart its MPEG-TS timeline. A long-lived
+  // HLS -> RTMP stream-copy worker can then emit non-monotonic DTS and get
+  // disconnected by YouTube/Facebook. RTMP input instead disconnects cleanly
+  // at the source handoff; the existing target reconnect path then reconnects
+  // to the SAME destination/runtime URL with a fresh FFmpeg timeline.
+  function getHandoffSafePreferredSource(streamKey, requestedMode, protocol) {
+    const normalizedProtocol = String(protocol || "").toLowerCase();
+
+    if (normalizedProtocol === "rtmp" || normalizedProtocol === "rtmps") {
+      return {
+        mode: "rtmp",
+        url: getInternalRtmpSourceUrl(streamKey),
+      };
+    }
+
+    return getPreferredSource(streamKey, requestedMode);
   }
 
   async function waitForPreferredSource(
@@ -1054,6 +1079,19 @@ function createStreamTargetManager({
 
   function buildFfmpegArgs(sourceUrl, destinationUrl, protocol) {
     const audioArgs = getTargetAudioArgs(protocol);
+    const sourceIsHls =
+      /^https?:\/\//i.test(String(sourceUrl || "")) &&
+      /\.m3u8(?:\?|$)/i.test(String(sourceUrl || ""));
+    const handoffTimestampArgs = sourceIsHls
+      ? [
+          "-fflags",
+          "+genpts+discardcorrupt+igndts",
+          "-avoid_negative_ts",
+          "make_zero",
+          "-dts_delta_threshold",
+          "1",
+        ]
+      : [];
     const output =
       protocol === "srt"
         ? [
@@ -1083,6 +1121,7 @@ function createStreamTargetManager({
 
     return [
       ...inputResilienceFlags,
+      ...handoffTimestampArgs,
       "-i",
       sourceUrl,
       "-map",
@@ -1219,9 +1258,10 @@ function createStreamTargetManager({
       target.target_type || target.platform,
     );
     const protocol = normalizeProtocol(target.protocol, targetType);
-    const preferredSource = getPreferredSource(
+    const preferredSource = getHandoffSafePreferredSource(
       channel.stream_key,
       target.source_mode || STREAM_TARGET_SOURCE_MODE,
+      protocol,
     );
     const sourceUrl = preferredSource.url;
 
@@ -1807,7 +1847,14 @@ function createStreamTargetManager({
           ok: false,
           message: "Connect an account to this target first",
         };
-      if (!destinationUrl || !options.reuseRuntimeUrl) {
+      const shouldReuseRuntimeUrl = Boolean(
+        destinationUrl &&
+        (options.reuseRuntimeUrl ||
+          options.reconnect ||
+          target.status === "reconnecting"),
+      );
+
+      if (!shouldReuseRuntimeUrl) {
         try {
           const created = await createOAuthDestination(
             target,
@@ -1869,8 +1916,8 @@ function createStreamTargetManager({
         // ignore the target forever even after the destination comes back.
         const recoverablePreflightFailure = Boolean(
           options.reconnect &&
-            target.auto_reconnect &&
-            preflight.retryable !== false,
+          target.auto_reconnect &&
+          preflight.retryable !== false,
         );
         const preflightStatus = recoverablePreflightFailure
           ? "reconnecting"
