@@ -2044,9 +2044,67 @@ function createStreamTargetManager({
        WHERE channel_id = $1 AND enabled = true AND auto_start = true`,
       [channel.id],
     );
+
     for (const target of result.rows) {
+      const startAutoTargetSafely = async (attempt = "initial") => {
+        // Re-read immediately before start. The row loaded above can become
+        // stale during Pull Source failover/failback or FFmpeg recovery.
+        const freshResult = await pool.query(
+          `SELECT *
+           FROM social_destinations
+           WHERE id = $1 AND channel_id = $2
+           LIMIT 1`,
+          [target.id, channel.id],
+        );
+
+        const freshTarget = freshResult.rows[0];
+
+        if (!freshTarget || !freshTarget.enabled || !freshTarget.auto_start) {
+          return {
+            ok: false,
+            message: "Auto-start target is no longer enabled",
+          };
+        }
+
+        const runtimeState = processStates.get(Number(freshTarget.id));
+        if (runtimeState?.proc && !runtimeState.proc.killed) {
+          return {
+            ok: true,
+            message: "Target is already streaming",
+          };
+        }
+
+        const hasPreservedRuntimeSession = Boolean(
+          freshTarget.active_destination_url ||
+          freshTarget.platform_broadcast_id ||
+          freshTarget.platform_stream_id ||
+          freshTarget.status === "reconnecting",
+        );
+
+        if (hasPreservedRuntimeSession) {
+          console.log(
+            `[STREAM-TARGET-AUTOSTART] ${attempt} recovery for #${freshTarget.id}; reusing preserved destination session.`,
+          );
+        }
+
+        return startTarget(
+          freshTarget,
+          channel,
+          organizationId,
+          hasPreservedRuntimeSession
+            ? {
+                reconnect: true,
+                reuseRuntimeUrl: true,
+                requestedBy: "auto-start-recovery",
+              }
+            : {
+                requestedBy: "auto-start",
+              },
+        );
+      };
+
       const timer = setTimeout(() => {
-        startTarget(target, channel, organizationId)
+        startAutoTargetSafely("initial")
           .then((result) => {
             if (result.ok) return;
 
@@ -2055,14 +2113,14 @@ function createStreamTargetManager({
             );
 
             const shouldRetry =
-              /HLS media is not ready|HLS playlist|HLS returned HTTP/i.test(
+              /HLS media is not ready|HLS playlist|HLS returned HTTP|media is not ready/i.test(
                 String(result.message || ""),
               );
 
             if (!shouldRetry) return;
 
             const retryTimer = setTimeout(() => {
-              startTarget(target, channel, organizationId)
+              startAutoTargetSafely("delayed")
                 .then((retryResult) => {
                   if (!retryResult.ok) {
                     console.log(
@@ -2077,6 +2135,7 @@ function createStreamTargetManager({
                   ),
                 );
             }, 5000);
+
             retryTimer.unref?.();
           })
           .catch((error) =>
@@ -2086,6 +2145,7 @@ function createStreamTargetManager({
             ),
           );
       }, 5000);
+
       timer.unref?.();
     }
   }
