@@ -762,7 +762,12 @@ function createPullSourceManager({ pool }) {
       };
     }
 
-    await setActiveSource(freshSource, options.reason || "source_start");
+    // Start and verify media delivery BEFORE committing DB ownership.  The old
+    // ordering marked a source active before FFmpeg/SRS delivery was proven;
+    // recovery/health probes could then race with that provisional state and
+    // leave a successfully streaming backup with stale inactive/unhealthy DB
+    // flags.  Ownership now becomes authoritative only after startSource()
+    // confirms the canonical SRS stream is live.
     const result = await startSource(freshSource, channel, {
       reconnecting: Boolean(options.reconnecting),
       activated: true,
@@ -770,7 +775,23 @@ function createPullSourceManager({ pool }) {
 
     if (!result.ok) {
       await clearActiveSource(freshSource, "source_start_failed");
-    } else if (String(freshSource.role || "backup") === "backup") {
+      return result;
+    }
+
+    // Media delivery is confirmed. Commit active ownership and normalize the
+    // persisted health/runtime fields atomically enough for the UI/failback
+    // monitor to observe a consistent source state on the next poll.
+    await setActiveSource(freshSource, options.reason || "source_start");
+    await updateDb(freshSource.id, {
+      status: "streaming",
+      is_running: true,
+      health_status: "healthy",
+      last_health_check_at: new Date(),
+      last_error: null,
+      last_error_code: null,
+    });
+
+    if (String(freshSource.role || "backup") === "backup") {
       failbackStableSince.delete(Number(freshSource.channel_id));
     }
     return result;
