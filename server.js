@@ -9792,6 +9792,174 @@ app.get("/api/hls/seg/:app/:streamKey/:segment", async (req, res) => {
       .json({ ok: false, message: "Segment unavailable: " + err.message });
   }
 });
+// STREAM TARGET SOURCE-HANDOFF CONTINUITY
+//
+// A Pull Source failover/failback briefly removes /live/<stream_key> from SRS.
+// That transient on_unpublish must NOT be treated as a real broadcast end,
+// otherwise YouTube/Facebook workers are intentionally stopped and OAuth
+// platform broadcasts are ended. Preserve targets while the Pull Source HA
+// controller is actively recovering, then let each target's existing
+// source-side reconnect loop attach to the restored canonical stream.
+//
+// Manual Pull Source Stop remains a real end because stopSource() has already
+// moved the source out of an active/recovering state before SRS on_unpublish.
+const STREAM_TARGET_HANDOFF_GRACE_MS = Math.max(
+  10000,
+  Number(process.env.STREAM_TARGET_HANDOFF_GRACE_MS || 30000),
+);
+const STREAM_TARGET_HANDOFF_RECHECK_MS = Math.max(
+  3000,
+  Number(process.env.STREAM_TARGET_HANDOFF_RECHECK_MS || 10000),
+);
+const STREAM_TARGET_HANDOFF_MAX_MS = Math.max(
+  STREAM_TARGET_HANDOFF_GRACE_MS,
+  Number(process.env.STREAM_TARGET_HANDOFF_MAX_MS || 90000),
+);
+
+const streamTargetHandoffStops = new Map();
+
+async function getPullSourceHandoffState(channelId) {
+  const result = await pool.query(
+    `
+    SELECT
+      f.enabled,
+      f.active_source_id,
+      COALESCE(
+        BOOL_OR(
+          ps.enabled = TRUE
+          AND COALESCE(ps.auto_reconnect, FALSE) = TRUE
+          AND (
+            COALESCE(ps.is_active_source, FALSE) = TRUE
+            OR COALESCE(ps.is_running, FALSE) = TRUE
+            OR COALESCE(ps.status, '') IN (
+              'starting',
+              'streaming',
+              'reconnecting',
+              'waiting'
+            )
+          )
+        ),
+        FALSE
+      ) AS recovery_expected
+    FROM channel_source_failover f
+    LEFT JOIN channel_pull_sources ps
+      ON ps.channel_id = f.channel_id
+    WHERE f.channel_id = $1
+    GROUP BY f.channel_id, f.enabled, f.active_source_id
+    LIMIT 1
+    `,
+    [channelId],
+  );
+
+  const row = result.rows[0];
+  return {
+    enabled: Boolean(row?.enabled),
+    activeSourceId: row?.active_source_id ?? null,
+    recoveryExpected: Boolean(row?.recovery_expected),
+  };
+}
+
+function clearDeferredStreamTargetStop(streamKey, reason = "source recovered") {
+  const pending = streamTargetHandoffStops.get(streamKey);
+  if (!pending) return false;
+
+  if (pending.timer) clearTimeout(pending.timer);
+  streamTargetHandoffStops.delete(streamKey);
+
+  console.log(
+    `[STREAM-TARGET-HANDOFF] Preserving targets for ${streamKey}: ${reason}.`,
+  );
+  return true;
+}
+
+function scheduleDeferredStreamTargetStop(streamKey, channelId) {
+  const existing = streamTargetHandoffStops.get(streamKey);
+  if (existing?.timer) clearTimeout(existing.timer);
+
+  const startedAt = existing?.startedAt || Date.now();
+
+  const scheduleCheck = (delayMs) => {
+    const timer = setTimeout(async () => {
+      const pending = streamTargetHandoffStops.get(streamKey);
+      if (!pending || pending.timer !== timer) return;
+
+      try {
+        const rawStream = await getSrsRawStream(streamKey).catch(() => null);
+
+        if (rawStream) {
+          clearDeferredStreamTargetStop(
+            streamKey,
+            "canonical SRS stream returned during Pull Source handoff",
+          );
+          return;
+        }
+
+        const handoff = await getPullSourceHandoffState(channelId);
+        const elapsedMs = Date.now() - startedAt;
+
+        if (
+          handoff.enabled &&
+          handoff.recoveryExpected &&
+          elapsedMs < STREAM_TARGET_HANDOFF_MAX_MS
+        ) {
+          console.log(
+            `[STREAM-TARGET-HANDOFF] ${streamKey} still recovering ` +
+              `(${Math.round(elapsedMs / 1000)}s); keeping downstream targets alive.`,
+          );
+          scheduleCheck(STREAM_TARGET_HANDOFF_RECHECK_MS);
+          return;
+        }
+
+        streamTargetHandoffStops.delete(streamKey);
+
+        console.log(
+          `[STREAM-TARGET-HANDOFF] Recovery window ended for ${streamKey}; ` +
+            `stopping channel targets as a real source end.`,
+        );
+
+        await streamTargetManager.stopChannelTargets(channelId);
+      } catch (err) {
+        const elapsedMs = Date.now() - startedAt;
+
+        if (elapsedMs < STREAM_TARGET_HANDOFF_MAX_MS) {
+          console.error(
+            `[STREAM-TARGET-HANDOFF] Recovery check failed for ${streamKey}; ` +
+              `retrying without ending targets:`,
+            err.message,
+          );
+          scheduleCheck(STREAM_TARGET_HANDOFF_RECHECK_MS);
+          return;
+        }
+
+        streamTargetHandoffStops.delete(streamKey);
+        console.error(
+          `[STREAM-TARGET-HANDOFF] Recovery check timed out for ${streamKey}; ` +
+            `falling back to normal target stop:`,
+          err.message,
+        );
+
+        streamTargetManager
+          .stopChannelTargets(channelId)
+          .catch((stopErr) =>
+            console.error(
+              `[STREAM-TARGET] Deferred auto-stop failed for channel ${channelId}:`,
+              stopErr.message,
+            ),
+          );
+      }
+    }, delayMs);
+
+    timer.unref?.();
+    streamTargetHandoffStops.set(streamKey, {
+      timer,
+      channelId,
+      startedAt,
+    });
+  };
+
+  scheduleCheck(STREAM_TARGET_HANDOFF_GRACE_MS);
+}
+
 // POST /api/srs/on_publish
 // SRS fires this when a broadcaster connects
 // Return code 0 = allow, code 403 = reject
@@ -9873,6 +10041,14 @@ app.post("/api/srs/on_publish", async (req, res) => {
       return res.json({ code: 403 });
     }
   }
+
+  // If this raw publish returned while a deferred Pull Source handoff stop was
+  // pending, keep downstream targets in their reconnect lifecycle. Do not
+  // auto-start them as a brand-new OAuth/platform broadcast below.
+  const recoveredFromSourceHandoff = clearDeferredStreamTargetStop(
+    streamKey,
+    "canonical source republished",
+  );
 
   try {
     // 0. Auto-reset stale is_live flags older than 2 hours (cleanup)
@@ -9960,17 +10136,24 @@ app.post("/api/srs/on_publish", async (req, res) => {
     // Targets explicitly configured with enabled + auto_start are started
     // after HLS has had time to produce real segments. The manager handles
     // OAuth targets, generic RTMP/RTMPS/SRT targets, reconnects, and metrics.
-    const streamTargetAutoStartTimer = setTimeout(() => {
-      streamTargetManager
-        .startAutoTargets(channel, channel.org_id)
-        .catch((err) =>
-          console.error(
-            `[STREAM-TARGET] Auto-start failed for channel ${channel.id}:`,
-            err.message,
-          ),
-        );
-    }, 5000);
-    streamTargetAutoStartTimer.unref?.();
+    if (recoveredFromSourceHandoff) {
+      console.log(
+        `[STREAM-TARGET-HANDOFF] Skipping fresh target auto-start for ${streamKey}; ` +
+          `existing targets will reconnect to their preserved destination sessions.`,
+      );
+    } else {
+      const streamTargetAutoStartTimer = setTimeout(() => {
+        streamTargetManager
+          .startAutoTargets(channel, channel.org_id)
+          .catch((err) =>
+            console.error(
+              `[STREAM-TARGET] Auto-start failed for channel ${channel.id}:`,
+              err.message,
+            ),
+          );
+      }, 5000);
+      streamTargetAutoStartTimer.unref?.();
+    }
 
     // 5. Notify all connected dashboard clients via socket
     if (io) {
@@ -10096,17 +10279,43 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     const orgId = channelResult.rows[0]?.organization_id;
     const endedChannelId = channelResult.rows[0]?.id;
 
-    // STREAM TARGET AUTO-STOP — stop every running target for this channel,
-    // including platform-side OAuth broadcasts, when the source unpublishes.
+    // STREAM TARGET AUTO-STOP / PULL SOURCE HANDOFF CONTINUITY
+    //
+    // A failover/failback briefly unpublishes the canonical raw stream. When
+    // Pull Source HA is actively recovering, preserve downstream target intent
+    // and platform broadcast IDs instead of ending YouTube/Facebook here.
+    // Their target workers already know how to wait for the internal source and
+    // reconnect to active_destination_url when it returns.
     if (endedChannelId) {
-      streamTargetManager
-        .stopChannelTargets(endedChannelId)
-        .catch((err) =>
-          console.error(
-            `[STREAM-TARGET] Auto-stop failed for channel ${endedChannelId}:`,
-            err.message,
-          ),
+      let preserveForHandoff = false;
+
+      try {
+        const handoff = await getPullSourceHandoffState(endedChannelId);
+        preserveForHandoff = handoff.enabled && handoff.recoveryExpected;
+      } catch (handoffError) {
+        console.error(
+          `[STREAM-TARGET-HANDOFF] Could not inspect Pull Source state for ` +
+            `channel ${endedChannelId}:`,
+          handoffError.message,
         );
+      }
+
+      if (preserveForHandoff) {
+        console.log(
+          `[STREAM-TARGET-HANDOFF] Deferring target stop for ${streamKey}; ` +
+            `Pull Source HA recovery is active.`,
+        );
+        scheduleDeferredStreamTargetStop(streamKey, endedChannelId);
+      } else {
+        streamTargetManager
+          .stopChannelTargets(endedChannelId)
+          .catch((err) =>
+            console.error(
+              `[STREAM-TARGET] Auto-stop failed for channel ${endedChannelId}:`,
+              err.message,
+            ),
+          );
+      }
     }
 
     // Notify dashboard
