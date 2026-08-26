@@ -6745,7 +6745,9 @@ const getPublicWatchStatus = async (streamKey) => {
     if (channelState?.is_live && channelState?.id) {
       try {
         const handoff = await getPullSourceHandoffState(channelState.id);
-        preserveForHandoff = handoff.enabled && handoff.recoveryExpected;
+        preserveForHandoff =
+          (handoff.enabled && handoff.recoveryExpected) ||
+          isStreamHandoffStabilizing(streamKey);
       } catch (handoffError) {
         console.debug(
           `[WATCH-STATUS] Could not inspect Pull Source HA state for ${streamKey}:`,
@@ -9857,7 +9859,40 @@ const STREAM_TARGET_HANDOFF_MAX_MS = Math.max(
   Number(process.env.STREAM_TARGET_HANDOFF_MAX_MS || 90000),
 );
 
+// A failover can involve more than one canonical unpublish/re-publish cycle:
+// Primary disappears -> Backup republishes -> Primary probe/failback swaps the
+// source again. The first successful republish therefore must not immediately
+// make the next unpublish look like a brand-new broadcast end.
+const STREAM_TARGET_HANDOFF_STABILITY_MS = Math.max(
+  5000,
+  Number(process.env.STREAM_TARGET_HANDOFF_STABILITY_MS || 20000),
+);
+
 const streamTargetHandoffStops = new Map();
+const streamHandoffStability = new Map();
+
+function markStreamHandoffStabilizing(streamKey) {
+  streamHandoffStability.set(
+    streamKey,
+    Date.now() + STREAM_TARGET_HANDOFF_STABILITY_MS,
+  );
+}
+
+function isStreamHandoffStabilizing(streamKey) {
+  const until = Number(streamHandoffStability.get(streamKey) || 0);
+  if (!until) return false;
+
+  if (Date.now() >= until) {
+    streamHandoffStability.delete(streamKey);
+    return false;
+  }
+
+  return true;
+}
+
+function clearStreamHandoffStability(streamKey) {
+  streamHandoffStability.delete(streamKey);
+}
 
 async function getPullSourceHandoffState(channelId) {
   const result = await pool.query(
@@ -9910,6 +9945,8 @@ async function finalizeCanonicalStreamEnd(
   streamKey,
   { reason = "source unpublished", stopTargets = true } = {},
 ) {
+  clearStreamHandoffStability(streamKey);
+
   // Changing this generation tells delayed ABR startup/retry work that the
   // previous broadcast really ended. It is deliberately NOT changed during an
   // HA handoff, which keeps viewer/DVR session identity stable.
@@ -10028,9 +10065,13 @@ function clearDeferredStreamTargetStop(streamKey, reason = "source recovered") {
 
   if (pending.timer) clearTimeout(pending.timer);
   streamTargetHandoffStops.delete(streamKey);
+  markStreamHandoffStabilizing(streamKey);
 
   console.log(
-    `[STREAM-TARGET-HANDOFF] Preserving targets for ${streamKey}: ${reason}.`,
+    `[STREAM-TARGET-HANDOFF] Preserving targets for ${streamKey}: ${reason}. ` +
+      `Keeping HA stabilization guard for ${Math.round(
+        STREAM_TARGET_HANDOFF_STABILITY_MS / 1000,
+      )}s.`,
   );
   return true;
 }
@@ -10385,7 +10426,9 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     if (channel?.id) {
       try {
         const handoff = await getPullSourceHandoffState(channel.id);
-        preserveForHandoff = handoff.enabled && handoff.recoveryExpected;
+        preserveForHandoff =
+          (handoff.enabled && handoff.recoveryExpected) ||
+          isStreamHandoffStabilizing(streamKey);
       } catch (handoffError) {
         console.error(
           `[STREAM-TARGET-HANDOFF] Could not inspect Pull Source state for ` +
@@ -10398,7 +10441,11 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     if (preserveForHandoff && channel?.id) {
       console.log(
         `[SRS-HA] Preserving logical live/DVR session for ${streamKey}; ` +
-          `Pull Source HA recovery is active.`,
+          `${
+            isStreamHandoffStabilizing(streamKey)
+              ? "HA stabilization guard is active."
+              : "Pull Source HA recovery is active."
+          }`,
       );
 
       // Keep:
