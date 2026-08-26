@@ -6667,7 +6667,7 @@ const getPublicWatchStatus = async (streamKey) => {
   let channelState = null;
   try {
     const channelResult = await pool.query(
-      `SELECT stream_key, name, is_live, live_started_at,
+      `SELECT id, stream_key, name, is_live, live_started_at,
               EXTRACT(EPOCH FROM (NOW() - live_started_at))::int AS uptime_seconds
        FROM channels
        WHERE stream_key = $1 AND organization_id = $2
@@ -6734,9 +6734,50 @@ const getPublicWatchStatus = async (streamKey) => {
         );
     }
   } else if (srsReachable) {
-    // SRS answered successfully and proved that the raw source is offline.
-    // Repair a stale DB live marker asynchronously.
-    if (channelState?.is_live) {
+    // A Pull Source failover/failback can briefly remove the canonical SRS
+    // publisher even though the logical broadcast is still alive. Before
+    // repairing the DB to "offline", ask the HA controller whether recovery is
+    // actively expected. If it is, preserve the original broadcast identity
+    // (especially live_started_at) so DVR viewers are not kicked into a brand
+    // new session while Primary/Backup switches underneath them.
+    let preserveForHandoff = false;
+
+    if (channelState?.is_live && channelState?.id) {
+      try {
+        const handoff = await getPullSourceHandoffState(channelState.id);
+        preserveForHandoff = handoff.enabled && handoff.recoveryExpected;
+      } catch (handoffError) {
+        console.debug(
+          `[WATCH-STATUS] Could not inspect Pull Source HA state for ${streamKey}:`,
+          handoffError.message,
+        );
+      }
+    }
+
+    if (preserveForHandoff && channelState?.is_live) {
+      activeStream = {
+        name: channelState.stream_key,
+        publish: {
+          active: true,
+          active_age: channelState.uptime_seconds || 0,
+        },
+        clients: 0,
+        kbps: { recv_30s: 0 },
+        source: "ha_recovery",
+        recovering: true,
+        encoderGeneration: bitrateCapEncoderGeneration.get(streamKey) || 0,
+        broadcastGeneration: bitrateCapGeneration.get(streamKey) || 0,
+        liveStartedAtMs: channelState.live_started_at
+          ? new Date(channelState.live_started_at).getTime()
+          : 0,
+      };
+
+      console.debug(
+        `[WATCH-STATUS] Preserving live state for ${streamKey}; Pull Source HA recovery is active.`,
+      );
+    } else if (channelState?.is_live) {
+      // SRS is reachable, the canonical publisher is genuinely absent, and no
+      // HA recovery is expected. This is a real/stale offline marker.
       pool
         .query(
           `UPDATE channels
@@ -9859,6 +9900,128 @@ async function getPullSourceHandoffState(channelId) {
   };
 }
 
+// Final destructive cleanup for a TRUE canonical-source end.
+//
+// Pull Source HA transitions must NOT call this immediately: they preserve the
+// logical broadcast while Primary/Backup is being recovered. The same helper is
+// used after the HA grace window expires so a failed recovery still eventually
+// becomes a normal offline event instead of leaving stale live state forever.
+async function finalizeCanonicalStreamEnd(
+  streamKey,
+  { reason = "source unpublished", stopTargets = true } = {},
+) {
+  // Changing this generation tells delayed ABR startup/retry work that the
+  // previous broadcast really ended. It is deliberately NOT changed during an
+  // HA handoff, which keeps viewer/DVR session identity stable.
+  const endedGeneration = (bitrateCapGeneration.get(streamKey) || 0) + 1;
+  bitrateCapGeneration.set(streamKey, endedGeneration);
+
+  for (const key of transcodeRetryCount.keys()) {
+    if (key.startsWith(`${streamKey}:`)) {
+      transcodeRetryCount.delete(key);
+    }
+  }
+
+  for (const key of abrRecoveryLastAttempt.keys()) {
+    if (key.startsWith(`${streamKey}:`)) {
+      abrRecoveryLastAttempt.delete(key);
+    }
+  }
+
+  for (const key of transcodeStartupLocks.keys()) {
+    if (key.startsWith(`${streamKey}:`)) {
+      transcodeStartupLocks.delete(key);
+    }
+  }
+
+  // Stop renditions only for a real end. During HA they are allowed to ride out
+  // the brief source gap or exit naturally and be recovered when the canonical
+  // publisher returns.
+  for (const [key, proc] of activeTranscodeProcesses.entries()) {
+    if (!key.startsWith(`${streamKey}:`)) continue;
+
+    if (proc && proc.exitCode === null) {
+      console.log(
+        `[Transcode] Stopping ${key} because raw source ${streamKey} ended (${reason}).`,
+      );
+
+      proc.kill("SIGTERM");
+
+      const forceKillTimer = setTimeout(() => {
+        if (proc.exitCode === null) {
+          console.warn(
+            `[Transcode] Force-killing ${key} after graceful shutdown timeout.`,
+          );
+          proc.kill("SIGKILL");
+        }
+      }, 5000);
+      forceKillTimer.unref();
+    }
+
+    activeTranscodeProcesses.delete(key);
+  }
+
+  stickyHlsApp.delete(streamKey);
+
+  for (const key of manifestCache.keys()) {
+    if (
+      key === streamKey ||
+      key.startsWith(`${streamKey}?`) ||
+      key.startsWith(`${streamKey}_`)
+    ) {
+      manifestCache.delete(key);
+    }
+  }
+
+  for (const key of segmentCache.keys()) {
+    if (key.includes(`/${streamKey}/`) || key.includes(`/${streamKey}_`)) {
+      segmentCache.delete(key);
+    }
+  }
+
+  const channelResult = await pool.query(
+    `UPDATE channels
+     SET is_live = FALSE,
+         live_started_at = NULL
+     WHERE stream_key = $1
+     RETURNING id, organization_id`,
+    [streamKey],
+  );
+
+  const orgId = channelResult.rows[0]?.organization_id;
+  const endedChannelId = channelResult.rows[0]?.id;
+
+  if (stopTargets && endedChannelId) {
+    await streamTargetManager
+      .stopChannelTargets(endedChannelId)
+      .catch((err) =>
+        console.error(
+          `[STREAM-TARGET] Auto-stop failed for channel ${endedChannelId}:`,
+          err.message,
+        ),
+      );
+  }
+
+  if (io) {
+    io.emit("stream:offline", {
+      stream_key: streamKey,
+      organization_id: orgId,
+    });
+  }
+
+  if (orgId) {
+    autoSyncRecordingsDelayed(orgId, 8000, endedChannelId, streamKey);
+  }
+
+  console.log(`[SRS] Stream offline: ${streamKey} (${reason})`);
+
+  return {
+    channelId: endedChannelId || null,
+    organizationId: orgId || null,
+    endedGeneration,
+  };
+}
+
 function clearDeferredStreamTargetStop(streamKey, reason = "source recovered") {
   const pending = streamTargetHandoffStops.get(streamKey);
   if (!pending) return false;
@@ -9914,10 +10077,13 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
 
         console.log(
           `[STREAM-TARGET-HANDOFF] Recovery window ended for ${streamKey}; ` +
-            `stopping channel targets as a real source end.`,
+            `finalizing the channel as a real source end.`,
         );
 
-        await streamTargetManager.stopChannelTargets(channelId);
+        await finalizeCanonicalStreamEnd(streamKey, {
+          reason: "Pull Source HA recovery window expired",
+          stopTargets: true,
+        });
       } catch (err) {
         const elapsedMs = Date.now() - startedAt;
 
@@ -9938,14 +10104,15 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
           err.message,
         );
 
-        streamTargetManager
-          .stopChannelTargets(channelId)
-          .catch((stopErr) =>
-            console.error(
-              `[STREAM-TARGET] Deferred auto-stop failed for channel ${channelId}:`,
-              stopErr.message,
-            ),
-          );
+        finalizeCanonicalStreamEnd(streamKey, {
+          reason: "Pull Source HA recovery check timed out",
+          stopTargets: true,
+        }).catch((finalizeErr) =>
+          console.error(
+            `[STREAM-TARGET-HANDOFF] Deferred real-end finalization failed for ${streamKey}:`,
+            finalizeErr.message,
+          ),
+        );
       }
     }, delayMs);
 
@@ -10190,152 +10357,74 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
   }
 
   // Internal receiver targets are outputs, not source channels. Their FFmpeg
-  // lifecycle/status is owned by streamTargetManager, so do not run source
-  // shutdown logic (ABR teardown, channel offline state, target auto-stop,
-  // recording sync, etc.) when an internal-target publish ends.
+  // lifecycle/status is owned by streamTargetManager.
   if (publishApp === "internal-target") {
     console.log(`[SRS] INTERNAL TARGET OFFLINE — ${streamKey}`);
     return res.json({ code: 0 });
   }
 
   try {
-    // Invalidate every delayed startup and retry that belongs to the broadcast
-    // which just ended. A pending startup timer may otherwise spawn
-    // ffmpeg after SRS has already removed the raw source.
-    const endedGeneration = (bitrateCapGeneration.get(streamKey) || 0) + 1;
-    bitrateCapGeneration.set(streamKey, endedGeneration);
-
-    // Clear all retry budgets and recovery cooldowns for this source stream.
-    for (const key of transcodeRetryCount.keys()) {
-      if (key.startsWith(`${streamKey}:`)) {
-        transcodeRetryCount.delete(key);
-      }
-    }
-    for (const key of abrRecoveryLastAttempt.keys()) {
-      if (key.startsWith(`${streamKey}:`)) {
-        abrRecoveryLastAttempt.delete(key);
-      }
-    }
-    for (const key of transcodeStartupLocks.keys()) {
-      if (key.startsWith(`${streamKey}:`)) {
-        transcodeStartupLocks.delete(key);
-      }
-    }
-
-    // Stop any active rendition process that is still consuming this source.
-    for (const [key, proc] of activeTranscodeProcesses.entries()) {
-      if (!key.startsWith(`${streamKey}:`)) continue;
-
-      if (proc && proc.exitCode === null) {
-        console.log(
-          `[Transcode] Stopping ${key} because raw source ${streamKey} unpublished.`,
-        );
-
-        proc.kill("SIGTERM");
-
-        const forceKillTimer = setTimeout(() => {
-          if (proc.exitCode === null) {
-            console.warn(
-              `[Transcode] Force-killing ${key} after graceful shutdown timeout.`,
-            );
-            proc.kill("SIGKILL");
-          }
-        }, 5000);
-        forceKillTimer.unref();
-      }
-
-      activeTranscodeProcesses.delete(key);
-    }
-
-    // Remove every manifest/segment cache entry tied to the ended source or
-    // one of its suffixed ABR rendition streams. This prevents stale manifests
-    // from referencing SRS segment files that were already deleted.
-    stickyHlsApp.delete(streamKey);
-
-    for (const key of manifestCache.keys()) {
-      if (
-        key === streamKey ||
-        key.startsWith(`${streamKey}?`) ||
-        key.startsWith(`${streamKey}_`)
-      ) {
-        manifestCache.delete(key);
-      }
-    }
-
-    for (const key of segmentCache.keys()) {
-      if (key.includes(`/${streamKey}/`) || key.includes(`/${streamKey}_`)) {
-        segmentCache.delete(key);
-      }
-    }
-
-    // Mark channel offline
-    const channelResult = await pool.query(
-      `UPDATE channels SET is_live = FALSE, live_started_at = NULL
+    // CLASSIFY THE END BEFORE MUTATING BROADCAST STATE.
+    //
+    // Previously this handler immediately incremented broadcast generation,
+    // killed ABR workers, cleared HLS caches, and set
+    // is_live=FALSE/live_started_at=NULL, then checked Pull Source HA afterward.
+    // That made a normal Primary -> Backup handoff look like a brand-new
+    // broadcast to the Watch Page and destroyed DVR/session continuity.
+    const channelLookup = await pool.query(
+      `SELECT id, organization_id, is_live, live_started_at
+       FROM channels
        WHERE stream_key = $1
-       RETURNING id, organization_id`,
+       LIMIT 1`,
       [streamKey],
     );
 
-    const orgId = channelResult.rows[0]?.organization_id;
-    const endedChannelId = channelResult.rows[0]?.id;
+    const channel = channelLookup.rows[0] || null;
+    let preserveForHandoff = false;
 
-    // STREAM TARGET AUTO-STOP / PULL SOURCE HANDOFF CONTINUITY
-    //
-    // A failover/failback briefly unpublishes the canonical raw stream. When
-    // Pull Source HA is actively recovering, preserve downstream target intent
-    // and platform broadcast IDs instead of ending YouTube/Facebook here.
-    // Their target workers already know how to wait for the internal source and
-    // reconnect to active_destination_url when it returns.
-    if (endedChannelId) {
-      let preserveForHandoff = false;
-
+    if (channel?.id) {
       try {
-        const handoff = await getPullSourceHandoffState(endedChannelId);
+        const handoff = await getPullSourceHandoffState(channel.id);
         preserveForHandoff = handoff.enabled && handoff.recoveryExpected;
       } catch (handoffError) {
         console.error(
           `[STREAM-TARGET-HANDOFF] Could not inspect Pull Source state for ` +
-            `channel ${endedChannelId}:`,
+            `channel ${channel.id}:`,
           handoffError.message,
         );
       }
-
-      if (preserveForHandoff) {
-        console.log(
-          `[STREAM-TARGET-HANDOFF] Deferring target stop for ${streamKey}; ` +
-            `Pull Source HA recovery is active.`,
-        );
-        scheduleDeferredStreamTargetStop(streamKey, endedChannelId);
-      } else {
-        streamTargetManager
-          .stopChannelTargets(endedChannelId)
-          .catch((err) =>
-            console.error(
-              `[STREAM-TARGET] Auto-stop failed for channel ${endedChannelId}:`,
-              err.message,
-            ),
-          );
-      }
     }
 
-    // Notify dashboard
-    if (io) {
-      io.emit("stream:offline", {
-        stream_key: streamKey,
-        organization_id: orgId,
-      });
+    if (preserveForHandoff && channel?.id) {
+      console.log(
+        `[SRS-HA] Preserving logical live/DVR session for ${streamKey}; ` +
+          `Pull Source HA recovery is active.`,
+      );
+
+      // Keep:
+      //   channels.is_live = TRUE
+      //   channels.live_started_at = original timestamp
+      //   bitrateCapGeneration unchanged
+      //   HLS/segment caches intact
+      //   stream:offline suppressed
+      //   recording finalization deferred
+      //   downstream platform sessions preserved
+      //
+      // If the canonical stream never returns, the deferred HA watcher will
+      // call finalizeCanonicalStreamEnd() after the configured maximum window.
+      scheduleDeferredStreamTargetStop(streamKey, channel.id);
+      return res.json({ code: 0 });
     }
 
-    // Auto-sync recordings after stream ends (wait for SRS to write files)
-    if (orgId) {
-      autoSyncRecordingsDelayed(orgId, 8000, endedChannelId, streamKey);
-    }
+    await finalizeCanonicalStreamEnd(streamKey, {
+      reason: "canonical source unpublished",
+      stopTargets: true,
+    });
 
-    console.log(`[SRS] Stream offline: ${streamKey}`);
-    res.json({ code: 0 });
+    return res.json({ code: 0 });
   } catch (err) {
     console.error("[SRS] on_unpublish error:", err.message);
-    res.json({ code: 0 });
+    return res.json({ code: 0 });
   }
 });
 
