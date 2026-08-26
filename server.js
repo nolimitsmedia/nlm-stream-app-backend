@@ -6745,9 +6745,14 @@ const getPublicWatchStatus = async (streamKey) => {
     if (channelState?.is_live && channelState?.id) {
       try {
         const handoff = await getPullSourceHandoffState(channelState.id);
+        const intentionalStop = getPullSourceIntentionalStop(channelState.id);
+
         preserveForHandoff =
-          (handoff.enabled && handoff.recoveryExpected) ||
-          isStreamHandoffStabilizing(streamKey);
+          !intentionalStop &&
+          ((handoff.enabled &&
+            handoff.managedSession &&
+            handoff.enabledReconnectSources > 0) ||
+            isStreamHandoffStabilizing(streamKey));
       } catch (handoffError) {
         console.debug(
           `[WATCH-STATUS] Could not inspect Pull Source HA state for ${streamKey}:`,
@@ -9871,6 +9876,62 @@ const STREAM_TARGET_HANDOFF_STABILITY_MS = Math.max(
 const streamTargetHandoffStops = new Map();
 const streamHandoffStability = new Map();
 
+// Explicit operator/API stop intent. Pull Source service already has an internal
+// `manualStop` flag, but that flag is not exposed to server.js and the SRS
+// on_unpublish webhook can race the DB updates performed by stopSource().
+// Track intent here BEFORE the worker is terminated so the logical-broadcast
+// classifier can reliably distinguish:
+//   transport/source failure -> preserve HA session
+//   operator Disable/Delete/Stop -> finalize broadcast
+const PULL_SOURCE_INTENTIONAL_STOP_TTL_MS = Math.max(
+  10000,
+  Number(process.env.PULL_SOURCE_INTENTIONAL_STOP_TTL_MS || 30000),
+);
+const pullSourceIntentionalStops = new Map();
+
+function markPullSourceIntentionalStop(channelId, reason = "manual_stop") {
+  const id = Number(channelId);
+  if (!Number.isInteger(id) || id <= 0) return;
+
+  pullSourceIntentionalStops.set(id, {
+    reason: String(reason || "manual_stop"),
+    expiresAt: Date.now() + PULL_SOURCE_INTENTIONAL_STOP_TTL_MS,
+  });
+}
+
+function clearPullSourceIntentionalStop(channelId) {
+  const id = Number(channelId);
+  if (Number.isInteger(id) && id > 0) {
+    pullSourceIntentionalStops.delete(id);
+  }
+}
+
+function getPullSourceIntentionalStop(channelId) {
+  const id = Number(channelId);
+  const entry = pullSourceIntentionalStops.get(id);
+  if (!entry) return null;
+
+  if (Date.now() >= Number(entry.expiresAt || 0)) {
+    pullSourceIntentionalStops.delete(id);
+    return null;
+  }
+
+  return entry;
+}
+
+// Reasons written by pull_source_service when a canonical channel is actively
+// owned/recovered by the Pull Source state machine. `source_stopped` is
+// deliberately absent: after an intentional stop a later direct OBS/RTMP
+// broadcast must not inherit Pull Source HA preservation.
+const PULL_SOURCE_MANAGED_SWITCH_REASONS = new Set([
+  "source_start",
+  "source_switch",
+  "automatic_failover",
+  "automatic_failback",
+  "automatic_source_recovery",
+  "retry_current_source",
+]);
+
 function markStreamHandoffStabilizing(streamKey) {
   streamHandoffStability.set(
     streamKey,
@@ -9900,6 +9961,12 @@ async function getPullSourceHandoffState(channelId) {
     SELECT
       f.enabled,
       f.active_source_id,
+      f.last_switch_reason,
+      f.last_switch_at,
+      COUNT(ps.id) FILTER (
+        WHERE ps.enabled = TRUE
+          AND COALESCE(ps.auto_reconnect, FALSE) = TRUE
+      )::int AS enabled_reconnect_sources,
       COALESCE(
         BOOL_OR(
           ps.enabled = TRUE
@@ -9921,17 +9988,40 @@ async function getPullSourceHandoffState(channelId) {
     LEFT JOIN channel_pull_sources ps
       ON ps.channel_id = f.channel_id
     WHERE f.channel_id = $1
-    GROUP BY f.channel_id, f.enabled, f.active_source_id
+    GROUP BY
+      f.channel_id,
+      f.enabled,
+      f.active_source_id,
+      f.last_switch_reason,
+      f.last_switch_at
     LIMIT 1
     `,
     [channelId],
   );
 
   const row = result.rows[0];
+  const activeSourceId = row?.active_source_id ?? null;
+  const lastSwitchReason = String(row?.last_switch_reason || "");
+  const enabledReconnectSources = Number(row?.enabled_reconnect_sources || 0);
+
+  // `recoveryExpected` is an instantaneous worker-health observation and may
+  // legitimately flicker false between FFmpeg exit, DB state update, and SRS
+  // on_unpublish. `managedSession` answers the different question we actually
+  // need for logical broadcast continuity: is this live channel owned by the
+  // Pull Source HA state machine?
+  const managedSession = Boolean(
+    activeSourceId != null ||
+    PULL_SOURCE_MANAGED_SWITCH_REASONS.has(lastSwitchReason),
+  );
+
   return {
     enabled: Boolean(row?.enabled),
-    activeSourceId: row?.active_source_id ?? null,
+    activeSourceId,
     recoveryExpected: Boolean(row?.recovery_expected),
+    managedSession,
+    enabledReconnectSources,
+    lastSwitchReason: lastSwitchReason || null,
+    lastSwitchAt: row?.last_switch_at || null,
   };
 }
 
@@ -10027,6 +10117,10 @@ async function finalizeCanonicalStreamEnd(
 
   const orgId = channelResult.rows[0]?.organization_id;
   const endedChannelId = channelResult.rows[0]?.id;
+
+  if (endedChannelId) {
+    clearPullSourceIntentionalStop(endedChannelId);
+  }
 
   if (stopTargets && endedChannelId) {
     await streamTargetManager
@@ -10421,14 +10515,19 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     );
 
     const channel = channelLookup.rows[0] || null;
-    let preserveForHandoff = false;
+    let handoff = {
+      enabled: false,
+      activeSourceId: null,
+      recoveryExpected: false,
+      managedSession: false,
+      enabledReconnectSources: 0,
+      lastSwitchReason: null,
+      lastSwitchAt: null,
+    };
 
     if (channel?.id) {
       try {
-        const handoff = await getPullSourceHandoffState(channel.id);
-        preserveForHandoff =
-          (handoff.enabled && handoff.recoveryExpected) ||
-          isStreamHandoffStabilizing(streamKey);
+        handoff = await getPullSourceHandoffState(channel.id);
       } catch (handoffError) {
         console.error(
           `[STREAM-TARGET-HANDOFF] Could not inspect Pull Source state for ` +
@@ -10438,13 +10537,52 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
       }
     }
 
+    const intentionalStop = channel?.id
+      ? getPullSourceIntentionalStop(channel.id)
+      : null;
+    const stabilizing = isStreamHandoffStabilizing(streamKey);
+
+    // IMPORTANT: do not use recoveryExpected as the gate. It is deliberately
+    // retained as telemetry/logging, but it can flicker false during the exact
+    // race between FFmpeg exit and the SRS webhook. Logical HA ownership is
+    // based on the already-live channel + enabled HA configuration + evidence
+    // that the channel is managed by Pull Sources.
+    const haCandidate = Boolean(
+      channel?.id &&
+      channel?.is_live &&
+      handoff.enabled &&
+      handoff.managedSession &&
+      handoff.enabledReconnectSources > 0,
+    );
+
+    const preserveForHandoff = Boolean(
+      !intentionalStop && (haCandidate || stabilizing),
+    );
+
+    console.log(
+      `[SRS-HA-CLASSIFY] stream=${streamKey} ` +
+        `channel=${channel?.id ?? "null"} ` +
+        `channelIsLive=${Boolean(channel?.is_live)} ` +
+        `haEnabled=${Boolean(handoff.enabled)} ` +
+        `managedSession=${Boolean(handoff.managedSession)} ` +
+        `activeSourceId=${handoff.activeSourceId ?? "null"} ` +
+        `enabledReconnectSources=${handoff.enabledReconnectSources} ` +
+        `recoveryExpected=${Boolean(handoff.recoveryExpected)} ` +
+        `stabilizing=${stabilizing} ` +
+        `intentionalStop=${Boolean(intentionalStop)} ` +
+        `lastSwitchReason=${handoff.lastSwitchReason || "null"} ` +
+        `decision=${preserveForHandoff ? "PRESERVE" : "FINALIZE"}`,
+    );
+
     if (preserveForHandoff && channel?.id) {
       console.log(
         `[SRS-HA] Preserving logical live/DVR session for ${streamKey}; ` +
           `${
-            isStreamHandoffStabilizing(streamKey)
+            stabilizing
               ? "HA stabilization guard is active."
-              : "Pull Source HA recovery is active."
+              : handoff.recoveryExpected
+                ? "Pull Source HA recovery is active."
+                : "logical Pull Source HA ownership is active while transport state converges."
           }`,
       );
 
@@ -11976,6 +12114,47 @@ const pullSourceManager = registerPullSourceRoutes(app, pool, {
   requireRole,
   requireOrganizationRole,
 });
+
+// Explicitly bridge Pull Source operator/API intent into server.js's logical
+// broadcast classifier. The routes call manager.stopSource dynamically, so this
+// wrapper runs BEFORE the underlying service sends SIGTERM. Internal automatic
+// failover/failback source switches call the service's private stopSource()
+// closure and intentionally bypass this marker.
+const originalPullSourceStop =
+  pullSourceManager.stopSource.bind(pullSourceManager);
+pullSourceManager.stopSource = async (source, options = {}) => {
+  const channelId = Number(source?.channel_id);
+  markPullSourceIntentionalStop(
+    channelId,
+    options.reason || "operator_pull_source_stop",
+  );
+
+  try {
+    return await originalPullSourceStop(source, options);
+  } catch (error) {
+    // If the stop itself failed before it could take effect, do not leave a
+    // stale intent marker that would turn a later genuine transport failure
+    // into an unintended FINALIZE decision.
+    clearPullSourceIntentionalStop(channelId);
+    throw error;
+  }
+};
+
+// A subsequent explicit Start/Make Active begins a new managed source lifecycle
+// and must clear any short-lived stop marker left by a previous operator action.
+const originalPullSourceStart =
+  pullSourceManager.startSource.bind(pullSourceManager);
+pullSourceManager.startSource = async (source, channel, options = {}) => {
+  clearPullSourceIntentionalStop(source?.channel_id || channel?.id);
+  return originalPullSourceStart(source, channel, options);
+};
+
+const originalPullSourceActivate =
+  pullSourceManager.activateSource.bind(pullSourceManager);
+pullSourceManager.activateSource = async (source, channel, options = {}) => {
+  clearPullSourceIntentionalStop(source?.channel_id || channel?.id);
+  return originalPullSourceActivate(source, channel, options);
+};
 
 // OAuth routes are mounted AFTER Stream Targets so disconnecting an OAuth
 // account can safely stop any active target/platform broadcast before the
