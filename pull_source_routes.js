@@ -12,6 +12,8 @@ const {
   maskSourceUrl,
 } = require("./pull_source_schema");
 
+const { createHaEventService } = require("./ha_event_service");
+
 function sanitize(row, runtime = null) {
   if (!row) return row;
   const merged = { ...row, ...(runtime || {}) };
@@ -48,6 +50,7 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
   } = deps;
 
   const manager = createPullSourceManager({ pool });
+  const haEvents = createHaEventService(pool);
 
   const manageMw = [
     authenticateAdmin,
@@ -145,6 +148,490 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
         res
           .status(500)
           .json({ ok: false, message: "Failed to fetch Pull Sources" });
+      }
+    },
+  );
+
+  // Read-only HA / failover event history.
+  // Tenant isolation is enforced by getOwnedChannel() before history is read.
+  app.get(
+    "/api/channels/:channelId/ha-health",
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    async (req, res) => {
+      try {
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+
+        if (!channel) {
+          return res.status(404).json({
+            ok: false,
+            message: "Channel not found",
+          });
+        }
+
+        const channelId = channel.id;
+        const organizationId = req.organization.id;
+
+        const summaryResult = await pool.query(
+          `
+          SELECT
+            COUNT(*) FILTER (
+              WHERE event_type = 'primary_failed'
+            )::int AS primary_failures,
+
+            COUNT(*) FILTER (
+              WHERE event_type = 'failover_started'
+            )::int AS failovers_started,
+
+            COUNT(*) FILTER (
+              WHERE event_type = 'backup_activated'
+            )::int AS backup_activations,
+
+            COUNT(*) FILTER (
+              WHERE event_type = 'failback_started'
+            )::int AS failbacks_started,
+
+            COUNT(*) FILTER (
+              WHERE event_type = 'primary_restored'
+            )::int AS primary_restorations,
+
+            COUNT(*) FILTER (
+              WHERE event_type = 'switch_failed'
+            )::int AS failed_switches,
+
+            COUNT(*) FILTER (
+              WHERE event_type IN (
+                'source_recovered',
+                'backend_restart_recovery'
+              )
+            )::int AS recoveries,
+
+            MAX(created_at) FILTER (
+              WHERE event_type = 'primary_failed'
+            ) AS last_primary_failure,
+
+            MAX(created_at) FILTER (
+              WHERE event_type = 'backup_activated'
+            ) AS last_failover,
+
+            MAX(created_at) FILTER (
+              WHERE event_type = 'primary_restored'
+            ) AS last_failback,
+
+            MAX(created_at) AS last_ha_event
+
+          FROM channel_ha_events
+
+          WHERE channel_id = $1
+            AND organization_id = $2
+          `,
+          [channelId, organizationId],
+        );
+
+        const incidentMetricsResult = await pool.query(
+          `
+          WITH failures AS (
+            SELECT
+              id,
+              created_at AS failed_at
+            FROM channel_ha_events
+            WHERE channel_id = $1
+              AND organization_id = $2
+              AND event_type IN (
+                'primary_failed',
+                'active_source_failed'
+              )
+            ORDER BY created_at
+          ),
+
+          paired_failovers AS (
+            SELECT
+              f.id AS failure_event_id,
+              f.failed_at,
+              b.id AS backup_event_id,
+              b.created_at AS backup_activated_at,
+
+              EXTRACT(
+                EPOCH FROM (b.created_at - f.failed_at)
+              ) * 1000 AS failover_ms
+
+            FROM failures f
+
+            LEFT JOIN LATERAL (
+              SELECT
+                id,
+                created_at
+              FROM channel_ha_events e
+              WHERE e.channel_id = $1
+                AND e.organization_id = $2
+                AND e.event_type = 'backup_activated'
+                AND e.created_at >= f.failed_at
+              ORDER BY e.created_at
+              LIMIT 1
+            ) b ON TRUE
+          ),
+
+          paired_switches AS (
+            SELECT
+              fs.id AS failover_started_event_id,
+              fs.created_at AS failover_started_at,
+              ba.id AS backup_activated_event_id,
+              ba.created_at AS backup_activated_at,
+
+              EXTRACT(
+                EPOCH FROM (
+                  ba.created_at - fs.created_at
+                )
+              ) * 1000 AS switch_ms
+
+            FROM channel_ha_events fs
+
+            LEFT JOIN LATERAL (
+              SELECT
+                id,
+                created_at
+              FROM channel_ha_events e
+              WHERE e.channel_id = $1
+                AND e.organization_id = $2
+                AND e.event_type = 'backup_activated'
+                AND e.created_at >= fs.created_at
+              ORDER BY e.created_at
+              LIMIT 1
+            ) ba ON TRUE
+
+            WHERE fs.channel_id = $1
+              AND fs.organization_id = $2
+              AND fs.event_type = 'failover_started'
+          ),
+
+          paired_failbacks AS (
+            SELECT
+              fb.id AS failback_started_event_id,
+              fb.created_at AS failback_started_at,
+              pr.id AS primary_restored_event_id,
+              pr.created_at AS primary_restored_at,
+
+              EXTRACT(
+                EPOCH FROM (
+                  pr.created_at - fb.created_at
+                )
+              ) * 1000 AS failback_ms
+
+            FROM channel_ha_events fb
+
+            LEFT JOIN LATERAL (
+              SELECT
+                id,
+                created_at
+              FROM channel_ha_events e
+              WHERE e.channel_id = $1
+                AND e.organization_id = $2
+                AND e.event_type = 'primary_restored'
+                AND e.created_at >= fb.created_at
+              ORDER BY e.created_at
+              LIMIT 1
+            ) pr ON TRUE
+
+            WHERE fb.channel_id = $1
+              AND fb.organization_id = $2
+              AND fb.event_type = 'failback_started'
+          )
+
+          SELECT
+            (
+              SELECT COUNT(*)
+              FROM paired_failovers
+              WHERE backup_activated_at IS NOT NULL
+            )::int AS successful_failovers,
+
+            (
+              SELECT COUNT(*)
+              FROM paired_failovers
+              WHERE backup_activated_at IS NULL
+            )::int AS incomplete_failovers,
+
+            (
+              SELECT ROUND(AVG(failover_ms))::bigint
+              FROM paired_failovers
+              WHERE failover_ms IS NOT NULL
+            ) AS avg_failover_incident_ms,
+
+            (
+              SELECT ROUND(MAX(failover_ms))::bigint
+              FROM paired_failovers
+              WHERE failover_ms IS NOT NULL
+            ) AS worst_failover_incident_ms,
+
+            (
+              SELECT ROUND(failover_ms)::bigint
+              FROM paired_failovers
+              WHERE failover_ms IS NOT NULL
+              ORDER BY failed_at DESC
+              LIMIT 1
+            ) AS last_failover_incident_ms,
+
+            (
+              SELECT ROUND(AVG(switch_ms))::bigint
+              FROM paired_switches
+              WHERE switch_ms IS NOT NULL
+            ) AS avg_switch_ms,
+
+            (
+              SELECT ROUND(switch_ms)::bigint
+              FROM paired_switches
+              WHERE switch_ms IS NOT NULL
+              ORDER BY failover_started_at DESC
+              LIMIT 1
+            ) AS last_switch_ms,
+
+            (
+              SELECT ROUND(AVG(failback_ms))::bigint
+              FROM paired_failbacks
+              WHERE failback_ms IS NOT NULL
+            ) AS avg_failback_ms,
+
+            (
+              SELECT ROUND(failback_ms)::bigint
+              FROM paired_failbacks
+              WHERE failback_ms IS NOT NULL
+              ORDER BY failback_started_at DESC
+              LIMIT 1
+            ) AS last_failback_ms
+          `,
+          [channelId, organizationId],
+        );
+
+        const stateResult = await pool.query(
+          `
+          SELECT
+            f.channel_id,
+            f.enabled,
+            f.active_source_id,
+            f.last_switch_reason,
+            f.last_switch_at,
+
+            s.name AS active_source_name,
+            s.role AS active_source_role,
+            s.priority AS active_source_priority,
+            s.status AS active_source_status,
+            s.health_status AS active_source_health,
+            s.is_running AS active_source_running
+
+          FROM channel_source_failover f
+
+          LEFT JOIN channel_pull_sources s
+            ON s.id = f.active_source_id
+           AND s.organization_id = $2
+
+          WHERE f.channel_id = $1
+          `,
+          [channelId, organizationId],
+        );
+
+        const sourcesResult = await pool.query(
+          `
+          SELECT
+            id,
+            name,
+            role,
+            priority,
+            status,
+            health_status,
+            is_running,
+            is_active_source,
+            reconnect_count
+          FROM channel_pull_sources
+          WHERE channel_id = $1
+            AND organization_id = $2
+            AND enabled = TRUE
+          ORDER BY
+            CASE WHEN role = 'primary' THEN 0 ELSE 1 END,
+            priority ASC,
+            id ASC
+          `,
+          [channelId, organizationId],
+        );
+
+        const summary = summaryResult.rows[0] || {};
+        const incidentMetrics = incidentMetricsResult.rows[0] || {};
+        const state = stateResult.rows[0] || null;
+
+        const sources = (sourcesResult.rows || []).map((source) => {
+          const runtime = manager.getRuntimeState(source.id);
+
+          return {
+            ...source,
+            runtime: runtime || null,
+            bitrate_kbps: Number(runtime?.bitrate_kbps || 0),
+            uptime_seconds: Number(runtime?.uptime_seconds || 0),
+            out_time_ms: Number(runtime?.out_time_ms || 0),
+            runtime_status: runtime?.status || null,
+            runtime_last_error: runtime?.last_error || null,
+          };
+        });
+
+        const activeHealthy =
+          Boolean(state?.active_source_running) &&
+          String(state?.active_source_status || "").toLowerCase() === "streaming" &&
+          String(state?.active_source_health || "").toLowerCase() === "healthy";
+
+        const systemStatus = !state?.enabled
+          ? "disabled"
+          : activeHealthy
+            ? "healthy"
+            : state?.active_source_id
+              ? "degraded"
+              : "unavailable";
+
+        res.json({
+          ok: true,
+          channel: {
+            id: channel.id,
+            name: channel.name,
+            stream_key: channel.stream_key,
+          },
+          health: {
+            status: systemStatus,
+            failover_enabled: Boolean(state?.enabled),
+            active_source: state
+              ? {
+                  id: state.active_source_id,
+                  name: state.active_source_name,
+                  role: state.active_source_role,
+                  priority: state.active_source_priority,
+                  status: state.active_source_status,
+                  health_status: state.active_source_health,
+                  is_running: Boolean(state.active_source_running),
+                }
+              : null,
+            last_switch_reason: state?.last_switch_reason || null,
+            last_switch_at: state?.last_switch_at || null,
+          },
+          metrics: {
+            primary_failures: Number(summary.primary_failures || 0),
+            failovers_started: Number(summary.failovers_started || 0),
+            backup_activations: Number(summary.backup_activations || 0),
+            failbacks_started: Number(summary.failbacks_started || 0),
+            primary_restorations: Number(summary.primary_restorations || 0),
+            failed_switches: Number(summary.failed_switches || 0),
+            recoveries: Number(summary.recoveries || 0),
+            last_primary_failure: summary.last_primary_failure || null,
+            last_failover: summary.last_failover || null,
+            last_failback: summary.last_failback || null,
+            last_ha_event: summary.last_ha_event || null,
+
+            successful_failovers: Number(
+              incidentMetrics.successful_failovers || 0
+            ),
+
+            incomplete_failovers: Number(
+              incidentMetrics.incomplete_failovers || 0
+            ),
+
+            avg_failover_incident_ms:
+              incidentMetrics.avg_failover_incident_ms == null
+                ? null
+                : Number(incidentMetrics.avg_failover_incident_ms),
+
+            worst_failover_incident_ms:
+              incidentMetrics.worst_failover_incident_ms == null
+                ? null
+                : Number(incidentMetrics.worst_failover_incident_ms),
+
+            last_failover_incident_ms:
+              incidentMetrics.last_failover_incident_ms == null
+                ? null
+                : Number(incidentMetrics.last_failover_incident_ms),
+
+            avg_switch_ms:
+              incidentMetrics.avg_switch_ms == null
+                ? null
+                : Number(incidentMetrics.avg_switch_ms),
+
+            last_switch_ms:
+              incidentMetrics.last_switch_ms == null
+                ? null
+                : Number(incidentMetrics.last_switch_ms),
+
+            avg_failback_ms:
+              incidentMetrics.avg_failback_ms == null
+                ? null
+                : Number(incidentMetrics.avg_failback_ms),
+
+            last_failback_ms:
+              incidentMetrics.last_failback_ms == null
+                ? null
+                : Number(incidentMetrics.last_failback_ms),
+          },
+          sources,
+        });
+      } catch (error) {
+        console.error("Get HA Health Error:", error);
+
+        res.status(500).json({
+          ok: false,
+          message: "Failed to fetch HA health",
+        });
+      }
+    },
+  );
+
+  app.get(
+    "/api/channels/:channelId/ha-events",
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    async (req, res) => {
+      try {
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+
+        if (!channel) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Channel not found" });
+        }
+
+        const limit = positiveInt(req.query.limit, 50, 1, 500);
+
+        const eventType = String(
+          req.query.event_type || req.query.eventType || "",
+        ).trim() || null;
+
+        const status =
+          String(req.query.status || "").trim() || null;
+
+        const events = await haEvents.getChannelHistory(
+          channel.id,
+          req.organization.id,
+          {
+            limit,
+            eventType,
+            status,
+          },
+        );
+
+        res.json({
+          ok: true,
+          channel: {
+            id: channel.id,
+            name: channel.name,
+            stream_key: channel.stream_key,
+          },
+          count: events.length,
+          events,
+        });
+      } catch (error) {
+        console.error("Get HA Event History Error:", error);
+
+        res.status(500).json({
+          ok: false,
+          message: "Failed to fetch HA event history",
+        });
       }
     },
   );

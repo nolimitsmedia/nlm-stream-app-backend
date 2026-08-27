@@ -7,6 +7,7 @@ const { spawn } = require("child_process");
 const dns = require("dns").promises;
 const net = require("net");
 const { decryptSourceUrl, maskSourceUrl } = require("./pull_source_schema");
+const { createHaEventService } = require("./ha_event_service");
 
 const SUPPORTED_PROTOCOLS = Object.freeze({
   rtmp: { label: "RTMP", schemes: ["rtmp:"] },
@@ -441,6 +442,7 @@ function buildWorkerArgs(sourceUrl, protocol, streamKey) {
 function createPullSourceManager({ pool }) {
   const states = new Map();
   const failbackStableSince = new Map();
+  const haEvents = createHaEventService(pool);
   let failoverMonitorBusy = false;
 
   function getState(id) {
@@ -791,6 +793,41 @@ function createPullSourceManager({ pool }) {
       last_error_code: null,
     });
 
+    // HA history is recorded only AFTER media delivery and DB ownership are
+    // confirmed. Event logging is best-effort and must never affect streaming.
+    const activationReason = options.reason || "source_start";
+
+    let activationEventType = "source_activated";
+
+    if (activationReason === "automatic_failover") {
+      activationEventType = "backup_activated";
+    } else if (activationReason === "automatic_failback") {
+      activationEventType = "primary_restored";
+    } else if (activationReason === "automatic_source_recovery") {
+      activationEventType = "source_recovered";
+    } else if (activationReason === "retry_current_source") {
+      activationEventType = "source_recovered";
+    } else if (activationReason === "backend_restart") {
+      activationEventType = "backend_restart_recovery";
+    }
+
+    await haEvents.recordEvent({
+      organizationId: freshSource.organization_id,
+      channelId: freshSource.channel_id,
+      eventType: activationEventType,
+      sourceId: freshSource.id,
+      previousSourceId: current?.id || null,
+      newSourceId: freshSource.id,
+      reason: activationReason,
+      status: "completed",
+      metadata: {
+        sourceName: freshSource.name || null,
+        sourceRole: freshSource.role || null,
+        protocol: freshSource.protocol || null,
+        reconnecting: Boolean(options.reconnecting),
+      },
+    });
+
     if (String(freshSource.role || "backup") === "backup") {
       failbackStableSince.delete(Number(freshSource.channel_id));
     }
@@ -844,6 +881,27 @@ function createPullSourceManager({ pool }) {
       `[PULL-SOURCE-FAILOVER] Active #${source.id} failed. Waiting ${thresholdMs}ms before selecting backup: ${failure.message}`,
     );
 
+    await haEvents.recordEvent({
+      organizationId: source.organization_id,
+      channelId: source.channel_id,
+      eventType:
+        String(source.role || "").toLowerCase() === "primary"
+          ? "primary_failed"
+          : "active_source_failed",
+      sourceId: source.id,
+      previousSourceId: source.id,
+      reason: failure.code || "source_connection_interrupted",
+      status: "detected",
+      metadata: {
+        sourceName: source.name || null,
+        sourceRole: source.role || null,
+        message: failure.message || null,
+        retryable: failure.retryable !== false,
+        failoverThresholdMs: thresholdMs,
+        reconnectCount: state.reconnectCount,
+      },
+    });
+
     state.retryTimer = setTimeout(async () => {
       state.retryTimer = null;
       if (state.manualStop) return;
@@ -856,6 +914,23 @@ function createPullSourceManager({ pool }) {
           console.warn(
             `[PULL-SOURCE-FAILOVER] Switching channel ${channel.id} from #${source.id} to #${candidate.id} (${candidate.name}).`,
           );
+
+          await haEvents.recordEvent({
+            organizationId: source.organization_id,
+            channelId: source.channel_id,
+            eventType: "failover_started",
+            sourceId: source.id,
+            previousSourceId: source.id,
+            newSourceId: candidate.id,
+            reason: "automatic_failover",
+            status: "started",
+            metadata: {
+              previousSourceName: source.name || null,
+              newSourceName: candidate.name || null,
+              thresholdMs,
+            },
+          });
+
           await activateSource(candidate, channel, {
             reason: "automatic_failover",
             reconnecting: true,
@@ -878,6 +953,19 @@ function createPullSourceManager({ pool }) {
           `[PULL-SOURCE-FAILOVER] Recovery failed for channel ${channel.id}:`,
           error.message,
         );
+
+        await haEvents.recordEvent({
+          organizationId: source.organization_id,
+          channelId: source.channel_id,
+          eventType: "switch_failed",
+          sourceId: source.id,
+          previousSourceId: source.id,
+          reason: "automatic_failover",
+          status: "failed",
+          metadata: {
+            message: error.message || null,
+          },
+        });
       }
     }, thresholdMs);
     state.retryTimer.unref?.();
@@ -1367,6 +1455,23 @@ function createPullSourceManager({ pool }) {
         console.warn(
           `[PULL-SOURCE-FAILBACK] Primary #${primary.id} has been healthy for ${Math.round(stableForMs / 1000)}s; switching channel ${channelId} back.`,
         );
+
+        await haEvents.recordEvent({
+          organizationId: row.organization_id,
+          channelId,
+          eventType: "failback_started",
+          sourceId: primary.id,
+          previousSourceId: row.active_source_id || null,
+          newSourceId: primary.id,
+          reason: "automatic_failback",
+          status: "started",
+          metadata: {
+            primaryName: primary.name || null,
+            stableForMs,
+            requiredMs,
+          },
+        });
+
         await activateSource(
           primary,
           { id: row.channel_id, stream_key: row.stream_key },
