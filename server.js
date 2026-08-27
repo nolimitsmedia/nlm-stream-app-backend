@@ -21,6 +21,7 @@ const {
   getCachedStreamAnalysis,
   scheduleLiveStreamAnalysis,
 } = require("./stream_health_service");
+const { startMediaNodeHeartbeat } = require("./media_node_service");
 
 let UAParser = null;
 try {
@@ -115,6 +116,15 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
+
+// Media-node heartbeat. MEDIA_NODE_ID <= 0 disables local node registration.
+const MEDIA_NODE_ID = Number(process.env.MEDIA_NODE_ID || 0);
+const MEDIA_NODE_HEARTBEAT_INTERVAL_MS = Math.max(
+  5000,
+  Number(process.env.MEDIA_NODE_HEARTBEAT_INTERVAL_MS || 30000),
+);
+
+let mediaNodeHeartbeat = null;
 
 // Internal Stream Target receiver allow-list.
 //
@@ -15286,6 +15296,26 @@ io.on("connection", (socket) => {
         `NLM Streaming Manager API running on http://localhost:${PORT}`,
       );
     });
+
+    // Media-node heartbeat — local infrastructure telemetry for the multi-node
+    // control plane. Runs immediately once, then on the configured interval.
+    if (Number.isInteger(MEDIA_NODE_ID) && MEDIA_NODE_ID > 0) {
+      mediaNodeHeartbeat = startMediaNodeHeartbeat({
+        pool,
+        nodeId: MEDIA_NODE_ID,
+        srsApiUrl: SRS_API_URL,
+        intervalMs: MEDIA_NODE_HEARTBEAT_INTERVAL_MS,
+      });
+
+      console.log(
+        `[MediaNode] heartbeat enabled node=${MEDIA_NODE_ID}` +
+          ` interval=${MEDIA_NODE_HEARTBEAT_INTERVAL_MS}ms`,
+      );
+    } else {
+      console.log(
+        "[MediaNode] heartbeat disabled — MEDIA_NODE_ID is not configured.",
+      );
+    }
 
     // Phase 3.1 scheduled automation — execute due starts/ends and recover
     // missed jobs after normal PM2 restarts. Run once immediately, then poll.
