@@ -4433,6 +4433,10 @@ app.get(
           metadata,
           created_at,
           updated_at,
+          (
+            SELECT COUNT(*)::int FROM channels c
+            WHERE c.media_node_id = media_nodes.id
+          ) AS assigned_channels,
           CASE
             WHEN last_heartbeat_at IS NULL THEN NULL
             ELSE GREATEST(
@@ -4493,6 +4497,7 @@ app.get(
             node.disk_percent == null ? null : Number(node.disk_percent),
           load_1m: node.load_1m == null ? null : Number(node.load_1m),
           ffmpeg_processes: Number(node.ffmpeg_processes || 0),
+          assigned_channels: Number(node.assigned_channels || 0),
           heartbeat_age_seconds: heartbeatAge,
           effective_status: effectiveStatus,
           capacity_percent:
@@ -10843,10 +10848,18 @@ app.get(
     try {
       const result = await pool.query(
         `
-      SELECT *
-      FROM channels
-      WHERE organization_id = $1
-      ORDER BY created_at DESC
+      SELECT
+        c.*,
+        mn.name AS media_node_name,
+        mn.hostname AS media_node_hostname,
+        mn.region AS media_node_region,
+        mn.status AS media_node_status,
+        mn.is_enabled AS media_node_enabled,
+        mn.is_draining AS media_node_draining
+      FROM channels c
+      LEFT JOIN media_nodes mn ON mn.id = c.media_node_id
+      WHERE c.organization_id = $1
+      ORDER BY c.created_at DESC
       `,
         [req.organization.id],
       );
@@ -10886,18 +10899,35 @@ app.post(
 
       const streamKey = await generateUniqueStreamKey(name);
 
+      // Phase 1: record media-node ownership without changing media routing.
+      const nodeResult = await pool.query(`
+        SELECT mn.id, COUNT(c.id)::int AS assigned_channels
+        FROM media_nodes mn
+        LEFT JOIN channels c ON c.media_node_id = mn.id
+        WHERE mn.is_enabled = TRUE
+          AND mn.is_draining = FALSE
+          AND mn.status IN ('online', 'degraded')
+        GROUP BY mn.id
+        ORDER BY COUNT(c.id) ASC, mn.id ASC
+        LIMIT 1
+      `);
+      const mediaNodeId = nodeResult.rows[0]?.id || null;
+
       const result = await pool.query(
         `
         INSERT INTO channels (
-          organization_id,
-          name,
-          stream_key,
-          description
+          organization_id, name, stream_key, description, media_node_id
         )
-        VALUES ($1, $2, $3, $4)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         `,
-        [req.organization.id, name, streamKey, description || null],
+        [
+          req.organization.id,
+          name,
+          streamKey,
+          description || null,
+          mediaNodeId,
+        ],
       );
 
       res.json({
@@ -10912,6 +10942,101 @@ app.post(
         message: "Failed to create channel",
         error: error.message,
       });
+    }
+  },
+);
+
+// MEDIA NODE ASSIGNMENT — control-plane ownership only.
+// This phase does not move live media or rewrite ingest/playback endpoints.
+app.patch(
+  "/api/admin/channels/:id/media-node",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const rawNodeId = req.body?.media_node_id;
+      const mediaNodeId =
+        rawNodeId === null || rawNodeId === "" ? null : Number(rawNodeId);
+
+      if (
+        mediaNodeId !== null &&
+        (!Number.isInteger(mediaNodeId) || mediaNodeId <= 0)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message: "media_node_id must be a positive integer or null",
+        });
+      }
+
+      const channelResult = await pool.query(
+        `SELECT id, name, is_live FROM channels WHERE id = $1`,
+        [req.params.id],
+      );
+      const channel = channelResult.rows[0];
+      if (!channel)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+
+      if (channel.is_live) {
+        return res.status(409).json({
+          ok: false,
+          message:
+            "Stop the channel before changing its media-node assignment.",
+        });
+      }
+
+      let node = null;
+      if (mediaNodeId !== null) {
+        const nodeResult = await pool.query(
+          `SELECT id, name, hostname, region, status, is_enabled, is_draining
+           FROM media_nodes WHERE id = $1`,
+          [mediaNodeId],
+        );
+        node = nodeResult.rows[0];
+        if (!node)
+          return res
+            .status(404)
+            .json({ ok: false, message: "Media node not found" });
+        if (!node.is_enabled)
+          return res
+            .status(409)
+            .json({
+              ok: false,
+              message: "Cannot assign a channel to a disabled media node.",
+            });
+        if (node.is_draining)
+          return res
+            .status(409)
+            .json({
+              ok: false,
+              message: "Cannot assign a channel to a draining media node.",
+            });
+      }
+
+      const updated = await pool.query(
+        `UPDATE channels SET media_node_id = $1 WHERE id = $2 RETURNING *`,
+        [mediaNodeId, channel.id],
+      );
+
+      res.json({
+        ok: true,
+        channel: {
+          ...updated.rows[0],
+          media_node_name: node?.name || null,
+          media_node_hostname: node?.hostname || null,
+          media_node_region: node?.region || null,
+          media_node_status: node?.status || null,
+        },
+      });
+    } catch (error) {
+      console.error("Update channel media node error:", error);
+      res
+        .status(500)
+        .json({
+          ok: false,
+          message: "Failed to update channel media-node assignment",
+        });
     }
   },
 );
