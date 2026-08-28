@@ -22,6 +22,11 @@ const {
   scheduleLiveStreamAnalysis,
 } = require("./stream_health_service");
 const { startMediaNodeHeartbeat } = require("./media_node_service");
+const {
+  resolveAgentBaseUrl,
+  requestMediaNodeAgent,
+  getAgentHealth,
+} = require("./media_node_agent_client");
 
 let UAParser = null;
 try {
@@ -122,6 +127,18 @@ const MEDIA_NODE_ID = Number(process.env.MEDIA_NODE_ID || 0);
 const MEDIA_NODE_HEARTBEAT_INTERVAL_MS = Math.max(
   5000,
   Number(process.env.MEDIA_NODE_HEARTBEAT_INTERVAL_MS || 30000),
+);
+
+const MEDIA_NODE_AGENT_PORT = Math.max(
+  1,
+  Number(process.env.MEDIA_NODE_AGENT_PORT || 5091),
+);
+const MEDIA_NODE_AGENT_TOKEN = String(
+  process.env.MEDIA_NODE_AGENT_TOKEN || "",
+).trim();
+const MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS = Math.max(
+  500,
+  Number(process.env.MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS || 2500),
 );
 
 let mediaNodeHeartbeat = null;
@@ -4457,28 +4474,29 @@ app.get(
         Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
       );
 
-      const nodes = result.rows.map((node) => {
+      let nodes = result.rows.map((node) => {
         const heartbeatAge =
           node.heartbeat_age_seconds == null
             ? null
             : Number(node.heartbeat_age_seconds);
 
-        let effectiveStatus = node.status || "offline";
+        // Runtime health and placement/maintenance state are intentionally
+        // separate. A healthy draining node is still ONLINE for existing
+        // streams; it is simply ineligible for new placement.
+        let runtimeStatus = node.status || "offline";
 
         if (!node.is_enabled) {
-          effectiveStatus = "disabled";
+          runtimeStatus = "disabled";
         } else if (heartbeatAge == null || heartbeatAge > staleAfterSeconds) {
-          effectiveStatus = "offline";
+          runtimeStatus = "offline";
         } else if (
           node.srs_healthy === false ||
           node.api_healthy === false ||
           node.status === "degraded"
         ) {
-          effectiveStatus = "degraded";
-        } else if (node.is_draining) {
-          effectiveStatus = "draining";
+          runtimeStatus = "degraded";
         } else {
-          effectiveStatus = "online";
+          runtimeStatus = "online";
         }
 
         const maxStreams = Number(node.max_streams || 0);
@@ -4499,7 +4517,17 @@ app.get(
           ffmpeg_processes: Number(node.ffmpeg_processes || 0),
           assigned_channels: Number(node.assigned_channels || 0),
           heartbeat_age_seconds: heartbeatAge,
-          effective_status: effectiveStatus,
+          runtime_status: runtimeStatus,
+          effective_status: runtimeStatus,
+          placement_status: !node.is_enabled
+            ? "disabled"
+            : node.is_draining
+              ? "draining"
+              : maxStreams > 0 && activeStreams >= maxStreams
+                ? "at_capacity"
+                : runtimeStatus === "online"
+                  ? "eligible"
+                  : "unavailable",
           capacity_percent:
             maxStreams > 0
               ? Math.min(100, Math.round((activeStreams / maxStreams) * 100))
@@ -4510,10 +4538,81 @@ app.get(
           placement_eligible:
             node.is_enabled === true &&
             node.is_draining !== true &&
-            effectiveStatus === "online" &&
+            runtimeStatus === "online" &&
             (maxStreams <= 0 || activeStreams < maxStreams),
         };
       });
+
+      // Phase 4B: probe each explicitly configured/co-located agent using a
+      // short timeout. Failure is reported as agent connectivity state and does
+      // not fail the Media Nodes registry endpoint.
+      nodes = await Promise.all(
+        nodes.map(async (node) => {
+          let agentBaseUrl = null;
+          try {
+            agentBaseUrl = resolveAgentBaseUrl(node, {
+              localNodeId: MEDIA_NODE_ID,
+              localPort: MEDIA_NODE_AGENT_PORT,
+            });
+          } catch (error) {
+            return {
+              ...node,
+              agent: {
+                configured: false,
+                reachable: false,
+                healthy: false,
+                error: error.message,
+              },
+            };
+          }
+
+          if (!agentBaseUrl) {
+            return {
+              ...node,
+              agent: {
+                configured: false,
+                reachable: false,
+                healthy: false,
+                error: null,
+              },
+            };
+          }
+
+          try {
+            const response = await getAgentHealth({
+              baseUrl: agentBaseUrl,
+              token: MEDIA_NODE_AGENT_TOKEN,
+              timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+            });
+            return {
+              ...node,
+              agent: {
+                configured: true,
+                reachable: true,
+                healthy:
+                  response.data?.ok === true &&
+                  response.data?.api_healthy === true,
+                version: response.data?.agent_version || null,
+                response_ms: response.response_ms,
+                srs_healthy: response.data?.srs_healthy ?? null,
+                active_streams: Number(response.data?.active_streams || 0),
+                ffmpeg_processes: Number(response.data?.ffmpeg_processes || 0),
+                error: response.data?.last_error || null,
+              },
+            };
+          } catch (error) {
+            return {
+              ...node,
+              agent: {
+                configured: true,
+                reachable: false,
+                healthy: false,
+                error: error.message,
+              },
+            };
+          }
+        }),
+      );
 
       const summary = nodes.reduce(
         (acc, node) => {
@@ -4522,9 +4621,12 @@ app.get(
           if (node.effective_status === "online") acc.online += 1;
           if (node.effective_status === "degraded") acc.degraded += 1;
           if (node.effective_status === "offline") acc.offline += 1;
-          if (node.effective_status === "draining") acc.draining += 1;
+          if (node.is_draining) acc.draining += 1;
           if (node.placement_eligible) acc.placement_eligible += 1;
           if (node.at_capacity) acc.at_capacity += 1;
+          if (node.agent?.configured) acc.agent_configured += 1;
+          if (node.agent?.reachable) acc.agent_reachable += 1;
+          if (node.agent?.healthy) acc.agent_healthy += 1;
           acc.active_streams += node.active_streams || 0;
           acc.total_capacity += node.max_streams || 0;
           acc.ffmpeg_processes += node.ffmpeg_processes || 0;
@@ -4539,6 +4641,9 @@ app.get(
           draining: 0,
           placement_eligible: 0,
           at_capacity: 0,
+          agent_configured: 0,
+          agent_reachable: 0,
+          agent_healthy: 0,
           active_streams: 0,
           total_capacity: 0,
           ffmpeg_processes: 0,
@@ -4557,6 +4662,91 @@ app.get(
       res.status(500).json({
         ok: false,
         message: "Failed to load media nodes",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// MEDIA NODE AGENT — Phase 4B read-only control-plane bridge
+// Super Admin only. No start/stop/migrate/execute operations exist here.
+// ══════════════════════════════════════════
+const MEDIA_NODE_AGENT_ROUTE_MAP = {
+  health: "/v1/health",
+  capabilities: "/v1/capabilities",
+  streams: "/v1/streams",
+  ffmpeg: "/v1/processes/ffmpeg",
+};
+
+app.get(
+  "/api/admin/media-nodes/:id/agent/:resource",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id);
+      const agentPath = MEDIA_NODE_AGENT_ROUTE_MAP[req.params.resource];
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid media node id" });
+      }
+      if (!agentPath) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Unknown Media Node Agent resource" });
+      }
+
+      const nodeResult = await queryWithRetry(
+        `SELECT id, name, hostname, host(public_ip) AS public_ip,
+                private_ip::text AS private_ip, metadata
+         FROM media_nodes WHERE id = $1`,
+        [nodeId],
+      );
+      const node = nodeResult.rows[0];
+      if (!node) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Media node not found" });
+      }
+
+      const baseUrl = resolveAgentBaseUrl(node, {
+        localNodeId: MEDIA_NODE_ID,
+        localPort: MEDIA_NODE_AGENT_PORT,
+      });
+      if (!baseUrl) {
+        return res.status(409).json({
+          ok: false,
+          message: "Media Node Agent is not configured for this node",
+        });
+      }
+
+      const response = await requestMediaNodeAgent({
+        baseUrl,
+        token: MEDIA_NODE_AGENT_TOKEN,
+        path: agentPath,
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      });
+
+      res.json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: response.response_ms,
+        resource: req.params.resource,
+        data: response.data,
+      });
+    } catch (error) {
+      console.error("Media Node Agent proxy error:", error.message);
+      const status =
+        error?.status === 401
+          ? 502
+          : error?.code === "AGENT_TIMEOUT"
+            ? 504
+            : 502;
+      res.status(status).json({
+        ok: false,
+        message: "Media Node Agent request failed",
         error: error.message,
       });
     }
