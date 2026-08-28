@@ -10852,6 +10852,7 @@ app.get(
         c.*,
         mn.name AS media_node_name,
         mn.hostname AS media_node_hostname,
+        mn.public_ip::text AS media_node_public_ip,
         mn.region AS media_node_region,
         mn.status AS media_node_status,
         mn.is_enabled AS media_node_enabled,
@@ -10864,9 +10865,37 @@ app.get(
         [req.organization.id],
       );
 
+      const channels = result.rows.map((channel) => {
+        // Phase 2 — node-aware ingest routing.
+        //
+        // The assigned media node is now the source of truth for where an
+        // encoder should publish. Prefer the node's public IP because RTMP/SRT
+        // are raw media transports and do not depend on the HTTP API/CDN host.
+        // The legacy VITE_INGEST_HOST fallback remains a frontend safety net for
+        // an unassigned channel, but assigned channels receive explicit routing.
+        const ingestHost =
+          channel.media_node_public_ip || channel.media_node_hostname || null;
+
+        return {
+          ...channel,
+          routing: {
+            media_node_id: channel.media_node_id || null,
+            media_node_name: channel.media_node_name || null,
+            ingest_host: ingestHost,
+            rtmp_server: ingestHost ? `rtmp://${ingestHost}/live` : null,
+            srt_publish_url: ingestHost
+              ? `srt://${ingestHost}:10080?streamid=#!::r=live/${channel.stream_key},m=publish`
+              : null,
+            assignment_status: channel.media_node_id
+              ? "assigned"
+              : "unassigned",
+          },
+        };
+      });
+
       res.json({
         ok: true,
-        channels: result.rows,
+        channels,
       });
     } catch (error) {
       console.error("Get Channels Error:", error);
@@ -10989,7 +11018,8 @@ app.patch(
       let node = null;
       if (mediaNodeId !== null) {
         const nodeResult = await pool.query(
-          `SELECT id, name, hostname, region, status, is_enabled, is_draining
+          `SELECT id, name, hostname, public_ip::text AS public_ip,
+                  region, status, is_enabled, is_draining
            FROM media_nodes WHERE id = $1`,
           [mediaNodeId],
         );
@@ -11025,8 +11055,23 @@ app.patch(
           ...updated.rows[0],
           media_node_name: node?.name || null,
           media_node_hostname: node?.hostname || null,
+          media_node_public_ip: node?.public_ip || null,
           media_node_region: node?.region || null,
           media_node_status: node?.status || null,
+          routing: {
+            media_node_id: node?.id || null,
+            media_node_name: node?.name || null,
+            ingest_host: node?.public_ip || node?.hostname || null,
+            rtmp_server:
+              node?.public_ip || node?.hostname
+                ? `rtmp://${node.public_ip || node.hostname}/live`
+                : null,
+            srt_publish_url:
+              node?.public_ip || node?.hostname
+                ? `srt://${node.public_ip || node.hostname}:10080?streamid=#!::r=live/${updated.rows[0].stream_key},m=publish`
+                : null,
+            assignment_status: node ? "assigned" : "unassigned",
+          },
         },
       });
     } catch (error) {
