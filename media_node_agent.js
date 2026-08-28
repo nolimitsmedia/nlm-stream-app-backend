@@ -3,6 +3,8 @@
 require("dotenv").config();
 
 const http = require("http");
+const https = require("https");
+const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const { execFileSync } = require("child_process");
@@ -13,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4A.1";
+const AGENT_VERSION = "4C.1";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -32,10 +34,47 @@ const srsApiUrl = String(
 const nodeId = String(process.env.MEDIA_NODE_ID || "").trim();
 const nodeName = String(process.env.MEDIA_NODE_NAME || os.hostname()).trim();
 const agentToken = String(process.env.MEDIA_NODE_AGENT_TOKEN || "").trim();
+const tlsCertFile = String(
+  process.env.MEDIA_NODE_AGENT_TLS_CERT_FILE || "",
+).trim();
+const tlsKeyFile = String(
+  process.env.MEDIA_NODE_AGENT_TLS_KEY_FILE || "",
+).trim();
+const allowInsecureRemote =
+  String(process.env.MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE || "false")
+    .trim()
+    .toLowerCase() === "true";
+const useTls = Boolean(tlsCertFile && tlsKeyFile);
 
 if (!agentToken || agentToken.length < 32) {
   console.error(
     "[MediaNodeAgent] MEDIA_NODE_AGENT_TOKEN is required and must be at least 32 characters.",
+  );
+  process.exit(1);
+}
+
+if (Boolean(tlsCertFile) !== Boolean(tlsKeyFile)) {
+  console.error(
+    "[MediaNodeAgent] MEDIA_NODE_AGENT_TLS_CERT_FILE and MEDIA_NODE_AGENT_TLS_KEY_FILE must be configured together.",
+  );
+  process.exit(1);
+}
+
+function isLoopbackBind(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized.startsWith("127.")
+  );
+}
+
+if (!useTls && !isLoopbackBind(host) && !allowInsecureRemote) {
+  console.error(
+    "[MediaNodeAgent] Refusing non-loopback plaintext listener. Configure TLS or explicitly set MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE=true for an isolated private-network test.",
   );
   process.exit(1);
 }
@@ -146,6 +185,7 @@ function baseIdentity() {
     node_name: nodeName,
     hostname: os.hostname(),
     agent_version: AGENT_VERSION,
+    transport: useTls ? "https" : "http",
     pid: process.pid,
     uptime_seconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
@@ -190,6 +230,8 @@ function handleCapabilities(res) {
       remote_job_stop: false,
       stream_migration: false,
       automatic_load_balancing: false,
+      secure_remote_transport: useTls,
+      node_identity_response: true,
     },
     protocols: {
       ingest: ["rtmp", "rtmps", "srt"],
@@ -230,11 +272,12 @@ function handleFfmpeg(res) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+const requestHandler = async (req, res) => {
   try {
+    const requestProtocol = useTls ? "https" : "http";
     const url = new URL(
       req.url || "/",
-      `http://${req.headers.host || "localhost"}`,
+      `${requestProtocol}://${req.headers.host || "localhost"}`,
     );
 
     if (req.method !== "GET") {
@@ -272,7 +315,29 @@ const server = http.createServer(async (req, res) => {
       res.end();
     }
   }
-});
+};
+
+let server;
+if (useTls) {
+  try {
+    server = https.createServer(
+      {
+        cert: fs.readFileSync(tlsCertFile),
+        key: fs.readFileSync(tlsKeyFile),
+        minVersion: "TLSv1.2",
+      },
+      requestHandler,
+    );
+  } catch (error) {
+    console.error(
+      "[MediaNodeAgent] Failed to load TLS certificate/key:",
+      error.message,
+    );
+    process.exit(1);
+  }
+} else {
+  server = http.createServer(requestHandler);
+}
 
 server.requestTimeout = 10_000;
 server.headersTimeout = 12_000;
@@ -288,7 +353,7 @@ server.on("clientError", (error, socket) => {
 
 server.listen(port, host, () => {
   console.log(
-    `[MediaNodeAgent] v${AGENT_VERSION} listening on http://${host}:${port} node=${nodeId || "unset"} mode=read-only`,
+    `[MediaNodeAgent] v${AGENT_VERSION} listening on ${useTls ? "https" : "http"}://${host}:${port} node=${nodeId || "unset"} mode=read-only`,
   );
 });
 

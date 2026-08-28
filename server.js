@@ -23,7 +23,8 @@ const {
 } = require("./stream_health_service");
 const { startMediaNodeHeartbeat } = require("./media_node_service");
 const {
-  resolveAgentBaseUrl,
+  resolveAgentConnection,
+  validateAgentBaseUrlForNode,
   requestMediaNodeAgent,
   getAgentHealth,
 } = require("./media_node_agent_client");
@@ -140,6 +141,10 @@ const MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS = Math.max(
   500,
   Number(process.env.MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS || 2500),
 );
+const MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE =
+  String(process.env.MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE || "false")
+    .trim()
+    .toLowerCase() === "true";
 
 let mediaNodeHeartbeat = null;
 
@@ -4548,50 +4553,73 @@ app.get(
       // not fail the Media Nodes registry endpoint.
       nodes = await Promise.all(
         nodes.map(async (node) => {
-          let agentBaseUrl = null;
+          let connection = null;
           try {
-            agentBaseUrl = resolveAgentBaseUrl(node, {
+            connection = resolveAgentConnection(node, {
               localNodeId: MEDIA_NODE_ID,
               localPort: MEDIA_NODE_AGENT_PORT,
+              localToken: MEDIA_NODE_AGENT_TOKEN,
+              allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
             });
           } catch (error) {
             return {
               ...node,
               agent: {
                 configured: false,
+                token_configured: false,
                 reachable: false,
                 healthy: false,
+                transport: null,
                 error: error.message,
               },
             };
           }
 
-          if (!agentBaseUrl) {
+          if (!connection.configured) {
             return {
               ...node,
               agent: {
                 configured: false,
+                token_configured: connection.tokenConfigured,
                 reachable: false,
                 healthy: false,
+                transport: null,
                 error: null,
+              },
+            };
+          }
+
+          if (!connection.tokenConfigured) {
+            return {
+              ...node,
+              agent: {
+                configured: true,
+                token_configured: false,
+                reachable: false,
+                healthy: false,
+                transport: connection.transport,
+                error: "Media Node Agent token is not configured for this node",
               },
             };
           }
 
           try {
             const response = await getAgentHealth({
-              baseUrl: agentBaseUrl,
-              token: MEDIA_NODE_AGENT_TOKEN,
+              baseUrl: connection.baseUrl,
+              token: connection.token,
               timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+              expectedNodeId: node.id,
             });
             return {
               ...node,
               agent: {
                 configured: true,
+                token_configured: true,
                 reachable: true,
                 healthy:
                   response.data?.ok === true &&
                   response.data?.api_healthy === true,
+                transport: connection.transport,
                 version: response.data?.agent_version || null,
                 response_ms: response.response_ms,
                 srs_healthy: response.data?.srs_healthy ?? null,
@@ -4605,8 +4633,10 @@ app.get(
               ...node,
               agent: {
                 configured: true,
+                token_configured: true,
                 reachable: false,
                 healthy: false,
+                transport: connection.transport,
                 error: error.message,
               },
             };
@@ -4711,22 +4741,31 @@ app.get(
           .json({ ok: false, message: "Media node not found" });
       }
 
-      const baseUrl = resolveAgentBaseUrl(node, {
+      const connection = resolveAgentConnection(node, {
         localNodeId: MEDIA_NODE_ID,
         localPort: MEDIA_NODE_AGENT_PORT,
+        localToken: MEDIA_NODE_AGENT_TOKEN,
+        allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
       });
-      if (!baseUrl) {
+      if (!connection.configured) {
         return res.status(409).json({
           ok: false,
           message: "Media Node Agent is not configured for this node",
         });
       }
+      if (!connection.tokenConfigured) {
+        return res.status(409).json({
+          ok: false,
+          message: "Media Node Agent token is not configured for this node",
+        });
+      }
 
       const response = await requestMediaNodeAgent({
-        baseUrl,
-        token: MEDIA_NODE_AGENT_TOKEN,
+        baseUrl: connection.baseUrl,
+        token: connection.token,
         path: agentPath,
         timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
       });
 
       res.json({
@@ -4747,6 +4786,105 @@ app.get(
       res.status(status).json({
         ok: false,
         message: "Media Node Agent request failed",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// MEDIA NODE AGENT TRANSPORT SETTINGS — Phase 4C
+// Stores only the non-secret agent URL in media_nodes.metadata.agent_url.
+// Per-node bearer credentials stay in environment variables:
+// MEDIA_NODE_AGENT_TOKEN_<nodeId>. The local node may continue using the
+// existing MEDIA_NODE_AGENT_TOKEN fallback.
+// ══════════════════════════════════════════
+app.patch(
+  "/api/admin/media-nodes/:id/agent-settings",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id);
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid media node id" });
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(req.body || {}, "agent_url")) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Provide agent_url. Use null or an empty string to clear it.",
+        });
+      }
+
+      const nodeResult = await queryWithRetry(
+        `SELECT id, name, hostname, host(public_ip) AS public_ip,
+                private_ip::text AS private_ip, metadata
+         FROM media_nodes WHERE id = $1`,
+        [nodeId],
+      );
+      const node = nodeResult.rows[0];
+      if (!node) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Media node not found" });
+      }
+
+      const rawAgentUrl = String(req.body.agent_url || "").trim();
+      const normalizedAgentUrl = rawAgentUrl
+        ? validateAgentBaseUrlForNode(node, rawAgentUrl, {
+            localNodeId: MEDIA_NODE_ID,
+            allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
+          })
+        : null;
+
+      const updated = await pool.query(
+        `UPDATE media_nodes
+         SET metadata = CASE
+           WHEN $2::text IS NULL THEN COALESCE(metadata, '{}'::jsonb) - 'agent_url'
+           ELSE jsonb_set(
+             COALESCE(metadata, '{}'::jsonb),
+             '{agent_url}',
+             to_jsonb($2::text),
+             true
+           )
+         END,
+         updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, name, hostname, host(public_ip) AS public_ip,
+                   private_ip::text AS private_ip, metadata, updated_at`,
+        [nodeId, normalizedAgentUrl],
+      );
+
+      const updatedNode = updated.rows[0];
+      const connection = resolveAgentConnection(updatedNode, {
+        localNodeId: MEDIA_NODE_ID,
+        localPort: MEDIA_NODE_AGENT_PORT,
+        localToken: MEDIA_NODE_AGENT_TOKEN,
+        allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
+      });
+
+      res.json({
+        ok: true,
+        node: {
+          id: Number(updatedNode.id),
+          name: updatedNode.name,
+          agent_url: normalizedAgentUrl,
+          agent_transport: connection.transport,
+          token_configured: connection.tokenConfigured,
+        },
+        message: normalizedAgentUrl
+          ? `${updatedNode.name} agent transport updated.`
+          : `${updatedNode.name} explicit agent URL cleared.`,
+      });
+    } catch (error) {
+      console.error("Update Media Node Agent transport error:", error);
+      res.status(400).json({
+        ok: false,
+        message: "Failed to update Media Node Agent transport",
         error: error.message,
       });
     }

@@ -1,5 +1,9 @@
-// server/media_node_agent_client.js
-// Phase 4B — authenticated, read-only control-plane client for Media Node Agent.
+"use strict";
+
+// Phase 4C — secure multi-node Media Node Agent transport foundation.
+// Read-only only. No remote process execution exists in this client.
+
+const net = require("net");
 
 const DEFAULT_TIMEOUT_MS = 2500;
 const ALLOWED_PATHS = new Set([
@@ -9,17 +13,108 @@ const ALLOWED_PATHS = new Set([
   "/v1/processes/ffmpeg",
 ]);
 
-function normalizeBaseUrl(value) {
+function cleanHost(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^\[/, "")
+    .replace(/\]$/, "")
+    .replace(/\/\d+$/, "")
+    .toLowerCase();
+}
+
+function isLoopbackHost(hostname) {
+  const host = cleanHost(hostname);
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host.startsWith("127.")
+  );
+}
+
+function normalizeBaseUrl(value, options = {}) {
   const raw = String(value || "").trim();
   if (!raw) return null;
+
   const parsed = new URL(raw);
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error("Media Node Agent URL must use http or https");
   }
-  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  if (parsed.username || parsed.password) {
+    throw new Error("Media Node Agent URL must not contain credentials");
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(
+      "Media Node Agent URL must not contain query parameters or fragments",
+    );
+  }
+  if (parsed.pathname && parsed.pathname !== "/") {
+    throw new Error("Media Node Agent URL must not contain a path");
+  }
+
+  const allowLoopbackHttp = options.allowLoopbackHttp === true;
+  const allowInsecureRemote = options.allowInsecureRemote === true;
+  const loopback = isLoopbackHost(parsed.hostname);
+
+  if (
+    parsed.protocol !== "https:" &&
+    !(allowLoopbackHttp && loopback) &&
+    !allowInsecureRemote
+  ) {
+    throw new Error("Remote Media Node Agent URLs must use HTTPS");
+  }
+
+  parsed.pathname = "";
   parsed.search = "";
   parsed.hash = "";
   return parsed.toString().replace(/\/$/, "");
+}
+
+function getAllowedNodeHosts(node) {
+  return new Set(
+    [node?.hostname, node?.public_ip, node?.private_ip]
+      .map(cleanHost)
+      .filter(Boolean),
+  );
+}
+
+function validateAgentBaseUrlForNode(node, value, options = {}) {
+  const nodeId = Number(node?.id || 0);
+  const localNodeId = Number(options.localNodeId || 0);
+  const isLocalNode = localNodeId > 0 && nodeId === localNodeId;
+
+  const normalized = normalizeBaseUrl(value, {
+    allowLoopbackHttp: isLocalNode,
+    allowInsecureRemote: options.allowInsecureRemote === true,
+  });
+  if (!normalized) return null;
+
+  const parsed = new URL(normalized);
+  const urlHost = cleanHost(parsed.hostname);
+
+  // A co-located node may use loopback. A remote node must resolve through one
+  // of the node's registered identities to prevent the agent setting from
+  // becoming an arbitrary server-side request target.
+  if (isLocalNode && isLoopbackHost(urlHost)) {
+    return normalized;
+  }
+
+  const allowedHosts = getAllowedNodeHosts(node);
+  if (!allowedHosts.has(urlHost)) {
+    throw new Error(
+      "Media Node Agent host must match the node hostname, public IP, or private IP",
+    );
+  }
+
+  if (
+    !isLocalNode &&
+    parsed.protocol !== "https:" &&
+    options.allowInsecureRemote !== true
+  ) {
+    throw new Error("Remote Media Node Agent transport must use HTTPS");
+  }
+
+  return normalized;
 }
 
 function resolveAgentBaseUrl(node, options = {}) {
@@ -27,15 +122,72 @@ function resolveAgentBaseUrl(node, options = {}) {
   const localPort = Number(options.localPort || 5091);
   const nodeId = Number(node?.id || 0);
 
-  // Phase 4B safely supports the co-located production node without exposing
-  // the agent port publicly. Future remote nodes may explicitly advertise an
-  // agent_url in metadata once a private/TLS transport is configured.
+  // Keep Media Node 01 private and backward-compatible. No public listener is
+  // needed while the control plane and agent are co-located.
   if (localNodeId > 0 && nodeId === localNodeId) {
+    const explicit = node?.metadata?.agent_url;
+    if (explicit) {
+      return validateAgentBaseUrlForNode(node, explicit, options);
+    }
     return `http://127.0.0.1:${localPort}`;
   }
 
   const metadataUrl = node?.metadata?.agent_url;
-  return metadataUrl ? normalizeBaseUrl(metadataUrl) : null;
+  return metadataUrl
+    ? validateAgentBaseUrlForNode(node, metadataUrl, options)
+    : null;
+}
+
+function resolveAgentToken(node, options = {}) {
+  const nodeId = Number(node?.id || 0);
+  const localNodeId = Number(options.localNodeId || 0);
+  if (!Number.isInteger(nodeId) || nodeId <= 0) return null;
+
+  // Remote nodes receive a unique control-plane credential. This intentionally
+  // avoids reusing Media Node 01's bearer token across the cluster.
+  const specificToken = String(
+    process.env[`MEDIA_NODE_AGENT_TOKEN_${nodeId}`] || "",
+  ).trim();
+  if (specificToken) return specificToken;
+
+  if (localNodeId > 0 && nodeId === localNodeId) {
+    return String(options.localToken || "").trim() || null;
+  }
+
+  return null;
+}
+
+function resolveAgentConnection(node, options = {}) {
+  const baseUrl = resolveAgentBaseUrl(node, options);
+  const token = resolveAgentToken(node, options);
+  const parsed = baseUrl ? new URL(baseUrl) : null;
+
+  return {
+    configured: Boolean(baseUrl),
+    baseUrl,
+    token,
+    tokenConfigured: Boolean(token && token.length >= 32),
+    transport: parsed
+      ? isLoopbackHost(parsed.hostname)
+        ? "loopback"
+        : parsed.protocol === "https:"
+          ? "https"
+          : "http"
+      : null,
+  };
+}
+
+function verifyAgentIdentity(data, expectedNodeId) {
+  if (expectedNodeId == null) return;
+  const expected = String(expectedNodeId);
+  const received = data?.node_id == null ? "" : String(data.node_id);
+  if (!received || received !== expected) {
+    const error = new Error(
+      `Media Node Agent identity mismatch: expected node ${expected}, received ${received || "unset"}`,
+    );
+    error.code = "AGENT_IDENTITY_MISMATCH";
+    throw error;
+  }
 }
 
 async function requestMediaNodeAgent({
@@ -43,32 +195,37 @@ async function requestMediaNodeAgent({
   token,
   path,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  expectedNodeId = null,
 }) {
   if (!ALLOWED_PATHS.has(path)) {
     throw new Error(`Unsupported Media Node Agent path: ${path}`);
   }
   if (!baseUrl) throw new Error("Media Node Agent URL is not configured");
   if (!token || String(token).length < 32) {
-    throw new Error("MEDIA_NODE_AGENT_TOKEN is not configured");
+    throw new Error("Media Node Agent token is not configured for this node");
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    Math.max(500, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
-  );
+  const safeTimeout = Math.max(500, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), safeTimeout);
   timer.unref?.();
   const startedAt = Date.now();
 
   try {
-    const response = await fetch(`${normalizeBaseUrl(baseUrl)}${path}`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
+    const response = await fetch(
+      `${normalizeBaseUrl(baseUrl, {
+        allowLoopbackHttp: true,
+      })}${path}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "X-NLM-Control-Plane": "1",
+        },
+        signal: controller.signal,
       },
-      signal: controller.signal,
-    });
+    );
 
     const text = await response.text();
     let body = null;
@@ -88,6 +245,8 @@ async function requestMediaNodeAgent({
       throw error;
     }
 
+    verifyAgentIdentity(body, expectedNodeId);
+
     return {
       ok: true,
       status: response.status,
@@ -97,7 +256,7 @@ async function requestMediaNodeAgent({
   } catch (error) {
     if (error?.name === "AbortError") {
       const timeoutError = new Error(
-        `Media Node Agent request timed out after ${timeoutMs}ms`,
+        `Media Node Agent request timed out after ${safeTimeout}ms`,
       );
       timeoutError.code = "AGENT_TIMEOUT";
       throw timeoutError;
@@ -114,7 +273,13 @@ async function getAgentHealth(options) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
+  isLoopbackHost,
+  normalizeBaseUrl,
+  validateAgentBaseUrlForNode,
   resolveAgentBaseUrl,
+  resolveAgentToken,
+  resolveAgentConnection,
+  verifyAgentIdentity,
   requestMediaNodeAgent,
   getAgentHealth,
 };
