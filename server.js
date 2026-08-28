@@ -4504,6 +4504,14 @@ app.get(
             maxStreams > 0
               ? Math.min(100, Math.round((activeStreams / maxStreams) * 100))
               : null,
+          remaining_capacity:
+            maxStreams > 0 ? Math.max(0, maxStreams - activeStreams) : null,
+          at_capacity: maxStreams > 0 ? activeStreams >= maxStreams : false,
+          placement_eligible:
+            node.is_enabled === true &&
+            node.is_draining !== true &&
+            effectiveStatus === "online" &&
+            (maxStreams <= 0 || activeStreams < maxStreams),
         };
       });
 
@@ -4515,7 +4523,10 @@ app.get(
           if (node.effective_status === "degraded") acc.degraded += 1;
           if (node.effective_status === "offline") acc.offline += 1;
           if (node.effective_status === "draining") acc.draining += 1;
+          if (node.placement_eligible) acc.placement_eligible += 1;
+          if (node.at_capacity) acc.at_capacity += 1;
           acc.active_streams += node.active_streams || 0;
+          acc.total_capacity += node.max_streams || 0;
           acc.ffmpeg_processes += node.ffmpeg_processes || 0;
           return acc;
         },
@@ -4526,7 +4537,10 @@ app.get(
           degraded: 0,
           offline: 0,
           draining: 0,
+          placement_eligible: 0,
+          at_capacity: 0,
           active_streams: 0,
+          total_capacity: 0,
           ffmpeg_processes: 0,
         },
       );
@@ -4543,6 +4557,157 @@ app.get(
       res.status(500).json({
         ok: false,
         message: "Failed to load media nodes",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
+// MEDIA NODE CAPACITY + MAINTENANCE CONTROLS
+//
+// Control-plane only in this phase:
+// - draining excludes the node from NEW automatic/manual placement
+// - existing channel assignments are preserved
+// - existing live streams are not stopped or migrated
+// - disabling is blocked while streams are active
+// - max_streams is an admission/placement capacity signal; raw SRS ingest
+//   enforcement is intentionally left for the later node-agent/admission phase.
+// ══════════════════════════════════════════
+app.patch(
+  "/api/admin/media-nodes/:id/settings",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id);
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "Media node id must be a positive integer.",
+        });
+      }
+
+      const currentResult = await pool.query(
+        `SELECT id, name, status, is_enabled, is_draining, max_streams,
+                active_streams, last_heartbeat_at
+         FROM media_nodes
+         WHERE id = $1`,
+        [nodeId],
+      );
+      const current = currentResult.rows[0];
+
+      if (!current) {
+        return res.status(404).json({
+          ok: false,
+          message: "Media node not found.",
+        });
+      }
+
+      const updates = [];
+      const values = [];
+
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "max_streams")) {
+        const maxStreams = Number(req.body.max_streams);
+        if (
+          !Number.isInteger(maxStreams) ||
+          maxStreams < 1 ||
+          maxStreams > 10000
+        ) {
+          return res.status(400).json({
+            ok: false,
+            message: "max_streams must be an integer between 1 and 10000.",
+          });
+        }
+
+        if (maxStreams < Number(current.active_streams || 0)) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "max_streams cannot be lower than the node's current active stream count.",
+          });
+        }
+
+        values.push(maxStreams);
+        updates.push(`max_streams = $${values.length}`);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "is_draining")) {
+        if (typeof req.body.is_draining !== "boolean") {
+          return res.status(400).json({
+            ok: false,
+            message: "is_draining must be true or false.",
+          });
+        }
+
+        values.push(req.body.is_draining);
+        updates.push(`is_draining = $${values.length}`);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "is_enabled")) {
+        if (typeof req.body.is_enabled !== "boolean") {
+          return res.status(400).json({
+            ok: false,
+            message: "is_enabled must be true or false.",
+          });
+        }
+
+        if (
+          req.body.is_enabled === false &&
+          Number(current.active_streams || 0) > 0
+        ) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Cannot disable a media node while it has active streams. Drain it first and wait for streams to finish.",
+          });
+        }
+
+        values.push(req.body.is_enabled);
+        updates.push(`is_enabled = $${values.length}`);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Provide at least one of: max_streams, is_draining, is_enabled.",
+        });
+      }
+
+      values.push(nodeId);
+      const updatedResult = await pool.query(
+        `UPDATE media_nodes
+         SET ${updates.join(", ")}, updated_at = NOW()
+         WHERE id = $${values.length}
+         RETURNING id, name, hostname, host(public_ip) AS public_ip, region,
+                   status, is_enabled, is_draining, max_streams, active_streams,
+                   cpu_percent, memory_percent, disk_percent, load_1m,
+                   ffmpeg_processes, srs_healthy, api_healthy,
+                   last_heartbeat_at, last_error, metadata, updated_at`,
+        values,
+      );
+
+      const node = updatedResult.rows[0];
+
+      res.json({
+        ok: true,
+        node: {
+          ...node,
+          id: Number(node.id),
+          max_streams: Number(node.max_streams || 0),
+          active_streams: Number(node.active_streams || 0),
+          maintenance_mode: node.is_draining ? "draining" : "normal",
+        },
+        message: node.is_draining
+          ? `${node.name} is draining. Existing streams remain untouched; new placement is blocked.`
+          : `${node.name} settings updated.`,
+      });
+    } catch (error) {
+      console.error("Update media node settings error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update media node settings.",
         error: error.message,
       });
     }
@@ -10928,18 +11093,47 @@ app.post(
 
       const streamKey = await generateUniqueStreamKey(name);
 
-      // Phase 1: record media-node ownership without changing media routing.
-      const nodeResult = await pool.query(`
-        SELECT mn.id, COUNT(c.id)::int AS assigned_channels
+      // Phase 3: safe automatic placement.
+      // Only a fresh, healthy, enabled, non-draining node with remaining
+      // stream capacity may receive a newly-created channel. Existing channel
+      // assignments are never moved by this selector.
+      const staleAfterSeconds = Math.max(
+        60,
+        Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
+      );
+      const nodeResult = await pool.query(
+        `
+        SELECT
+          mn.id,
+          COUNT(c.id)::int AS assigned_channels,
+          mn.active_streams,
+          mn.max_streams
         FROM media_nodes mn
         LEFT JOIN channels c ON c.media_node_id = mn.id
         WHERE mn.is_enabled = TRUE
           AND mn.is_draining = FALSE
-          AND mn.status IN ('online', 'degraded')
+          AND mn.status = 'online'
+          AND mn.srs_healthy IS TRUE
+          AND mn.api_healthy IS TRUE
+          AND mn.last_heartbeat_at IS NOT NULL
+          AND mn.last_heartbeat_at >= NOW() - ($1 * INTERVAL '1 second')
+          AND (
+            mn.max_streams IS NULL
+            OR mn.max_streams <= 0
+            OR mn.active_streams < mn.max_streams
+          )
         GROUP BY mn.id
-        ORDER BY COUNT(c.id) ASC, mn.id ASC
+        ORDER BY
+          CASE
+            WHEN mn.max_streams IS NULL OR mn.max_streams <= 0 THEN 0
+            ELSE mn.active_streams::numeric / mn.max_streams
+          END ASC,
+          COUNT(c.id) ASC,
+          mn.id ASC
         LIMIT 1
-      `);
+        `,
+        [staleAfterSeconds],
+      );
       const mediaNodeId = nodeResult.rows[0]?.id || null;
 
       const result = await pool.query(
@@ -11019,7 +11213,9 @@ app.patch(
       if (mediaNodeId !== null) {
         const nodeResult = await pool.query(
           `SELECT id, name, hostname, host(public_ip) AS public_ip,
-                  region, status, is_enabled, is_draining
+                  region, status, is_enabled, is_draining,
+                  max_streams, active_streams, srs_healthy, api_healthy,
+                  last_heartbeat_at
            FROM media_nodes WHERE id = $1`,
           [mediaNodeId],
         );
@@ -11029,15 +11225,57 @@ app.patch(
             .status(404)
             .json({ ok: false, message: "Media node not found" });
         if (!node.is_enabled)
-          return res.status(409).json({
-            ok: false,
-            message: "Cannot assign a channel to a disabled media node.",
-          });
+          return res
+            .status(409)
+            .json({
+              ok: false,
+              message: "Cannot assign a channel to a disabled media node.",
+            });
         if (node.is_draining)
+          return res
+            .status(409)
+            .json({
+              ok: false,
+              message: "Cannot assign a channel to a draining media node.",
+            });
+
+        const staleAfterSeconds = Math.max(
+          60,
+          Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
+        );
+        const heartbeatAgeSeconds = node.last_heartbeat_at
+          ? Math.max(
+              0,
+              Math.floor(
+                (Date.now() - new Date(node.last_heartbeat_at).getTime()) /
+                  1000,
+              ),
+            )
+          : null;
+
+        if (
+          node.status !== "online" ||
+          node.srs_healthy !== true ||
+          node.api_healthy !== true ||
+          heartbeatAgeSeconds === null ||
+          heartbeatAgeSeconds > staleAfterSeconds
+        ) {
           return res.status(409).json({
             ok: false,
-            message: "Cannot assign a channel to a draining media node.",
+            message:
+              "Cannot assign a channel to a media node that is offline, stale, or unhealthy.",
           });
+        }
+
+        const maxStreams = Number(node.max_streams || 0);
+        const activeStreams = Number(node.active_streams || 0);
+        if (maxStreams > 0 && activeStreams >= maxStreams) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Cannot assign a channel to a media node that is at capacity.",
+          });
+        }
       }
 
       const updated = await pool.query(
@@ -11072,10 +11310,12 @@ app.patch(
       });
     } catch (error) {
       console.error("Update channel media node error:", error);
-      res.status(500).json({
-        ok: false,
-        message: "Failed to update channel media-node assignment",
-      });
+      res
+        .status(500)
+        .json({
+          ok: false,
+          message: "Failed to update channel media-node assignment",
+        });
     }
   },
 );
