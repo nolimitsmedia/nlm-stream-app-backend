@@ -4396,6 +4396,155 @@ app.get(
 );
 
 // ══════════════════════════════════════════
+// MEDIA NODE REGISTRY — cluster/control-plane visibility
+// Read-only in this phase. Heartbeats update media_nodes; this endpoint turns
+// those rows into a super-admin cluster view and derives an effective status
+// from heartbeat freshness without mutating the stored heartbeat record.
+// ══════════════════════════════════════════
+app.get(
+  "/api/admin/media-nodes",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const result = await queryWithRetry(`
+        SELECT
+          id,
+          name,
+          hostname,
+          public_ip::text AS public_ip,
+          private_ip::text AS private_ip,
+          region,
+          role,
+          status,
+          is_enabled,
+          is_draining,
+          max_streams,
+          active_streams,
+          cpu_percent,
+          memory_percent,
+          disk_percent,
+          load_1m,
+          ffmpeg_processes,
+          srs_healthy,
+          api_healthy,
+          last_heartbeat_at,
+          last_error,
+          metadata,
+          created_at,
+          updated_at,
+          CASE
+            WHEN last_heartbeat_at IS NULL THEN NULL
+            ELSE GREATEST(
+              0,
+              FLOOR(EXTRACT(EPOCH FROM (NOW() - last_heartbeat_at)))
+            )::int
+          END AS heartbeat_age_seconds
+        FROM media_nodes
+        ORDER BY
+          is_enabled DESC,
+          is_draining ASC,
+          name ASC,
+          id ASC
+      `);
+
+      const staleAfterSeconds = Math.max(
+        60,
+        Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
+      );
+
+      const nodes = result.rows.map((node) => {
+        const heartbeatAge =
+          node.heartbeat_age_seconds == null
+            ? null
+            : Number(node.heartbeat_age_seconds);
+
+        let effectiveStatus = node.status || "offline";
+
+        if (!node.is_enabled) {
+          effectiveStatus = "disabled";
+        } else if (heartbeatAge == null || heartbeatAge > staleAfterSeconds) {
+          effectiveStatus = "offline";
+        } else if (
+          node.srs_healthy === false ||
+          node.api_healthy === false ||
+          node.status === "degraded"
+        ) {
+          effectiveStatus = "degraded";
+        } else if (node.is_draining) {
+          effectiveStatus = "draining";
+        } else {
+          effectiveStatus = "online";
+        }
+
+        const maxStreams = Number(node.max_streams || 0);
+        const activeStreams = Number(node.active_streams || 0);
+
+        return {
+          ...node,
+          id: Number(node.id),
+          max_streams: maxStreams,
+          active_streams: activeStreams,
+          cpu_percent:
+            node.cpu_percent == null ? null : Number(node.cpu_percent),
+          memory_percent:
+            node.memory_percent == null ? null : Number(node.memory_percent),
+          disk_percent:
+            node.disk_percent == null ? null : Number(node.disk_percent),
+          load_1m: node.load_1m == null ? null : Number(node.load_1m),
+          ffmpeg_processes: Number(node.ffmpeg_processes || 0),
+          heartbeat_age_seconds: heartbeatAge,
+          effective_status: effectiveStatus,
+          capacity_percent:
+            maxStreams > 0
+              ? Math.min(100, Math.round((activeStreams / maxStreams) * 100))
+              : null,
+        };
+      });
+
+      const summary = nodes.reduce(
+        (acc, node) => {
+          acc.total += 1;
+          if (node.is_enabled) acc.enabled += 1;
+          if (node.effective_status === "online") acc.online += 1;
+          if (node.effective_status === "degraded") acc.degraded += 1;
+          if (node.effective_status === "offline") acc.offline += 1;
+          if (node.effective_status === "draining") acc.draining += 1;
+          acc.active_streams += node.active_streams || 0;
+          acc.ffmpeg_processes += node.ffmpeg_processes || 0;
+          return acc;
+        },
+        {
+          total: 0,
+          enabled: 0,
+          online: 0,
+          degraded: 0,
+          offline: 0,
+          draining: 0,
+          active_streams: 0,
+          ffmpeg_processes: 0,
+        },
+      );
+
+      res.json({
+        ok: true,
+        stale_after_seconds: staleAfterSeconds,
+        summary,
+        nodes,
+      });
+    } catch (error) {
+      console.error("Get media nodes error:", error);
+
+      res.status(500).json({
+        ok: false,
+        message: "Failed to load media nodes",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
 // SUPER ADMIN DASHBOARD — trend history (Platform Overview graphs)
 // A periodic snapshot job, separate from the live getServerStatusSnapshot()
 // above — that one only ever answers "right now"; this is what lets the
