@@ -4793,6 +4793,188 @@ app.get(
 );
 
 // ══════════════════════════════════════════
+// MEDIA NODE CONTROLLED JOBS — Phase 4D.1
+// Super Admin only. The only allowed job is a fixed, harmless FFmpeg probe.
+// No arbitrary executable, command line, URL, file path, stream key or shell
+// input is accepted by either the control plane or the agent.
+// ══════════════════════════════════════════
+async function getMediaNodeAgentConnectionForControl(nodeId) {
+  const nodeResult = await queryWithRetry(
+    `SELECT id, name, hostname, host(public_ip) AS public_ip,
+            private_ip::text AS private_ip, metadata
+     FROM media_nodes WHERE id = $1`,
+    [nodeId],
+  );
+  const node = nodeResult.rows[0];
+  if (!node) {
+    const e = new Error("Media node not found");
+    e.status = 404;
+    throw e;
+  }
+  const connection = resolveAgentConnection(node, {
+    localNodeId: MEDIA_NODE_ID,
+    localPort: MEDIA_NODE_AGENT_PORT,
+    localToken: MEDIA_NODE_AGENT_TOKEN,
+    allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
+  });
+  if (!connection.configured || !connection.tokenConfigured) {
+    const e = new Error(
+      "Media Node Agent is not fully configured for this node",
+    );
+    e.status = 409;
+    throw e;
+  }
+  return { node, connection };
+}
+
+app.post(
+  "/api/admin/media-nodes/:id/jobs",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id);
+      if (!Number.isInteger(nodeId) || nodeId <= 0)
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid media node id" });
+      if (req.body?.type !== "ffmpeg_probe")
+        return res
+          .status(400)
+          .json({ ok: false, message: "Phase 4D.1 only permits ffmpeg_probe" });
+      const requestId =
+        req.body?.request_id == null
+          ? null
+          : String(req.body.request_id).trim();
+      if (requestId && !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId))
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid request_id" });
+      const { node, connection } =
+        await getMediaNodeAgentConnectionForControl(nodeId);
+      const response = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: "/v1/jobs",
+        method: "POST",
+        body: { type: "ffmpeg_probe", request_id: requestId },
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+      res
+        .status(202)
+        .json({
+          ok: true,
+          node: { id: Number(node.id), name: node.name },
+          agent_response_ms: response.response_ms,
+          data: response.data,
+        });
+    } catch (error) {
+      console.error("Media Node job create error:", error.message);
+      res
+        .status(error.status || (error.code === "AGENT_TIMEOUT" ? 504 : 502))
+        .json({
+          ok: false,
+          message: "Media Node job request failed",
+          error: error.message,
+        });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/media-nodes/:id/jobs/:jobId",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id),
+        jobId = String(req.params.jobId || "");
+      if (
+        !Number.isInteger(nodeId) ||
+        nodeId <= 0 ||
+        !/^[0-9a-f-]{36}$/i.test(jobId)
+      )
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid node or job id" });
+      const { node, connection } =
+        await getMediaNodeAgentConnectionForControl(nodeId);
+      const response = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/jobs/${jobId}`,
+        method: "GET",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+      res.json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: response.response_ms,
+        data: response.data,
+      });
+    } catch (error) {
+      console.error("Media Node job status error:", error.message);
+      res
+        .status(error.status || (error.code === "AGENT_TIMEOUT" ? 504 : 502))
+        .json({
+          ok: false,
+          message: "Media Node job status failed",
+          error: error.message,
+        });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/media-nodes/:id/jobs/:jobId/stop",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id),
+        jobId = String(req.params.jobId || "");
+      if (
+        !Number.isInteger(nodeId) ||
+        nodeId <= 0 ||
+        !/^[0-9a-f-]{36}$/i.test(jobId)
+      )
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid node or job id" });
+      const { node, connection } =
+        await getMediaNodeAgentConnectionForControl(nodeId);
+      const response = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/jobs/${jobId}`,
+        method: "POST",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+      res
+        .status(202)
+        .json({
+          ok: true,
+          node: { id: Number(node.id), name: node.name },
+          agent_response_ms: response.response_ms,
+          data: response.data,
+        });
+    } catch (error) {
+      console.error("Media Node job stop error:", error.message);
+      res
+        .status(error.status || (error.code === "AGENT_TIMEOUT" ? 504 : 502))
+        .json({
+          ok: false,
+          message: "Media Node job stop failed",
+          error: error.message,
+        });
+    }
+  },
+);
+
+// ══════════════════════════════════════════
 // MEDIA NODE AGENT TRANSPORT SETTINGS — Phase 4C
 // Stores only the non-secret agent URL in media_nodes.metadata.agent_url.
 // Per-node bearer credentials stay in environment variables:

@@ -1,12 +1,11 @@
 "use strict";
 
-// Phase 4C — secure multi-node Media Node Agent transport foundation.
-// Read-only only. No remote process execution exists in this client.
+// Phase 4D.1 — secure multi-node transport plus strictly controlled job requests.
 
 const net = require("net");
 
 const DEFAULT_TIMEOUT_MS = 2500;
-const ALLOWED_PATHS = new Set([
+const ALLOWED_GET_PATHS = new Set([
   "/v1/health",
   "/v1/capabilities",
   "/v1/streams",
@@ -194,12 +193,20 @@ async function requestMediaNodeAgent({
   baseUrl,
   token,
   path,
+  method = "GET",
+  body = null,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   expectedNodeId = null,
 }) {
-  if (!ALLOWED_PATHS.has(path)) {
-    throw new Error(`Unsupported Media Node Agent path: ${path}`);
-  }
+  const normalizedMethod = String(method).toUpperCase();
+  const jobPath = /^\/v1\/jobs(?:\/[0-9a-f-]{36})?$/i.test(path);
+  const allowed =
+    (normalizedMethod === "GET" && (ALLOWED_GET_PATHS.has(path) || jobPath)) ||
+    (normalizedMethod === "POST" && jobPath);
+  if (!allowed)
+    throw new Error(
+      `Unsupported Media Node Agent request: ${normalizedMethod} ${path}`,
+    );
   if (!baseUrl) throw new Error("Media Node Agent URL is not configured");
   if (!token || String(token).length < 32) {
     throw new Error("Media Node Agent token is not configured for this node");
@@ -217,12 +224,14 @@ async function requestMediaNodeAgent({
         allowLoopbackHttp: true,
       })}${path}`,
       {
-        method: "GET",
+        method: normalizedMethod,
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/json",
+          ...(body != null ? { "Content-Type": "application/json" } : {}),
           "X-NLM-Control-Plane": "1",
         },
+        ...(body != null ? { body: JSON.stringify(body) } : {}),
         signal: controller.signal,
       },
     );

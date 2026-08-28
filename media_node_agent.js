@@ -7,7 +7,7 @@ const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 
 const {
   getLocalSystemMetrics,
@@ -15,11 +15,16 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4C.1";
+const AGENT_VERSION = "4D.1";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_REQUEST_BYTES = 16 * 1024;
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+const JOB_MAX_RUNTIME_MS = 15 * 1000;
+const jobs = new Map();
+const requestIds = new Map();
 
 const host = String(process.env.MEDIA_NODE_AGENT_HOST || DEFAULT_HOST).trim();
 const port = Math.max(
@@ -192,6 +197,177 @@ function baseIdentity() {
   };
 }
 
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_REQUEST_BYTES) {
+        const error = new Error("Request body too large");
+        error.status = 413;
+        reject(error);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve(text ? JSON.parse(text) : {});
+      } catch {
+        const error = new Error("Invalid JSON body");
+        error.status = 400;
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function publicJob(job) {
+  return {
+    id: job.id,
+    request_id: job.request_id,
+    type: job.type,
+    status: job.status,
+    created_at: job.created_at,
+    started_at: job.started_at,
+    finished_at: job.finished_at,
+    exit_code: job.exit_code,
+    signal: job.signal,
+    error: job.error,
+  };
+}
+
+function cleanupJobs() {
+  const cutoff = Date.now() - JOB_RETENTION_MS;
+  for (const [id, job] of jobs) {
+    const finished = job.finished_at ? Date.parse(job.finished_at) : 0;
+    if (finished && finished < cutoff) {
+      jobs.delete(id);
+      if (job.request_id) requestIds.delete(job.request_id);
+    }
+  }
+}
+
+function startFfmpegProbe(requestId) {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId))
+    return jobs.get(requestIds.get(requestId));
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    request_id: requestId || null,
+    type: "ffmpeg_probe",
+    status: "starting",
+    created_at: now,
+    started_at: now,
+    finished_at: null,
+    exit_code: null,
+    signal: null,
+    error: null,
+    child: null,
+    timer: null,
+  };
+  jobs.set(id, job);
+  if (requestId) requestIds.set(requestId, id);
+
+  // Fixed executable and fixed arguments: callers cannot supply commands, paths, URLs or shell text.
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc=size=320x180:rate=10",
+    "-t",
+    "3",
+    "-f",
+    "null",
+    "-",
+  ];
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    shell: false,
+  });
+  job.child = child;
+  job.status = "running";
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + chunk.toString("utf8")).slice(-2048);
+  });
+  child.on("error", (error) => {
+    job.status = "failed";
+    job.error = error.message;
+    job.finished_at = new Date().toISOString();
+    clearTimeout(job.timer);
+  });
+  child.on("exit", (code, signal) => {
+    job.exit_code = code;
+    job.signal = signal || null;
+    job.finished_at = new Date().toISOString();
+    job.child = null;
+    clearTimeout(job.timer);
+    if (job.status === "stopping") job.status = "stopped";
+    else if (code === 0) job.status = "succeeded";
+    else {
+      job.status = "failed";
+      job.error = stderr || `FFmpeg exited with code ${code}`;
+    }
+  });
+  job.timer = setTimeout(() => {
+    if (job.child && job.status === "running") {
+      job.status = "stopping";
+      job.error = "Job exceeded maximum runtime";
+      job.child.kill("SIGTERM");
+    }
+  }, JOB_MAX_RUNTIME_MS);
+  job.timer.unref?.();
+  return job;
+}
+
+async function handleCreateJob(req, res) {
+  const body = await readJsonBody(req);
+  if (body.type !== "ffmpeg_probe") {
+    sendJson(res, 400, { ok: false, error: "Unsupported job type" });
+    return;
+  }
+  const requestId =
+    body.request_id == null ? null : String(body.request_id).trim();
+  if (requestId && !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId)) {
+    sendJson(res, 400, { ok: false, error: "Invalid request_id" });
+    return;
+  }
+  const job = startFfmpegProbe(requestId);
+  sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
+}
+
+function handleGetJob(res, id) {
+  cleanupJobs();
+  const job = jobs.get(id);
+  if (!job) return sendJson(res, 404, { ok: false, error: "Job not found" });
+  sendJson(res, 200, { ok: true, ...baseIdentity(), job: publicJob(job) });
+}
+
+function handleStopJob(res, id) {
+  const job = jobs.get(id);
+  if (!job) return sendJson(res, 404, { ok: false, error: "Job not found" });
+  if (!["starting", "running"].includes(job.status) || !job.child) {
+    return sendJson(res, 409, {
+      ok: false,
+      error: `Job is already ${job.status}`,
+      job: publicJob(job),
+    });
+  }
+  job.status = "stopping";
+  job.child.kill("SIGTERM");
+  sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
+}
+
 async function handleHealth(res) {
   const startedAt = Date.now();
   const system = getLocalSystemMetrics();
@@ -219,15 +395,16 @@ function handleCapabilities(res) {
   sendJson(res, 200, {
     ok: true,
     ...baseIdentity(),
-    mode: "read_only",
+    mode: "controlled_jobs",
     capabilities: {
       health: true,
       system_metrics: true,
       srs_health: true,
       stream_inventory: true,
       ffmpeg_process_count: true,
-      remote_job_start: false,
-      remote_job_stop: false,
+      remote_job_start: true,
+      remote_job_stop: true,
+      allowed_job_types: ["ffmpeg_probe"],
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
@@ -280,14 +457,27 @@ const requestHandler = async (req, res) => {
       `${requestProtocol}://${req.headers.host || "localhost"}`,
     );
 
-    if (req.method !== "GET") {
-      sendJson(res, 405, { ok: false, error: "Method not allowed" });
-      return;
-    }
-
     if (!isAuthorized(req)) {
       res.setHeader("WWW-Authenticate", 'Bearer realm="nlm-media-node-agent"');
       sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/jobs") {
+      await handleCreateJob(req, res);
+      return;
+    }
+    const jobMatch = url.pathname.match(/^\/v1\/jobs\/([0-9a-f-]{36})$/i);
+    if (jobMatch && req.method === "GET") {
+      handleGetJob(res, jobMatch[1]);
+      return;
+    }
+    if (jobMatch && req.method === "POST") {
+      handleStopJob(res, jobMatch[1]);
+      return;
+    }
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method not allowed" });
       return;
     }
 
@@ -353,7 +543,7 @@ server.on("clientError", (error, socket) => {
 
 server.listen(port, host, () => {
   console.log(
-    `[MediaNodeAgent] v${AGENT_VERSION} listening on ${useTls ? "https" : "http"}://${host}:${port} node=${nodeId || "unset"} mode=read-only`,
+    `[MediaNodeAgent] v${AGENT_VERSION} listening on ${useTls ? "https" : "http"}://${host}:${port} node=${nodeId || "unset"} mode=controlled-jobs`,
   );
 });
 
