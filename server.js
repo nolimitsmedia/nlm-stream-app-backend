@@ -4412,7 +4412,7 @@ app.get(
           id,
           name,
           hostname,
-          public_ip::text AS public_ip,
+          host(public_ip) AS public_ip,
           private_ip::text AS private_ip,
           region,
           role,
@@ -10852,7 +10852,7 @@ app.get(
         c.*,
         mn.name AS media_node_name,
         mn.hostname AS media_node_hostname,
-        mn.public_ip::text AS media_node_public_ip,
+        host(mn.public_ip) AS media_node_public_ip,
         mn.region AS media_node_region,
         mn.status AS media_node_status,
         mn.is_enabled AS media_node_enabled,
@@ -11018,7 +11018,7 @@ app.patch(
       let node = null;
       if (mediaNodeId !== null) {
         const nodeResult = await pool.query(
-          `SELECT id, name, hostname, public_ip::text AS public_ip,
+          `SELECT id, name, hostname, host(public_ip) AS public_ip,
                   region, status, is_enabled, is_draining
            FROM media_nodes WHERE id = $1`,
           [mediaNodeId],
@@ -11029,19 +11029,15 @@ app.patch(
             .status(404)
             .json({ ok: false, message: "Media node not found" });
         if (!node.is_enabled)
-          return res
-            .status(409)
-            .json({
-              ok: false,
-              message: "Cannot assign a channel to a disabled media node.",
-            });
+          return res.status(409).json({
+            ok: false,
+            message: "Cannot assign a channel to a disabled media node.",
+          });
         if (node.is_draining)
-          return res
-            .status(409)
-            .json({
-              ok: false,
-              message: "Cannot assign a channel to a draining media node.",
-            });
+          return res.status(409).json({
+            ok: false,
+            message: "Cannot assign a channel to a draining media node.",
+          });
       }
 
       const updated = await pool.query(
@@ -11076,12 +11072,10 @@ app.patch(
       });
     } catch (error) {
       console.error("Update channel media node error:", error);
-      res
-        .status(500)
-        .json({
-          ok: false,
-          message: "Failed to update channel media-node assignment",
-        });
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update channel media-node assignment",
+      });
     }
   },
 );
