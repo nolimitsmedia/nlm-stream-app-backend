@@ -4793,8 +4793,9 @@ app.get(
 );
 
 // ══════════════════════════════════════════
-// MEDIA NODE CONTROLLED JOBS — Phase 4D.1
-// Super Admin only. The only allowed job is a fixed, harmless FFmpeg probe.
+// MEDIA NODE CONTROLLED JOBS — Phase 4D.2
+// Super Admin only. Allowed jobs are fixed harmless FFmpeg probes; one short
+// probe validates execution and one fixed 10-second probe validates stopping.
 // No arbitrary executable, command line, URL, file path, stream key or shell
 // input is accepted by either the control plane or the agent.
 // ══════════════════════════════════════════
@@ -4838,10 +4839,25 @@ app.post(
         return res
           .status(400)
           .json({ ok: false, message: "Invalid media node id" });
-      if (req.body?.type !== "ffmpeg_probe")
-        return res
-          .status(400)
-          .json({ ok: false, message: "Phase 4D.1 only permits ffmpeg_probe" });
+      const allowedKeys = new Set(["type", "request_id"]);
+      const unknownKeys = Object.keys(req.body || {}).filter(
+        (key) => !allowedKeys.has(key),
+      );
+      if (unknownKeys.length) {
+        return res.status(400).json({
+          ok: false,
+          message: `Unsupported job fields: ${unknownKeys.join(", ")}`,
+        });
+      }
+
+      const allowedTypes = new Set(["ffmpeg_probe", "ffmpeg_stop_probe"]);
+      if (!allowedTypes.has(req.body?.type)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Phase 4D.2 only permits ffmpeg_probe or ffmpeg_stop_probe",
+        });
+      }
+
       const requestId =
         req.body?.request_id == null
           ? null
@@ -4857,18 +4873,16 @@ app.post(
         token: connection.token,
         path: "/v1/jobs",
         method: "POST",
-        body: { type: "ffmpeg_probe", request_id: requestId },
+        body: { type: req.body.type, request_id: requestId },
         timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
         expectedNodeId: node.id,
       });
-      res
-        .status(202)
-        .json({
-          ok: true,
-          node: { id: Number(node.id), name: node.name },
-          agent_response_ms: response.response_ms,
-          data: response.data,
-        });
+      res.status(202).json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: response.response_ms,
+        data: response.data,
+      });
     } catch (error) {
       console.error("Media Node job create error:", error.message);
       res
@@ -4953,14 +4967,12 @@ app.post(
         timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
         expectedNodeId: node.id,
       });
-      res
-        .status(202)
-        .json({
-          ok: true,
-          node: { id: Number(node.id), name: node.name },
-          agent_response_ms: response.response_ms,
-          data: response.data,
-        });
+      res.status(202).json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: response.response_ms,
+        data: response.data,
+      });
     } catch (error) {
       console.error("Media Node job stop error:", error.message);
       res
@@ -11735,19 +11747,15 @@ app.patch(
             .status(404)
             .json({ ok: false, message: "Media node not found" });
         if (!node.is_enabled)
-          return res
-            .status(409)
-            .json({
-              ok: false,
-              message: "Cannot assign a channel to a disabled media node.",
-            });
+          return res.status(409).json({
+            ok: false,
+            message: "Cannot assign a channel to a disabled media node.",
+          });
         if (node.is_draining)
-          return res
-            .status(409)
-            .json({
-              ok: false,
-              message: "Cannot assign a channel to a draining media node.",
-            });
+          return res.status(409).json({
+            ok: false,
+            message: "Cannot assign a channel to a draining media node.",
+          });
 
         const staleAfterSeconds = Math.max(
           60,
@@ -11820,12 +11828,10 @@ app.patch(
       });
     } catch (error) {
       console.error("Update channel media node error:", error);
-      res
-        .status(500)
-        .json({
-          ok: false,
-          message: "Failed to update channel media-node assignment",
-        });
+      res.status(500).json({
+        ok: false,
+        message: "Failed to update channel media-node assignment",
+      });
     }
   },
 );

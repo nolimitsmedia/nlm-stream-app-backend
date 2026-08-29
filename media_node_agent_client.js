@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.1 — secure multi-node transport plus strictly controlled job requests.
+// Phase 4D.2 — secure transport plus strict controlled-job request validation.
 
 const net = require("net");
 
@@ -207,6 +207,32 @@ async function requestMediaNodeAgent({
     throw new Error(
       `Unsupported Media Node Agent request: ${normalizedMethod} ${path}`,
     );
+
+  // Defense in depth: controlled job creation has an exact schema. Never let
+  // future callers smuggle commands, URLs, paths, arbitrary FFmpeg arguments,
+  // or other execution parameters through this transport helper.
+  if (normalizedMethod === "POST" && path === "/v1/jobs") {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new Error("Media Node job body must be an object");
+    }
+    const allowedKeys = new Set(["type", "request_id"]);
+    const unknownKeys = Object.keys(body).filter(
+      (key) => !allowedKeys.has(key),
+    );
+    if (unknownKeys.length) {
+      throw new Error(
+        `Unsupported Media Node job fields: ${unknownKeys.join(", ")}`,
+      );
+    }
+    if (!["ffmpeg_probe", "ffmpeg_stop_probe"].includes(body.type)) {
+      throw new Error("Unsupported Media Node job type");
+    }
+  } else if (body != null) {
+    throw new Error(
+      `Request body is not permitted for ${normalizedMethod} ${path}`,
+    );
+  }
+
   if (!baseUrl) throw new Error("Media Node Agent URL is not configured");
   if (!token || String(token).length < 32) {
     throw new Error("Media Node Agent token is not configured for this node");

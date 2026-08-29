@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.1";
+const AGENT_VERSION = "4D.2";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -252,7 +252,7 @@ function cleanupJobs() {
   }
 }
 
-function startFfmpegProbe(requestId) {
+function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
   cleanupJobs();
   if (requestId && requestIds.has(requestId))
     return jobs.get(requestIds.get(requestId));
@@ -261,7 +261,7 @@ function startFfmpegProbe(requestId) {
   const job = {
     id,
     request_id: requestId || null,
-    type: "ffmpeg_probe",
+    type: jobType,
     status: "starting",
     created_at: now,
     started_at: now,
@@ -276,6 +276,7 @@ function startFfmpegProbe(requestId) {
   if (requestId) requestIds.set(requestId, id);
 
   // Fixed executable and fixed arguments: callers cannot supply commands, paths, URLs or shell text.
+  const durationSeconds = jobType === "ffmpeg_stop_probe" ? "10" : "3";
   const args = [
     "-hide_banner",
     "-loglevel",
@@ -285,7 +286,7 @@ function startFfmpegProbe(requestId) {
     "-i",
     "testsrc=size=320x180:rate=10",
     "-t",
-    "3",
+    durationSeconds,
     "-f",
     "null",
     "-",
@@ -332,17 +333,44 @@ function startFfmpegProbe(requestId) {
 
 async function handleCreateJob(req, res) {
   const body = await readJsonBody(req);
-  if (body.type !== "ffmpeg_probe") {
+  const allowedKeys = new Set(["type", "request_id"]);
+  const unknownKeys = Object.keys(body || {}).filter(
+    (key) => !allowedKeys.has(key),
+  );
+  if (unknownKeys.length) {
+    sendJson(res, 400, {
+      ok: false,
+      error: `Unsupported job fields: ${unknownKeys.join(", ")}`,
+    });
+    return;
+  }
+
+  const allowedTypes = new Set(["ffmpeg_probe", "ffmpeg_stop_probe"]);
+  if (!allowedTypes.has(body.type)) {
     sendJson(res, 400, { ok: false, error: "Unsupported job type" });
     return;
   }
+
   const requestId =
     body.request_id == null ? null : String(body.request_id).trim();
   if (requestId && !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId)) {
     sendJson(res, 400, { ok: false, error: "Invalid request_id" });
     return;
   }
-  const job = startFfmpegProbe(requestId);
+
+  if (requestId && requestIds.has(requestId)) {
+    const existing = jobs.get(requestIds.get(requestId));
+    if (existing && existing.type !== body.type) {
+      sendJson(res, 409, {
+        ok: false,
+        error: "request_id is already associated with a different job type",
+        job: publicJob(existing),
+      });
+      return;
+    }
+  }
+
+  const job = startFfmpegProbe(requestId, body.type);
   sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
 }
 
@@ -404,7 +432,7 @@ function handleCapabilities(res) {
       ffmpeg_process_count: true,
       remote_job_start: true,
       remote_job_stop: true,
-      allowed_job_types: ["ffmpeg_probe"],
+      allowed_job_types: ["ffmpeg_probe", "ffmpeg_stop_probe"],
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
