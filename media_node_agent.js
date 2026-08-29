@@ -15,10 +15,11 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.2";
+const AGENT_VERSION = "4D.3";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
+const DEFAULT_SRS_HLS_BASE_URL = "http://127.0.0.1:8080";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const JOB_RETENTION_MS = 60 * 60 * 1000;
@@ -35,6 +36,9 @@ const srsApiUrl = String(
   process.env.MEDIA_NODE_AGENT_SRS_API_URL ||
     process.env.SRS_API_URL ||
     DEFAULT_SRS_API_URL,
+).replace(/\/$/, "");
+const srsHlsBaseUrl = String(
+  process.env.MEDIA_NODE_AGENT_SRS_HLS_BASE_URL || DEFAULT_SRS_HLS_BASE_URL,
 ).replace(/\/$/, "");
 const nodeId = String(process.env.MEDIA_NODE_ID || "").trim();
 const nodeName = String(process.env.MEDIA_NODE_NAME || os.hostname()).trim();
@@ -231,6 +235,7 @@ function publicJob(job) {
     id: job.id,
     request_id: job.request_id,
     type: job.type,
+    channel_id: job.channel_id ?? null,
     status: job.status,
     created_at: job.created_at,
     started_at: job.started_at,
@@ -252,10 +257,11 @@ function cleanupJobs() {
   }
 }
 
-function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
-  cleanupJobs();
-  if (requestId && requestIds.has(requestId))
-    return jobs.get(requestIds.get(requestId));
+function isValidStreamKey(value) {
+  return /^[A-Za-z0-9_-]{1,255}$/.test(String(value || ""));
+}
+
+function makeJob(requestId, jobType, metadata = {}) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const job = {
@@ -271,9 +277,113 @@ function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
     error: null,
     child: null,
     timer: null,
+    ...metadata,
   };
   jobs.set(id, job);
   if (requestId) requestIds.set(requestId, id);
+  return job;
+}
+
+function attachJobProcess(job, child) {
+  job.child = child;
+  job.status = "running";
+  let stderr = "";
+
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + chunk.toString("utf8")).slice(-2048);
+  });
+
+  child.on("error", (error) => {
+    job.status = "failed";
+    job.error = error.message;
+    job.finished_at = new Date().toISOString();
+    job.child = null;
+    clearTimeout(job.timer);
+  });
+
+  child.on("exit", (code, signal) => {
+    job.exit_code = code;
+    job.signal = signal || null;
+    job.finished_at = new Date().toISOString();
+    job.child = null;
+    clearTimeout(job.timer);
+
+    if (job.status === "stopping") {
+      job.status = "stopped";
+    } else if (code === 0) {
+      job.status = "succeeded";
+    } else {
+      job.status = "failed";
+      job.error = stderr || `FFmpeg exited with code ${code}`;
+    }
+  });
+
+  job.timer = setTimeout(() => {
+    if (job.child && job.status === "running") {
+      job.status = "stopping";
+      job.error = "Job exceeded maximum runtime";
+      job.child.kill("SIGTERM");
+    }
+  }, JOB_MAX_RUNTIME_MS);
+  job.timer.unref?.();
+  return job;
+}
+
+function startLiveStreamProbe(requestId, channelId, streamKey) {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId)) {
+    return jobs.get(requestIds.get(requestId));
+  }
+
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    throw new Error("Invalid channel_id");
+  }
+  if (!isValidStreamKey(streamKey)) {
+    throw new Error("Invalid stream key");
+  }
+
+  const job = makeJob(requestId, "live_stream_probe", {
+    channel_id: channelId,
+  });
+
+  // Real-media validation is intentionally read-only:
+  // - input URL is constructed locally from a backend-resolved stream key
+  // - no caller-provided URL/path/FFmpeg args are accepted
+  // - media is copied to the null muxer; nothing is published or written
+  const inputUrl = `${srsHlsBaseUrl}/live/${encodeURIComponent(streamKey)}.m3u8`;
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    inputUrl,
+    "-t",
+    "5",
+    "-map",
+    "0:v:0?",
+    "-map",
+    "0:a:0?",
+    "-c",
+    "copy",
+    "-f",
+    "null",
+    "-",
+  ];
+
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    shell: false,
+  });
+
+  return attachJobProcess(job, child);
+}
+
+function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId))
+    return jobs.get(requestIds.get(requestId));
+
+  const job = makeJob(requestId, jobType);
 
   // Fixed executable and fixed arguments: callers cannot supply commands, paths, URLs or shell text.
   const durationSeconds = jobType === "ffmpeg_stop_probe" ? "10" : "3";
@@ -300,59 +410,37 @@ function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false,
   });
-  job.child = child;
-  job.status = "running";
-  let stderr = "";
-  child.stderr.on("data", (chunk) => {
-    stderr = (stderr + chunk.toString("utf8")).slice(-2048);
-  });
-  child.on("error", (error) => {
-    job.status = "failed";
-    job.error = error.message;
-    job.finished_at = new Date().toISOString();
-    clearTimeout(job.timer);
-  });
-  child.on("exit", (code, signal) => {
-    job.exit_code = code;
-    job.signal = signal || null;
-    job.finished_at = new Date().toISOString();
-    job.child = null;
-    clearTimeout(job.timer);
-    if (job.status === "stopping") job.status = "stopped";
-    else if (code === 0) job.status = "succeeded";
-    else {
-      job.status = "failed";
-      job.error = stderr || `FFmpeg exited with code ${code}`;
-    }
-  });
-  job.timer = setTimeout(() => {
-    if (job.child && job.status === "running") {
-      job.status = "stopping";
-      job.error = "Job exceeded maximum runtime";
-      job.child.kill("SIGTERM");
-    }
-  }, JOB_MAX_RUNTIME_MS);
-  job.timer.unref?.();
-  return job;
+
+  return attachJobProcess(job, child);
 }
 
 async function handleCreateJob(req, res) {
   const body = await readJsonBody(req);
-  const allowedKeys = new Set(["type", "request_id"]);
-  const unknownKeys = Object.keys(body || {}).filter(
-    (key) => !allowedKeys.has(key),
-  );
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { ok: false, error: "Job body must be an object" });
+    return;
+  }
+
+  const allowedTypes = new Set([
+    "ffmpeg_probe",
+    "ffmpeg_stop_probe",
+    "live_stream_probe",
+  ]);
+  if (!allowedTypes.has(body.type)) {
+    sendJson(res, 400, { ok: false, error: "Unsupported job type" });
+    return;
+  }
+
+  const allowedKeys =
+    body.type === "live_stream_probe"
+      ? new Set(["type", "request_id", "channel_id", "stream_key"])
+      : new Set(["type", "request_id"]);
+  const unknownKeys = Object.keys(body).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length) {
     sendJson(res, 400, {
       ok: false,
       error: `Unsupported job fields: ${unknownKeys.join(", ")}`,
     });
-    return;
-  }
-
-  const allowedTypes = new Set(["ffmpeg_probe", "ffmpeg_stop_probe"]);
-  if (!allowedTypes.has(body.type)) {
-    sendJson(res, 400, { ok: false, error: "Unsupported job type" });
     return;
   }
 
@@ -375,7 +463,23 @@ async function handleCreateJob(req, res) {
     }
   }
 
-  const job = startFfmpegProbe(requestId, body.type);
+  let job;
+  if (body.type === "live_stream_probe") {
+    const channelId = Number(body.channel_id);
+    const streamKey = String(body.stream_key || "").trim();
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid channel_id" });
+      return;
+    }
+    if (!isValidStreamKey(streamKey)) {
+      sendJson(res, 400, { ok: false, error: "Invalid stream key" });
+      return;
+    }
+    job = startLiveStreamProbe(requestId, channelId, streamKey);
+  } else {
+    job = startFfmpegProbe(requestId, body.type);
+  }
+
   sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
 }
 
@@ -437,7 +541,11 @@ function handleCapabilities(res) {
       ffmpeg_process_count: true,
       remote_job_start: true,
       remote_job_stop: true,
-      allowed_job_types: ["ffmpeg_probe", "ffmpeg_stop_probe"],
+      allowed_job_types: [
+        "ffmpeg_probe",
+        "ffmpeg_stop_probe",
+        "live_stream_probe",
+      ],
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,

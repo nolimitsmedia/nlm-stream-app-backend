@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.2 — secure transport plus strict controlled-job request validation.
+// Phase 4D.3 — secure transport plus strict controlled real-media job validation.
 
 const net = require("net");
 
@@ -215,7 +215,19 @@ async function requestMediaNodeAgent({
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw new Error("Media Node job body must be an object");
     }
-    const allowedKeys = new Set(["type", "request_id"]);
+    const allowedTypes = new Set([
+      "ffmpeg_probe",
+      "ffmpeg_stop_probe",
+      "live_stream_probe",
+    ]);
+    if (!allowedTypes.has(body.type)) {
+      throw new Error("Unsupported Media Node job type");
+    }
+
+    const allowedKeys =
+      body.type === "live_stream_probe"
+        ? new Set(["type", "request_id", "channel_id", "stream_key"])
+        : new Set(["type", "request_id"]);
     const unknownKeys = Object.keys(body).filter(
       (key) => !allowedKeys.has(key),
     );
@@ -224,8 +236,15 @@ async function requestMediaNodeAgent({
         `Unsupported Media Node job fields: ${unknownKeys.join(", ")}`,
       );
     }
-    if (!["ffmpeg_probe", "ffmpeg_stop_probe"].includes(body.type)) {
-      throw new Error("Unsupported Media Node job type");
+
+    if (body.type === "live_stream_probe") {
+      const channelId = Number(body.channel_id);
+      if (!Number.isInteger(channelId) || channelId <= 0) {
+        throw new Error("Invalid Media Node job channel_id");
+      }
+      if (!/^[A-Za-z0-9_-]{1,255}$/.test(String(body.stream_key || ""))) {
+        throw new Error("Invalid Media Node job stream key");
+      }
     }
   } else if (body != null) {
     throw new Error(

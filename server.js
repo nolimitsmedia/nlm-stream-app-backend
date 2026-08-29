@@ -4793,11 +4793,12 @@ app.get(
 );
 
 // ══════════════════════════════════════════
-// MEDIA NODE CONTROLLED JOBS — Phase 4D.2
-// Super Admin only. Allowed jobs are fixed harmless FFmpeg probes; one short
-// probe validates execution and one fixed 10-second probe validates stopping.
-// No arbitrary executable, command line, URL, file path, stream key or shell
-// input is accepted by either the control plane or the agent.
+// MEDIA NODE CONTROLLED JOBS — Phase 4D.3
+// Super Admin only. Synthetic probes remain available, plus a read-only
+// live_stream_probe that validates real media from a channel assigned to the
+// requested node. The browser supplies only channel_id; the control plane
+// resolves the stream key from PostgreSQL and the agent constructs a fixed
+// local SRS HLS URL. No caller-supplied URL/path/FFmpeg args are accepted.
 // ══════════════════════════════════════════
 async function getMediaNodeAgentConnectionForControl(nodeId) {
   const nodeResult = await queryWithRetry(
@@ -4835,12 +4836,45 @@ app.post(
   async (req, res) => {
     try {
       const nodeId = Number(req.params.id);
-      if (!Number.isInteger(nodeId) || nodeId <= 0)
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
         return res
           .status(400)
           .json({ ok: false, message: "Invalid media node id" });
-      const allowedKeys = new Set(["type", "request_id"]);
-      const unknownKeys = Object.keys(req.body || {}).filter(
+      }
+
+      if (
+        !req.body ||
+        typeof req.body !== "object" ||
+        Array.isArray(req.body)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message: "Job body must be an object",
+        });
+      }
+
+      const allowedTypes = new Set([
+        "ffmpeg_probe",
+        "ffmpeg_stop_probe",
+        "live_stream_probe",
+      ]);
+      const jobType = req.body.type;
+      if (!allowedTypes.has(jobType)) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Phase 4D.3 permits ffmpeg_probe, ffmpeg_stop_probe, or live_stream_probe",
+        });
+      }
+
+      // Browser/API callers never provide stream_key. For the real-media probe
+      // they provide only channel_id; the server resolves the key after proving
+      // that the channel is assigned to the requested media node.
+      const allowedKeys =
+        jobType === "live_stream_probe"
+          ? new Set(["type", "request_id", "channel_id"])
+          : new Set(["type", "request_id"]);
+      const unknownKeys = Object.keys(req.body).filter(
         (key) => !allowedKeys.has(key),
       );
       if (unknownKeys.length) {
@@ -4850,33 +4884,79 @@ app.post(
         });
       }
 
-      const allowedTypes = new Set(["ffmpeg_probe", "ffmpeg_stop_probe"]);
-      if (!allowedTypes.has(req.body?.type)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Phase 4D.2 only permits ffmpeg_probe or ffmpeg_stop_probe",
-        });
-      }
-
       const requestId =
-        req.body?.request_id == null
-          ? null
-          : String(req.body.request_id).trim();
-      if (requestId && !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId))
+        req.body.request_id == null ? null : String(req.body.request_id).trim();
+      if (requestId && !/^[A-Za-z0-9._:-]{1,128}$/.test(requestId)) {
         return res
           .status(400)
           .json({ ok: false, message: "Invalid request_id" });
+      }
+
       const { node, connection } =
         await getMediaNodeAgentConnectionForControl(nodeId);
+
+      let agentBody = { type: jobType, request_id: requestId };
+
+      if (jobType === "live_stream_probe") {
+        const channelId = Number(req.body.channel_id);
+        if (!Number.isInteger(channelId) || channelId <= 0) {
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid channel_id" });
+        }
+
+        const channelResult = await queryWithRetry(
+          `SELECT id, name, stream_key, media_node_id, is_live
+           FROM channels
+           WHERE id = $1
+           LIMIT 1`,
+          [channelId],
+        );
+        const channel = channelResult.rows[0];
+        if (!channel) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Channel not found" });
+        }
+        if (Number(channel.media_node_id) !== nodeId) {
+          return res.status(409).json({
+            ok: false,
+            message: "Channel is not assigned to the requested media node",
+          });
+        }
+        if (channel.is_live !== true) {
+          return res.status(409).json({
+            ok: false,
+            message: "Channel must be live before running live_stream_probe",
+          });
+        }
+
+        const streamKey = String(channel.stream_key || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey)) {
+          return res.status(409).json({
+            ok: false,
+            message: "Channel stream key is not valid for controlled probing",
+          });
+        }
+
+        agentBody = {
+          type: jobType,
+          request_id: requestId,
+          channel_id: channelId,
+          stream_key: streamKey,
+        };
+      }
+
       const response = await requestMediaNodeAgent({
         baseUrl: connection.baseUrl,
         token: connection.token,
         path: "/v1/jobs",
         method: "POST",
-        body: { type: req.body.type, request_id: requestId },
+        body: agentBody,
         timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
         expectedNodeId: node.id,
       });
+
       res.status(202).json({
         ok: true,
         node: { id: Number(node.id), name: node.name },
