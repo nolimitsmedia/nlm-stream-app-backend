@@ -281,6 +281,11 @@ function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
     "-hide_banner",
     "-loglevel",
     "error",
+
+    // The stop-validation probe must run in real wall-clock time so the
+    // control plane can exercise active-process termination reliably.
+    ...(jobType === "ffmpeg_stop_probe" ? ["-re"] : []),
+
     "-f",
     "lavfi",
     "-i",
