@@ -237,30 +237,30 @@ async function requestMediaNodeAgent({
     );
 
     const text = await response.text();
-    let body = null;
+    let responseBody = null;
     try {
-      body = text ? JSON.parse(text) : null;
+      responseBody = text ? JSON.parse(text) : null;
     } catch {
-      body = null;
+      responseBody = null;
     }
 
     if (!response.ok) {
       const error = new Error(
-        body?.error ||
-          body?.message ||
+        responseBody?.error ||
+          responseBody?.message ||
           `Media Node Agent returned HTTP ${response.status}`,
       );
       error.status = response.status;
       throw error;
     }
 
-    verifyAgentIdentity(body, expectedNodeId);
+    verifyAgentIdentity(responseBody, expectedNodeId);
 
     return {
       ok: true,
       status: response.status,
       response_ms: Date.now() - startedAt,
-      data: body,
+      data: responseBody,
     };
   } catch (error) {
     if (error?.name === "AbortError") {
