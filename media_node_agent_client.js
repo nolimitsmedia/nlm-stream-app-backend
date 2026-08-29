@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.4A — secure transport plus strict controlled-job request validation.
+// Phase 4D.4B — secure transport plus strict controlled-job request validation.
 
 const net = require("net");
 
@@ -220,6 +220,7 @@ async function requestMediaNodeAgent({
       "ffmpeg_stop_probe",
       "live_stream_probe",
       "pull_source_probe",
+      "pull_source_start",
     ]);
     if (!allowedTypes.has(body.type)) {
       throw new Error("Unsupported Media Node job type");
@@ -228,7 +229,7 @@ async function requestMediaNodeAgent({
     const allowedKeys =
       body.type === "live_stream_probe"
         ? new Set(["type", "request_id", "channel_id", "stream_key"])
-        : body.type === "pull_source_probe"
+        : body.type === "pull_source_probe" || body.type === "pull_source_start"
           ? new Set([
               "type",
               "request_id",
@@ -236,6 +237,7 @@ async function requestMediaNodeAgent({
               "channel_id",
               "protocol",
               "source_url",
+              ...(body.type === "pull_source_start" ? ["stream_key"] : []),
             ])
           : new Set(["type", "request_id"]);
 
@@ -258,7 +260,10 @@ async function requestMediaNodeAgent({
       }
     }
 
-    if (body.type === "pull_source_probe") {
+    if (
+      body.type === "pull_source_probe" ||
+      body.type === "pull_source_start"
+    ) {
       const sourceId = Number(body.source_id);
       const channelId = Number(body.channel_id);
       const protocol = String(body.protocol || "")
@@ -274,11 +279,16 @@ async function requestMediaNodeAgent({
       if (
         !["rtmp", "rtmps", "rtsp", "srt", "hls", "http_flv"].includes(protocol)
       ) {
-        throw new Error("Unsupported Media Node Pull Source probe protocol");
+        throw new Error("Unsupported Media Node Pull Source protocol");
       }
       const sourceUrl = String(body.source_url || "").trim();
       if (!sourceUrl || sourceUrl.length > 4096) {
-        throw new Error("Invalid Media Node Pull Source probe URL");
+        throw new Error("Invalid Media Node Pull Source URL");
+      }
+      if (body.type === "pull_source_start") {
+        if (!/^[A-Za-z0-9_-]{1,255}$/.test(String(body.stream_key || ""))) {
+          throw new Error("Invalid Media Node Pull Source stream key");
+        }
       }
     }
   } else if (body != null) {

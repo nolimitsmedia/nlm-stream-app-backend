@@ -4796,7 +4796,7 @@ app.get(
 );
 
 // ══════════════════════════════════════════
-// MEDIA NODE CONTROLLED JOBS — Phase 4D.4A
+// MEDIA NODE CONTROLLED JOBS — Phase 4D.4B
 // Super Admin only. Synthetic probes remain available, plus read-only real
 // media probes for an assigned channel and for a configured Pull Source.
 // Browser callers never provide stream keys, source URLs, commands or FFmpeg args.
@@ -4859,20 +4859,21 @@ app.post(
         "ffmpeg_stop_probe",
         "live_stream_probe",
         "pull_source_probe",
+        "pull_source_start",
       ]);
       const jobType = req.body.type;
       if (!allowedTypes.has(jobType)) {
         return res.status(400).json({
           ok: false,
           message:
-            "Phase 4D.4A permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, or pull_source_probe",
+            "Phase 4D.4B permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
         });
       }
 
       const allowedKeys =
         jobType === "live_stream_probe"
           ? new Set(["type", "request_id", "channel_id"])
-          : jobType === "pull_source_probe"
+          : jobType === "pull_source_probe" || jobType === "pull_source_start"
             ? new Set(["type", "request_id", "source_id", "channel_id"])
             : new Set(["type", "request_id"]);
 
@@ -4899,7 +4900,7 @@ app.post(
 
       let agentBody = { type: jobType, request_id: requestId };
 
-      if (jobType === "pull_source_probe") {
+      if (jobType === "pull_source_probe" || jobType === "pull_source_start") {
         const sourceId = Number(req.body.source_id);
         const channelId = Number(req.body.channel_id);
 
@@ -4916,7 +4917,8 @@ app.post(
 
         const sourceResult = await queryWithRetry(
           `SELECT ps.id, ps.channel_id, ps.organization_id, ps.protocol,
-                  ps.source_url, ps.enabled, c.media_node_id
+                  ps.source_url, ps.enabled, ps.status, ps.is_running,
+                  ps.is_active_source, c.media_node_id, c.stream_key, c.is_live
            FROM channel_pull_sources ps
            JOIN channels c
              ON c.id = ps.channel_id
@@ -4943,8 +4945,7 @@ app.post(
         if (!source.enabled) {
           return res.status(409).json({
             ok: false,
-            message:
-              "Pull Source must be enabled before running pull_source_probe",
+            message: `Pull Source must be enabled before running ${jobType}`,
           });
         }
 
@@ -4960,7 +4961,7 @@ app.post(
           return res.status(409).json({
             ok: false,
             message:
-              "Pull Source protocol is not supported for controlled probing",
+              "Pull Source protocol is not supported for controlled node execution",
           });
         }
 
@@ -4968,8 +4969,43 @@ app.post(
         if (!sourceUrl || String(sourceUrl).length > 4096) {
           return res.status(409).json({
             ok: false,
-            message: "Pull Source URL could not be resolved for probing",
+            message:
+              "Pull Source URL could not be resolved for controlled node execution",
           });
+        }
+
+        // Re-run the production Pull Source URL/SSRF validation immediately
+        // before handing the decrypted endpoint to the assigned node. Browser
+        // callers never provide or receive source_url or stream_key.
+        await pullSourceManager.validateSourceUrl(sourceUrl, protocol);
+
+        const streamKey = String(source.stream_key || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey)) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Channel stream key is not valid for controlled node execution",
+          });
+        }
+
+        if (jobType === "pull_source_start") {
+          if (source.is_running === true || source.is_active_source === true) {
+            return res.status(409).json({
+              ok: false,
+              message:
+                "Pull Source is already active in the production Pull Source manager",
+            });
+          }
+
+          // First publisher wins. Phase 4D.4B must never collide with OBS, a
+          // local Pull Source worker, or another publisher on the canonical key.
+          if (await pullSourceManager.isSrsStreamLive(streamKey)) {
+            return res.status(409).json({
+              ok: false,
+              message:
+                "Channel already has a live publisher. Stop OBS/the existing publisher before controlled pull_source_start.",
+            });
+          }
         }
 
         agentBody = {
@@ -4979,6 +5015,7 @@ app.post(
           channel_id: channelId,
           protocol,
           source_url: sourceUrl,
+          ...(jobType === "pull_source_start" ? { stream_key: streamKey } : {}),
         };
       } else if (jobType === "live_stream_probe") {
         const channelId = Number(req.body.channel_id);

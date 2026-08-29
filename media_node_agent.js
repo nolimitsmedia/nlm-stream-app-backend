@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4A";
+const AGENT_VERSION = "4D.4B";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -34,6 +34,18 @@ const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
   "hls",
   "http_flv",
 ]);
+const PULL_SOURCE_START_PROTOCOLS = PULL_SOURCE_PROBE_PROTOCOLS;
+const INTERNAL_RTMP_BASE = String(
+  process.env.PULL_SOURCE_INTERNAL_RTMP_BASE || "rtmp://127.0.0.1:1935/live",
+).replace(/\/+$/, "");
+const RTSP_TRANSPORT = (() => {
+  const value = String(process.env.PULL_SOURCE_RTSP_TRANSPORT || "tcp")
+    .trim()
+    .toLowerCase();
+  return ["tcp", "udp", "udp_multicast", "http", "https"].includes(value)
+    ? value
+    : "tcp";
+})();
 
 const host = String(process.env.MEDIA_NODE_AGENT_HOST || DEFAULT_HOST).trim();
 const port = Math.max(
@@ -238,7 +250,25 @@ function readJsonBody(req) {
   });
 }
 
+function sanitizeJobError(job, value) {
+  if (!value) return null;
+  let text = String(value);
+  if (job?.type === "pull_source_probe" || job?.type === "pull_source_start") {
+    for (const sensitive of job.sensitive_values || []) {
+      if (sensitive)
+        text = text.split(String(sensitive)).join("[source-url-redacted]");
+    }
+    text = text.replace(
+      /(?:rtmps?|rtsp|srt|https?):\/\/[^\s]+/gi,
+      "[source-url-redacted]",
+    );
+  }
+  return text;
+}
+
 function publicJob(job) {
+  const startedMs = job.started_at ? Date.parse(job.started_at) : 0;
+  const finishedMs = job.finished_at ? Date.parse(job.finished_at) : Date.now();
   return {
     id: job.id,
     request_id: job.request_id,
@@ -246,13 +276,19 @@ function publicJob(job) {
     channel_id: job.channel_id ?? null,
     source_id: job.source_id ?? null,
     protocol: job.protocol ?? null,
+    persistent: job.persistent === true,
     status: job.status,
+    bitrate_kbps: Math.max(0, Math.round(Number(job.bitrate_kbps || 0))),
+    uptime_seconds:
+      startedMs && ["starting", "running", "stopping"].includes(job.status)
+        ? Math.max(0, Math.floor((finishedMs - startedMs) / 1000))
+        : 0,
     created_at: job.created_at,
     started_at: job.started_at,
     finished_at: job.finished_at,
     exit_code: job.exit_code,
     signal: job.signal,
-    error: job.error,
+    error: sanitizeJobError(job, job.error),
   };
 }
 
@@ -447,6 +483,212 @@ function validatePullProbeUrl(sourceUrl, protocol) {
   return parsed.toString();
 }
 
+function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
+  const normalized = normalizeProbeProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported Pull Source start protocol");
+  if (!isValidStreamKey(streamKey)) throw new Error("Invalid stream key");
+
+  const input = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-analyzeduration",
+    "3000000",
+    "-probesize",
+    "1000000",
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-avoid_negative_ts",
+    "make_zero",
+  ];
+
+  if (normalized === "rtmp" || normalized === "rtmps") {
+    input.push("-rw_timeout", "15000000");
+  } else if (normalized === "rtsp") {
+    input.push("-rtsp_transport", RTSP_TRANSPORT);
+  } else if (normalized === "hls" || normalized === "http_flv") {
+    input.push(
+      "-rw_timeout",
+      "15000000",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5",
+    );
+  }
+
+  const normalizeVideo =
+    normalized === "hls" || normalized === "http_flv" || normalized === "rtsp";
+  const video = normalizeVideo
+    ? [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "25",
+        "-g",
+        "50",
+        "-keyint_min",
+        "50",
+        "-sc_threshold",
+        "0",
+        "-bf",
+        "0",
+      ]
+    : ["-c:v", "copy"];
+
+  return [
+    ...input,
+    "-i",
+    sourceUrl,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    ...video,
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-ar",
+    "48000",
+    "-af",
+    "aresample=async=1:first_pts=0",
+    "-progress",
+    "pipe:1",
+    "-f",
+    "flv",
+    `${INTERNAL_RTMP_BASE}/${streamKey}`,
+  ];
+}
+
+function findActivePullSourceJob(sourceId, channelId) {
+  for (const job of jobs.values()) {
+    if (
+      job.type === "pull_source_start" &&
+      (job.source_id === sourceId || job.channel_id === channelId) &&
+      ["starting", "running", "stopping"].includes(job.status)
+    ) {
+      return job;
+    }
+  }
+  return null;
+}
+
+function attachPersistentPullSourceProcess(job, child) {
+  job.child = child;
+  job.persistent = true;
+  job.status = "running";
+  job.bitrate_kbps = 0;
+  let stderr = "";
+  let progressBuffer = "";
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    progressBuffer += chunk;
+    const lines = progressBuffer.split(/\r?\n/);
+    progressBuffer = lines.pop() || "";
+    for (const line of lines) {
+      const [key, ...rest] = line.split("=");
+      if (key !== "bitrate") continue;
+      const match = rest.join("=").match(/([0-9.]+)kbits\/s/i);
+      if (match) job.bitrate_kbps = Number(match[1]);
+    }
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-4096);
+  });
+
+  child.on("error", (error) => {
+    job.status = "failed";
+    job.error = error.message;
+    job.finished_at = new Date().toISOString();
+    job.child = null;
+  });
+
+  child.on("exit", (code, signal) => {
+    job.exit_code = code;
+    job.signal = signal || null;
+    job.finished_at = new Date().toISOString();
+    job.child = null;
+    job.bitrate_kbps = 0;
+    if (job.stop_timer) {
+      clearTimeout(job.stop_timer);
+      job.stop_timer = null;
+    }
+
+    if (job.status === "stopping") {
+      job.status = "stopped";
+      job.error = null;
+    } else {
+      job.status = "failed";
+      job.error =
+        stderr ||
+        `Persistent Pull Source worker exited code=${code} signal=${signal || "none"}`;
+    }
+  });
+
+  return job;
+}
+
+function startPersistentPullSource(
+  requestId,
+  sourceId,
+  channelId,
+  protocol,
+  sourceUrl,
+  streamKey,
+) {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId)) {
+    return jobs.get(requestIds.get(requestId));
+  }
+
+  const normalized = normalizeProbeProtocol(protocol);
+  if (!normalized || !PULL_SOURCE_START_PROTOCOLS.has(normalized)) {
+    throw new Error("Unsupported Pull Source start protocol");
+  }
+  if (!Number.isInteger(sourceId) || sourceId <= 0)
+    throw new Error("Invalid source_id");
+  if (!Number.isInteger(channelId) || channelId <= 0)
+    throw new Error("Invalid channel_id");
+  if (!isValidStreamKey(streamKey)) throw new Error("Invalid stream key");
+
+  const existing = findActivePullSourceJob(sourceId, channelId);
+  if (existing) {
+    const error = new Error(
+      "A persistent Pull Source worker is already active for this source or channel",
+    );
+    error.status = 409;
+    error.existingJob = existing;
+    throw error;
+  }
+
+  const cleanUrl = validatePullProbeUrl(sourceUrl, normalized);
+  const job = makeJob(requestId, "pull_source_start", {
+    source_id: sourceId,
+    channel_id: channelId,
+    protocol: normalized,
+    persistent: true,
+    bitrate_kbps: 0,
+    stop_timer: null,
+    sensitive_values: [cleanUrl],
+  });
+  const args = buildPersistentPullSourceArgs(cleanUrl, normalized, streamKey);
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+  return attachPersistentPullSourceProcess(job, child);
+}
+
 function startPullSourceProbe(
   requestId,
   sourceId,
@@ -474,6 +716,7 @@ function startPullSourceProbe(
     source_id: sourceId,
     channel_id: channelId,
     protocol: normalized,
+    sensitive_values: [cleanUrl],
   });
 
   // Read-only real Pull Source validation. Nothing is published or written.
@@ -525,6 +768,7 @@ async function handleCreateJob(req, res) {
     "ffmpeg_stop_probe",
     "live_stream_probe",
     "pull_source_probe",
+    "pull_source_start",
   ]);
   if (!allowedTypes.has(body.type)) {
     sendJson(res, 400, { ok: false, error: "Unsupported job type" });
@@ -534,7 +778,7 @@ async function handleCreateJob(req, res) {
   const allowedKeys =
     body.type === "live_stream_probe"
       ? new Set(["type", "request_id", "channel_id", "stream_key"])
-      : body.type === "pull_source_probe"
+      : body.type === "pull_source_probe" || body.type === "pull_source_start"
         ? new Set([
             "type",
             "request_id",
@@ -542,6 +786,7 @@ async function handleCreateJob(req, res) {
             "channel_id",
             "protocol",
             "source_url",
+            ...(body.type === "pull_source_start" ? ["stream_key"] : []),
           ])
         : new Set(["type", "request_id"]);
 
@@ -574,7 +819,7 @@ async function handleCreateJob(req, res) {
   }
 
   let job;
-  if (body.type === "pull_source_probe") {
+  if (body.type === "pull_source_probe" || body.type === "pull_source_start") {
     const sourceId = Number(body.source_id);
     const channelId = Number(body.channel_id);
     const protocol = normalizeProbeProtocol(body.protocol);
@@ -591,25 +836,51 @@ async function handleCreateJob(req, res) {
     if (!protocol) {
       sendJson(res, 400, {
         ok: false,
-        error: "Unsupported pull-source probe protocol",
+        error: "Unsupported Pull Source protocol",
       });
       return;
     }
     if (!sourceUrl || sourceUrl.length > 4096) {
-      sendJson(res, 400, {
-        ok: false,
-        error: "Invalid pull-source probe URL",
-      });
+      sendJson(res, 400, { ok: false, error: "Invalid Pull Source URL" });
       return;
     }
 
-    job = startPullSourceProbe(
-      requestId,
-      sourceId,
-      channelId,
-      protocol,
-      sourceUrl,
-    );
+    if (body.type === "pull_source_start") {
+      const streamKey = String(body.stream_key || "").trim();
+      if (!isValidStreamKey(streamKey)) {
+        sendJson(res, 400, { ok: false, error: "Invalid stream key" });
+        return;
+      }
+      try {
+        job = startPersistentPullSource(
+          requestId,
+          sourceId,
+          channelId,
+          protocol,
+          sourceUrl,
+          streamKey,
+        );
+      } catch (error) {
+        if (error?.status === 409) {
+          sendJson(res, 409, {
+            ok: false,
+            ...baseIdentity(),
+            error: error.message,
+            job: error.existingJob ? publicJob(error.existingJob) : null,
+          });
+          return;
+        }
+        throw error;
+      }
+    } else {
+      job = startPullSourceProbe(
+        requestId,
+        sourceId,
+        channelId,
+        protocol,
+        sourceUrl,
+      );
+    }
   } else if (body.type === "live_stream_probe") {
     const channelId = Number(body.channel_id);
     const streamKey = String(body.stream_key || "").trim();
@@ -647,7 +918,14 @@ function handleStopJob(res, id) {
     });
   }
   job.status = "stopping";
-  job.child.kill("SIGTERM");
+  const child = job.child;
+  child.kill("SIGTERM");
+  if (job.persistent === true) {
+    job.stop_timer = setTimeout(() => {
+      if (job.child === child && child.exitCode === null) child.kill("SIGKILL");
+    }, 5000);
+    job.stop_timer.unref?.();
+  }
   sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
 }
 
@@ -692,7 +970,9 @@ function handleCapabilities(res) {
         "ffmpeg_stop_probe",
         "live_stream_probe",
         "pull_source_probe",
+        "pull_source_start",
       ],
+      persistent_pull_source_start: true,
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
@@ -837,9 +1117,31 @@ server.listen(port, host, () => {
 
 function shutdown(signal) {
   console.log(`[MediaNodeAgent] ${signal} received; shutting down`);
+
+  // 4D.4B does not yet implement persistent-job reconciliation after an agent
+  // restart. Stop agent-owned workers deliberately so no orphan FFmpeg process
+  // can continue publishing without a control-plane owner.
+  for (const job of jobs.values()) {
+    if (job.child && ["starting", "running", "stopping"].includes(job.status)) {
+      try {
+        job.status = "stopping";
+        job.child.kill("SIGTERM");
+      } catch {}
+    }
+  }
+
   server.close(() => process.exit(0));
 
-  const timer = setTimeout(() => process.exit(1), 5000);
+  const timer = setTimeout(() => {
+    for (const job of jobs.values()) {
+      if (job.child && job.child.exitCode === null) {
+        try {
+          job.child.kill("SIGKILL");
+        } catch {}
+      }
+    }
+    process.exit(1);
+  }, 5000);
   timer.unref?.();
 }
 
