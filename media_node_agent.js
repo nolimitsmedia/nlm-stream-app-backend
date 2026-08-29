@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.3";
+const AGENT_VERSION = "4D.4A";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -26,6 +26,14 @@ const JOB_RETENTION_MS = 60 * 60 * 1000;
 const JOB_MAX_RUNTIME_MS = 15 * 1000;
 const jobs = new Map();
 const requestIds = new Map();
+const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
+  "rtmp",
+  "rtmps",
+  "rtsp",
+  "srt",
+  "hls",
+  "http_flv",
+]);
 
 const host = String(process.env.MEDIA_NODE_AGENT_HOST || DEFAULT_HOST).trim();
 const port = Math.max(
@@ -236,6 +244,8 @@ function publicJob(job) {
     request_id: job.request_id,
     type: job.type,
     channel_id: job.channel_id ?? null,
+    source_id: job.source_id ?? null,
+    protocol: job.protocol ?? null,
     status: job.status,
     created_at: job.created_at,
     started_at: job.started_at,
@@ -255,10 +265,6 @@ function cleanupJobs() {
       if (job.request_id) requestIds.delete(job.request_id);
     }
   }
-}
-
-function isValidStreamKey(value) {
-  return /^[A-Za-z0-9_-]{1,255}$/.test(String(value || ""));
 }
 
 function makeJob(requestId, jobType, metadata = {}) {
@@ -329,6 +335,40 @@ function attachJobProcess(job, child) {
   return job;
 }
 
+function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId))
+    return jobs.get(requestIds.get(requestId));
+
+  const job = makeJob(requestId, jobType);
+  const durationSeconds = jobType === "ffmpeg_stop_probe" ? "10" : "3";
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    ...(jobType === "ffmpeg_stop_probe" ? ["-re"] : []),
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc=size=320x180:rate=10",
+    "-t",
+    durationSeconds,
+    "-f",
+    "null",
+    "-",
+  ];
+
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    shell: false,
+  });
+  return attachJobProcess(job, child);
+}
+
+function isValidStreamKey(value) {
+  return /^[A-Za-z0-9_-]{1,255}$/.test(String(value || ""));
+}
+
 function startLiveStreamProbe(requestId, channelId, streamKey) {
   cleanupJobs();
   if (requestId && requestIds.has(requestId)) {
@@ -346,10 +386,6 @@ function startLiveStreamProbe(requestId, channelId, streamKey) {
     channel_id: channelId,
   });
 
-  // Real-media validation is intentionally read-only:
-  // - input URL is constructed locally from a backend-resolved stream key
-  // - no caller-provided URL/path/FFmpeg args are accepted
-  // - media is copied to the null muxer; nothing is published or written
   const inputUrl = `${srsHlsBaseUrl}/live/${encodeURIComponent(streamKey)}.m3u8`;
   const args = [
     "-hide_banner",
@@ -374,43 +410,106 @@ function startLiveStreamProbe(requestId, channelId, streamKey) {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false,
   });
-
   return attachJobProcess(job, child);
 }
 
-function startFfmpegProbe(requestId, jobType = "ffmpeg_probe") {
+function normalizeProbeProtocol(value) {
+  const protocol = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  return PULL_SOURCE_PROBE_PROTOCOLS.has(protocol) ? protocol : null;
+}
+
+function validatePullProbeUrl(sourceUrl, protocol) {
+  const normalized = normalizeProbeProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported pull-source probe protocol");
+
+  let parsed;
+  try {
+    parsed = new URL(String(sourceUrl || "").trim());
+  } catch {
+    throw new Error("Invalid pull-source probe URL");
+  }
+
+  const schemes = {
+    rtmp: ["rtmp:"],
+    rtmps: ["rtmps:"],
+    rtsp: ["rtsp:"],
+    srt: ["srt:"],
+    hls: ["http:", "https:"],
+    http_flv: ["http:", "https:"],
+  }[normalized];
+
+  if (!schemes.includes(parsed.protocol.toLowerCase())) {
+    throw new Error("Pull-source probe protocol does not match source URL");
+  }
+  return parsed.toString();
+}
+
+function startPullSourceProbe(
+  requestId,
+  sourceId,
+  channelId,
+  protocol,
+  sourceUrl,
+) {
   cleanupJobs();
-  if (requestId && requestIds.has(requestId))
+  if (requestId && requestIds.has(requestId)) {
     return jobs.get(requestIds.get(requestId));
+  }
 
-  const job = makeJob(requestId, jobType);
+  const normalized = normalizeProbeProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported pull-source probe protocol");
 
-  // Fixed executable and fixed arguments: callers cannot supply commands, paths, URLs or shell text.
-  const durationSeconds = jobType === "ffmpeg_stop_probe" ? "10" : "3";
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    throw new Error("Invalid source_id");
+  }
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    throw new Error("Invalid channel_id");
+  }
+
+  const cleanUrl = validatePullProbeUrl(sourceUrl, normalized);
+  const job = makeJob(requestId, "pull_source_probe", {
+    source_id: sourceId,
+    channel_id: channelId,
+    protocol: normalized,
+  });
+
+  // Read-only real Pull Source validation. Nothing is published or written.
+  const inputArgs = ["-hide_banner", "-loglevel", "error"];
+  if (normalized === "rtsp") {
+    inputArgs.push("-rtsp_transport", "tcp");
+  } else if (
+    normalized === "rtmp" ||
+    normalized === "rtmps" ||
+    normalized === "hls" ||
+    normalized === "http_flv"
+  ) {
+    inputArgs.push("-rw_timeout", "15000000");
+  }
+
   const args = [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-
-    // The stop-validation probe must run in real wall-clock time so the
-    // control plane can exercise active-process termination reliably.
-    ...(jobType === "ffmpeg_stop_probe" ? ["-re"] : []),
-
-    "-f",
-    "lavfi",
+    ...inputArgs,
     "-i",
-    "testsrc=size=320x180:rate=10",
+    cleanUrl,
     "-t",
-    durationSeconds,
+    "5",
+    "-map",
+    "0:v:0?",
+    "-map",
+    "0:a:0?",
+    "-c",
+    "copy",
     "-f",
     "null",
     "-",
   ];
+
   const child = spawn("ffmpeg", args, {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false,
   });
-
   return attachJobProcess(job, child);
 }
 
@@ -425,6 +524,7 @@ async function handleCreateJob(req, res) {
     "ffmpeg_probe",
     "ffmpeg_stop_probe",
     "live_stream_probe",
+    "pull_source_probe",
   ]);
   if (!allowedTypes.has(body.type)) {
     sendJson(res, 400, { ok: false, error: "Unsupported job type" });
@@ -434,7 +534,17 @@ async function handleCreateJob(req, res) {
   const allowedKeys =
     body.type === "live_stream_probe"
       ? new Set(["type", "request_id", "channel_id", "stream_key"])
-      : new Set(["type", "request_id"]);
+      : body.type === "pull_source_probe"
+        ? new Set([
+            "type",
+            "request_id",
+            "source_id",
+            "channel_id",
+            "protocol",
+            "source_url",
+          ])
+        : new Set(["type", "request_id"]);
+
   const unknownKeys = Object.keys(body).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length) {
     sendJson(res, 400, {
@@ -464,7 +574,43 @@ async function handleCreateJob(req, res) {
   }
 
   let job;
-  if (body.type === "live_stream_probe") {
+  if (body.type === "pull_source_probe") {
+    const sourceId = Number(body.source_id);
+    const channelId = Number(body.channel_id);
+    const protocol = normalizeProbeProtocol(body.protocol);
+    const sourceUrl = String(body.source_url || "").trim();
+
+    if (!Number.isInteger(sourceId) || sourceId <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid source_id" });
+      return;
+    }
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid channel_id" });
+      return;
+    }
+    if (!protocol) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Unsupported pull-source probe protocol",
+      });
+      return;
+    }
+    if (!sourceUrl || sourceUrl.length > 4096) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Invalid pull-source probe URL",
+      });
+      return;
+    }
+
+    job = startPullSourceProbe(
+      requestId,
+      sourceId,
+      channelId,
+      protocol,
+      sourceUrl,
+    );
+  } else if (body.type === "live_stream_probe") {
     const channelId = Number(body.channel_id);
     const streamKey = String(body.stream_key || "").trim();
     if (!Number.isInteger(channelId) || channelId <= 0) {
@@ -545,6 +691,7 @@ function handleCapabilities(res) {
         "ffmpeg_probe",
         "ffmpeg_stop_probe",
         "live_stream_probe",
+        "pull_source_probe",
       ],
       stream_migration: false,
       automatic_load_balancing: false,

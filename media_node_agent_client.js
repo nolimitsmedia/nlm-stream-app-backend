@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.3 — secure transport plus strict controlled real-media job validation.
+// Phase 4D.4A — secure transport plus strict controlled-job request validation.
 
 const net = require("net");
 
@@ -208,17 +208,18 @@ async function requestMediaNodeAgent({
       `Unsupported Media Node Agent request: ${normalizedMethod} ${path}`,
     );
 
-  // Defense in depth: controlled job creation has an exact schema. Never let
-  // future callers smuggle commands, URLs, paths, arbitrary FFmpeg arguments,
-  // or other execution parameters through this transport helper.
+  // Defense in depth: every controlled job has an exact schema. Never let this
+  // transport helper become a generic command/URL/FFmpeg argument tunnel.
   if (normalizedMethod === "POST" && path === "/v1/jobs") {
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw new Error("Media Node job body must be an object");
     }
+
     const allowedTypes = new Set([
       "ffmpeg_probe",
       "ffmpeg_stop_probe",
       "live_stream_probe",
+      "pull_source_probe",
     ]);
     if (!allowedTypes.has(body.type)) {
       throw new Error("Unsupported Media Node job type");
@@ -227,7 +228,17 @@ async function requestMediaNodeAgent({
     const allowedKeys =
       body.type === "live_stream_probe"
         ? new Set(["type", "request_id", "channel_id", "stream_key"])
-        : new Set(["type", "request_id"]);
+        : body.type === "pull_source_probe"
+          ? new Set([
+              "type",
+              "request_id",
+              "source_id",
+              "channel_id",
+              "protocol",
+              "source_url",
+            ])
+          : new Set(["type", "request_id"]);
+
     const unknownKeys = Object.keys(body).filter(
       (key) => !allowedKeys.has(key),
     );
@@ -244,6 +255,30 @@ async function requestMediaNodeAgent({
       }
       if (!/^[A-Za-z0-9_-]{1,255}$/.test(String(body.stream_key || ""))) {
         throw new Error("Invalid Media Node job stream key");
+      }
+    }
+
+    if (body.type === "pull_source_probe") {
+      const sourceId = Number(body.source_id);
+      const channelId = Number(body.channel_id);
+      const protocol = String(body.protocol || "")
+        .trim()
+        .toLowerCase()
+        .replace(/-/g, "_");
+      if (!Number.isInteger(sourceId) || sourceId <= 0) {
+        throw new Error("Invalid Media Node job source_id");
+      }
+      if (!Number.isInteger(channelId) || channelId <= 0) {
+        throw new Error("Invalid Media Node job channel_id");
+      }
+      if (
+        !["rtmp", "rtmps", "rtsp", "srt", "hls", "http_flv"].includes(protocol)
+      ) {
+        throw new Error("Unsupported Media Node Pull Source probe protocol");
+      }
+      const sourceUrl = String(body.source_url || "").trim();
+      if (!sourceUrl || sourceUrl.length > 4096) {
+        throw new Error("Invalid Media Node Pull Source probe URL");
       }
     }
   } else if (body != null) {

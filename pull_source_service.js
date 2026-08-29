@@ -1,4 +1,5 @@
 // pull_source_service.js
+// Phase 4D.4A keeps production Pull Source start/stop local; remote execution is probe-only.
 // Pulls external live sources and republishes them into the channel's normal
 // SRS /live/<stream_key> ingest path so the existing NLM lifecycle (ABR, DVR,
 // recording, analytics and Stream Targets) remains the single source of truth.

@@ -93,7 +93,10 @@ const {
 } = require("./social_oauth_schema");
 const { ensureStreamTargetColumns } = require("./stream_target_schema");
 const registerStreamTargetRoutes = require("./stream_target_routes");
-const { ensurePullSourceTables } = require("./pull_source_schema");
+const {
+  ensurePullSourceTables,
+  decryptSourceUrl,
+} = require("./pull_source_schema");
 const registerPullSourceRoutes = require("./pull_source_routes");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
@@ -4793,12 +4796,10 @@ app.get(
 );
 
 // ══════════════════════════════════════════
-// MEDIA NODE CONTROLLED JOBS — Phase 4D.3
-// Super Admin only. Synthetic probes remain available, plus a read-only
-// live_stream_probe that validates real media from a channel assigned to the
-// requested node. The browser supplies only channel_id; the control plane
-// resolves the stream key from PostgreSQL and the agent constructs a fixed
-// local SRS HLS URL. No caller-supplied URL/path/FFmpeg args are accepted.
+// MEDIA NODE CONTROLLED JOBS — Phase 4D.4A
+// Super Admin only. Synthetic probes remain available, plus read-only real
+// media probes for an assigned channel and for a configured Pull Source.
+// Browser callers never provide stream keys, source URLs, commands or FFmpeg args.
 // ══════════════════════════════════════════
 async function getMediaNodeAgentConnectionForControl(nodeId) {
   const nodeResult = await queryWithRetry(
@@ -4857,23 +4858,24 @@ app.post(
         "ffmpeg_probe",
         "ffmpeg_stop_probe",
         "live_stream_probe",
+        "pull_source_probe",
       ]);
       const jobType = req.body.type;
       if (!allowedTypes.has(jobType)) {
         return res.status(400).json({
           ok: false,
           message:
-            "Phase 4D.3 permits ffmpeg_probe, ffmpeg_stop_probe, or live_stream_probe",
+            "Phase 4D.4A permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, or pull_source_probe",
         });
       }
 
-      // Browser/API callers never provide stream_key. For the real-media probe
-      // they provide only channel_id; the server resolves the key after proving
-      // that the channel is assigned to the requested media node.
       const allowedKeys =
         jobType === "live_stream_probe"
           ? new Set(["type", "request_id", "channel_id"])
-          : new Set(["type", "request_id"]);
+          : jobType === "pull_source_probe"
+            ? new Set(["type", "request_id", "source_id", "channel_id"])
+            : new Set(["type", "request_id"]);
+
       const unknownKeys = Object.keys(req.body).filter(
         (key) => !allowedKeys.has(key),
       );
@@ -4897,7 +4899,88 @@ app.post(
 
       let agentBody = { type: jobType, request_id: requestId };
 
-      if (jobType === "live_stream_probe") {
+      if (jobType === "pull_source_probe") {
+        const sourceId = Number(req.body.source_id);
+        const channelId = Number(req.body.channel_id);
+
+        if (!Number.isInteger(sourceId) || sourceId <= 0) {
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid source_id" });
+        }
+        if (!Number.isInteger(channelId) || channelId <= 0) {
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid channel_id" });
+        }
+
+        const sourceResult = await queryWithRetry(
+          `SELECT ps.id, ps.channel_id, ps.organization_id, ps.protocol,
+                  ps.source_url, ps.enabled, c.media_node_id
+           FROM channel_pull_sources ps
+           JOIN channels c
+             ON c.id = ps.channel_id
+            AND c.organization_id = ps.organization_id
+           WHERE ps.id = $1
+             AND ps.channel_id = $2
+           LIMIT 1`,
+          [sourceId, channelId],
+        );
+        const source = sourceResult.rows[0];
+
+        if (!source) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Pull Source not found" });
+        }
+        if (Number(source.media_node_id) !== nodeId) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Pull Source channel is not assigned to the requested media node",
+          });
+        }
+        if (!source.enabled) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Pull Source must be enabled before running pull_source_probe",
+          });
+        }
+
+        const protocol = String(source.protocol || "")
+          .trim()
+          .toLowerCase()
+          .replace(/-/g, "_");
+        if (
+          !["rtmp", "rtmps", "rtsp", "srt", "hls", "http_flv"].includes(
+            protocol,
+          )
+        ) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "Pull Source protocol is not supported for controlled probing",
+          });
+        }
+
+        const sourceUrl = decryptSourceUrl(source.source_url);
+        if (!sourceUrl || String(sourceUrl).length > 4096) {
+          return res.status(409).json({
+            ok: false,
+            message: "Pull Source URL could not be resolved for probing",
+          });
+        }
+
+        agentBody = {
+          type: jobType,
+          request_id: requestId,
+          source_id: sourceId,
+          channel_id: channelId,
+          protocol,
+          source_url: sourceUrl,
+        };
+      } else if (jobType === "live_stream_probe") {
         const channelId = Number(req.body.channel_id);
         if (!Number.isInteger(channelId) || channelId <= 0) {
           return res
@@ -4913,6 +4996,7 @@ app.post(
           [channelId],
         );
         const channel = channelResult.rows[0];
+
         if (!channel) {
           return res
             .status(404)
