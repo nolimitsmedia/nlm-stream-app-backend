@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.4B — secure transport plus strict controlled-job request validation.
+// Phase 4D.4C — secure transport, strict controlled jobs, and read-only Pull Source runtime status.
 
 const net = require("net");
 
@@ -200,8 +200,10 @@ async function requestMediaNodeAgent({
 }) {
   const normalizedMethod = String(method).toUpperCase();
   const jobPath = /^\/v1\/jobs(?:\/[0-9a-f-]{36})?$/i.test(path);
+  const pullSourceStatusPath = /^\/v1\/pull-sources\/\d+\/status$/i.test(path);
   const allowed =
-    (normalizedMethod === "GET" && (ALLOWED_GET_PATHS.has(path) || jobPath)) ||
+    (normalizedMethod === "GET" &&
+      (ALLOWED_GET_PATHS.has(path) || jobPath || pullSourceStatusPath)) ||
     (normalizedMethod === "POST" && jobPath);
   if (!allowed)
     throw new Error(

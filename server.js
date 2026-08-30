@@ -4866,7 +4866,7 @@ app.post(
         return res.status(400).json({
           ok: false,
           message:
-            "Phase 4D.4B permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
+            "Phase 4D.4C permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
         });
       }
 
@@ -5136,6 +5136,120 @@ app.get(
         .json({
           ok: false,
           message: "Media Node job status failed",
+          error: error.message,
+        });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/media-nodes/:id/pull-sources/:sourceId/runtime-status",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const nodeId = Number(req.params.id);
+      const sourceId = Number(req.params.sourceId);
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid media node id" });
+      }
+      if (!Number.isInteger(sourceId) || sourceId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid source_id" });
+      }
+
+      const sourceResult = await queryWithRetry(
+        `SELECT ps.id, ps.channel_id, ps.organization_id, ps.name, ps.protocol,
+                ps.enabled, ps.status, ps.is_running, ps.is_active_source,
+                ps.health_status, ps.last_health_check_at, ps.reconnect_count,
+                c.name AS channel_name, c.media_node_id, c.is_live
+         FROM channel_pull_sources ps
+         JOIN channels c
+           ON c.id = ps.channel_id
+          AND c.organization_id = ps.organization_id
+         WHERE ps.id = $1
+         LIMIT 1`,
+        [sourceId],
+      );
+      const source = sourceResult.rows[0];
+      if (!source) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Pull Source not found" });
+      }
+      if (Number(source.media_node_id) !== nodeId) {
+        return res.status(409).json({
+          ok: false,
+          message:
+            "Pull Source channel is not assigned to the requested media node",
+        });
+      }
+
+      const { node, connection } =
+        await getMediaNodeAgentConnectionForControl(nodeId);
+      const response = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/pull-sources/${sourceId}/status`,
+        method: "GET",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+
+      const runtime = response.data?.runtime || {};
+      const agentActive = runtime.active === true;
+      const dbActive =
+        source.is_running === true || source.is_active_source === true;
+      let reconciliationState = "aligned_stopped";
+      if (agentActive && dbActive) reconciliationState = "aligned_running";
+      else if (agentActive && !dbActive)
+        reconciliationState = "agent_running_db_stale";
+      else if (!agentActive && dbActive)
+        reconciliationState = "db_running_agent_stale";
+
+      res.json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: response.response_ms,
+        source: {
+          id: Number(source.id),
+          channel_id: Number(source.channel_id),
+          organization_id: Number(source.organization_id),
+          name: source.name,
+          protocol: source.protocol,
+          enabled: source.enabled === true,
+          database_status: source.status,
+          database_is_running: source.is_running === true,
+          database_is_active_source: source.is_active_source === true,
+          database_health_status: source.health_status,
+          last_health_check_at: source.last_health_check_at,
+          reconnect_count: Number(source.reconnect_count || 0),
+          channel_name: source.channel_name,
+          channel_is_live: source.is_live === true,
+        },
+        runtime,
+        reconciliation: {
+          state: reconciliationState,
+          aligned: reconciliationState.startsWith("aligned_"),
+          agent_is_authoritative_for_process: true,
+          database_mutated: false,
+        },
+        agent: {
+          version: response.data?.agent_version || null,
+          pid: response.data?.pid || null,
+          timestamp: response.data?.timestamp || null,
+        },
+      });
+    } catch (error) {
+      console.error("Pull Source runtime status error:", error.message);
+      res
+        .status(error.status || (error.code === "AGENT_TIMEOUT" ? 504 : 502))
+        .json({
+          ok: false,
+          message: "Pull Source runtime status failed",
           error: error.message,
         });
     }

@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4B";
+const AGENT_VERSION = "4D.4C";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -205,6 +205,10 @@ async function getSanitizedStreams() {
     frames: Number(stream?.frames || 0),
     send_bytes: Number(stream?.send_bytes || 0),
     recv_bytes: Number(stream?.recv_bytes || 0),
+    kbps: {
+      recv_30s: Number(stream?.kbps?.recv_30s || 0),
+      send_30s: Number(stream?.kbps?.send_30s || 0),
+    },
   }));
 }
 
@@ -680,6 +684,7 @@ function startPersistentPullSource(
     bitrate_kbps: 0,
     stop_timer: null,
     sensitive_values: [cleanUrl],
+    stream_key: streamKey,
   });
   const args = buildPersistentPullSourceArgs(cleanUrl, normalized, streamKey);
   const child = spawn("ffmpeg", args, {
@@ -929,6 +934,82 @@ function handleStopJob(res, id) {
   sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
 }
 
+async function handlePullSourceRuntimeStatus(res, sourceId) {
+  cleanupJobs();
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid source_id" });
+  }
+
+  const matching = Array.from(jobs.values())
+    .filter(
+      (job) => job.type === "pull_source_start" && job.source_id === sourceId,
+    )
+    .sort(
+      (a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0),
+    );
+  const job = matching[0] || null;
+
+  let canonical = {
+    expected: false,
+    publish_active: false,
+    stream_name: null,
+    clients: 0,
+    frames: 0,
+    recv_kbps: 0,
+    send_kbps: 0,
+    error: null,
+  };
+
+  if (job?.stream_key) {
+    canonical.expected = ["starting", "running", "stopping"].includes(
+      job.status,
+    );
+    canonical.stream_name = job.stream_key;
+    try {
+      const streams = await getSanitizedStreams();
+      const stream = streams.find(
+        (item) => item.app === "live" && item.name === job.stream_key,
+      );
+      if (stream) {
+        canonical = {
+          ...canonical,
+          publish_active: stream.publish_active === true,
+          clients: Number(stream.clients || 0),
+          frames: Number(stream.frames || 0),
+          recv_kbps: Number(stream?.kbps?.recv_30s || 0),
+          send_kbps: Number(stream?.kbps?.send_30s || 0),
+        };
+      }
+    } catch (error) {
+      canonical.error = error?.message || "Unable to read SRS stream inventory";
+    }
+  }
+
+  const active =
+    !!job && ["starting", "running", "stopping"].includes(job.status);
+  const processAlive =
+    !!job?.child && job.child.exitCode === null && !job.child.killed;
+
+  sendJson(res, 200, {
+    ok: true,
+    ...baseIdentity(),
+    source_id: sourceId,
+    runtime: {
+      found: !!job,
+      active,
+      process_alive: processAlive,
+      child_pid: processAlive ? job.child.pid : null,
+      job: job ? publicJob(job) : null,
+      canonical_publish: canonical,
+      healthy:
+        !!job &&
+        job.status === "running" &&
+        processAlive &&
+        canonical.publish_active === true,
+    },
+  });
+}
+
 async function handleHealth(res) {
   const startedAt = Date.now();
   const system = getLocalSystemMetrics();
@@ -973,6 +1054,7 @@ function handleCapabilities(res) {
         "pull_source_start",
       ],
       persistent_pull_source_start: true,
+      pull_source_runtime_status: true,
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
@@ -1042,6 +1124,16 @@ const requestHandler = async (req, res) => {
     }
     if (jobMatch && req.method === "POST") {
       handleStopJob(res, jobMatch[1]);
+      return;
+    }
+    const pullSourceStatusMatch = url.pathname.match(
+      /^\/v1\/pull-sources\/(\d+)\/status$/,
+    );
+    if (pullSourceStatusMatch && req.method === "GET") {
+      await handlePullSourceRuntimeStatus(
+        res,
+        Number(pullSourceStatusMatch[1]),
+      );
       return;
     }
     if (req.method !== "GET") {
