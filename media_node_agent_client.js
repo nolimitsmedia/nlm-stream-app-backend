@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.4C — secure transport, strict controlled jobs, and read-only Pull Source runtime status.
+// Phase 4D.4D — secure transport, strict controlled jobs, runtime status, and authoritative Pull Source stop.
 
 const net = require("net");
 
@@ -201,10 +201,11 @@ async function requestMediaNodeAgent({
   const normalizedMethod = String(method).toUpperCase();
   const jobPath = /^\/v1\/jobs(?:\/[0-9a-f-]{36})?$/i.test(path);
   const pullSourceStatusPath = /^\/v1\/pull-sources\/\d+\/status$/i.test(path);
+  const pullSourceStopPath = /^\/v1\/pull-sources\/\d+\/stop$/i.test(path);
   const allowed =
     (normalizedMethod === "GET" &&
       (ALLOWED_GET_PATHS.has(path) || jobPath || pullSourceStatusPath)) ||
-    (normalizedMethod === "POST" && jobPath);
+    (normalizedMethod === "POST" && (jobPath || pullSourceStopPath));
   if (!allowed)
     throw new Error(
       `Unsupported Media Node Agent request: ${normalizedMethod} ${path}`,
@@ -292,6 +293,20 @@ async function requestMediaNodeAgent({
           throw new Error("Invalid Media Node Pull Source stream key");
         }
       }
+    }
+  } else if (normalizedMethod === "POST" && pullSourceStopPath) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new Error("Media Node Pull Source stop body must be an object");
+    }
+    const unknownKeys = Object.keys(body).filter((key) => key !== "channel_id");
+    if (unknownKeys.length) {
+      throw new Error(
+        `Unsupported Media Node Pull Source stop fields: ${unknownKeys.join(", ")}`,
+      );
+    }
+    const channelId = Number(body.channel_id);
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      throw new Error("Invalid Media Node Pull Source stop channel_id");
     }
   } else if (body != null) {
     throw new Error(

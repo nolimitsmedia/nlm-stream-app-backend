@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4C";
+const AGENT_VERSION = "4D.4D";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -915,6 +915,14 @@ function handleGetJob(res, id) {
 function handleStopJob(res, id) {
   const job = jobs.get(id);
   if (!job) return sendJson(res, 404, { ok: false, error: "Job not found" });
+  if (job.type === "pull_source_start") {
+    return sendJson(res, 409, {
+      ok: false,
+      error:
+        "Persistent Pull Source jobs must be stopped through the authoritative Pull Source stop endpoint",
+      job: publicJob(job),
+    });
+  }
   if (!["starting", "running"].includes(job.status) || !job.child) {
     return sendJson(res, 409, {
       ok: false,
@@ -932,6 +940,96 @@ function handleStopJob(res, id) {
     job.stop_timer.unref?.();
   }
   sendJson(res, 202, { ok: true, ...baseIdentity(), job: publicJob(job) });
+}
+
+function latestPullSourceJob(sourceId, channelId = null) {
+  return (
+    Array.from(jobs.values())
+      .filter(
+        (job) =>
+          job.type === "pull_source_start" &&
+          job.source_id === sourceId &&
+          (channelId == null || job.channel_id === channelId),
+      )
+      .sort(
+        (a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0),
+      )[0] || null
+  );
+}
+
+function requestPersistentPullSourceStop(job) {
+  if (!job) return { accepted: false, already_stopped: true };
+
+  if (job.status === "stopping") {
+    return { accepted: true, already_stopped: false };
+  }
+
+  if (!["starting", "running"].includes(job.status) || !job.child) {
+    return { accepted: false, already_stopped: true };
+  }
+
+  job.status = "stopping";
+  const child = job.child;
+  child.kill("SIGTERM");
+  if (job.stop_timer) clearTimeout(job.stop_timer);
+  job.stop_timer = setTimeout(() => {
+    if (job.child === child && child.exitCode === null) child.kill("SIGKILL");
+  }, 5000);
+  job.stop_timer.unref?.();
+  return { accepted: true, already_stopped: false };
+}
+
+async function handlePullSourceStop(req, res, sourceId) {
+  cleanupJobs();
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid source_id" });
+  }
+
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: "Pull Source stop body must be an object",
+    });
+  }
+  const unknownKeys = Object.keys(body).filter((key) => key !== "channel_id");
+  if (unknownKeys.length) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: `Unsupported Pull Source stop fields: ${unknownKeys.join(", ")}`,
+    });
+  }
+
+  const channelId = Number(body.channel_id);
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid channel_id" });
+  }
+
+  const job = latestPullSourceJob(sourceId, channelId);
+  if (!job) {
+    return sendJson(res, 200, {
+      ok: true,
+      ...baseIdentity(),
+      source_id: sourceId,
+      channel_id: channelId,
+      result: "not_running",
+      stop_accepted: false,
+      already_stopped: true,
+      job: null,
+    });
+  }
+
+  const stop = requestPersistentPullSourceStop(job);
+  sendJson(res, stop.accepted ? 202 : 200, {
+    ok: true,
+    ...baseIdentity(),
+    source_id: sourceId,
+    channel_id: channelId,
+    result: stop.accepted ? "stopping" : "already_stopped",
+    stop_accepted: stop.accepted,
+    already_stopped: stop.already_stopped,
+    job: publicJob(job),
+  });
 }
 
 async function handlePullSourceRuntimeStatus(res, sourceId) {
@@ -952,7 +1050,6 @@ async function handlePullSourceRuntimeStatus(res, sourceId) {
   let canonical = {
     expected: false,
     publish_active: false,
-    stream_name: null,
     clients: 0,
     frames: 0,
     recv_kbps: 0,
@@ -964,7 +1061,6 @@ async function handlePullSourceRuntimeStatus(res, sourceId) {
     canonical.expected = ["starting", "running", "stopping"].includes(
       job.status,
     );
-    canonical.stream_name = job.stream_key;
     try {
       const streams = await getSanitizedStreams();
       const stream = streams.find(
@@ -1055,6 +1151,7 @@ function handleCapabilities(res) {
       ],
       persistent_pull_source_start: true,
       pull_source_runtime_status: true,
+      authoritative_pull_source_stop: true,
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
@@ -1124,6 +1221,13 @@ const requestHandler = async (req, res) => {
     }
     if (jobMatch && req.method === "POST") {
       handleStopJob(res, jobMatch[1]);
+      return;
+    }
+    const pullSourceStopMatch = url.pathname.match(
+      /^\/v1\/pull-sources\/(\d+)\/stop$/,
+    );
+    if (pullSourceStopMatch && req.method === "POST") {
+      await handlePullSourceStop(req, res, Number(pullSourceStopMatch[1]));
       return;
     }
     const pullSourceStatusMatch = url.pathname.match(

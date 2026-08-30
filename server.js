@@ -4866,7 +4866,7 @@ app.post(
         return res.status(400).json({
           ok: false,
           message:
-            "Phase 4D.4C permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
+            "Phase 4D.4D permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
         });
       }
 
@@ -5006,6 +5006,11 @@ app.post(
                 "Channel already has a live publisher. Stop OBS/the existing publisher before controlled pull_source_start.",
             });
           }
+
+          // A new authoritative remote start begins a fresh source lifecycle.
+          // Clear any short-lived stop-intent marker from a prior operator stop
+          // so a later unrelated unpublish is not misclassified as intentional.
+          clearPullSourceIntentionalStop(source.channel_id);
         }
 
         agentBody = {
@@ -5200,6 +5205,14 @@ app.get(
       });
 
       const runtime = response.data?.runtime || {};
+      // Defense in depth: the canonical stream key is an internal credential-like
+      // routing value and must never be returned by this browser-facing endpoint.
+      if (
+        runtime?.canonical_publish &&
+        typeof runtime.canonical_publish === "object"
+      ) {
+        delete runtime.canonical_publish.stream_name;
+      }
       const agentActive = runtime.active === true;
       const dbActive =
         source.is_running === true || source.is_active_source === true;
@@ -5250,6 +5263,198 @@ app.get(
         .json({
           ok: false,
           message: "Pull Source runtime status failed",
+          error: error.message,
+        });
+    }
+  },
+);
+
+// Phase 4D.4D — authoritative Pull Source stop.
+// The control plane validates DB ownership/node assignment, marks intentional
+// broadcast end BEFORE terminating media, asks the assigned node agent to stop
+// only the matching persistent Pull Source worker, waits for process exit, and
+// only then finalizes durable Pull Source/ownership state. HA-aware remote stop
+// is intentionally deferred to 4D.4F, so this route refuses channels with HA
+// enabled rather than allowing the legacy local HA monitor to re-promote a
+// source behind the remote execution controller.
+app.post(
+  "/api/admin/media-nodes/:id/pull-sources/:sourceId/stop",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    let markedChannelId = null;
+    try {
+      const nodeId = Number(req.params.id);
+      const sourceId = Number(req.params.sourceId);
+      if (!Number.isInteger(nodeId) || nodeId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid media node id" });
+      }
+      if (!Number.isInteger(sourceId) || sourceId <= 0) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid source_id" });
+      }
+      if (
+        req.body &&
+        (typeof req.body !== "object" ||
+          Array.isArray(req.body) ||
+          Object.keys(req.body).length > 0)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Authoritative Pull Source stop does not accept request fields",
+        });
+      }
+
+      const sourceResult = await queryWithRetry(
+        `SELECT ps.id, ps.channel_id, ps.organization_id, ps.name, ps.protocol,
+                ps.enabled, ps.status, ps.is_running, ps.is_active_source,
+                ps.health_status, c.name AS channel_name, c.media_node_id,
+                COALESCE(f.enabled, FALSE) AS failover_enabled
+         FROM channel_pull_sources ps
+         JOIN channels c
+           ON c.id = ps.channel_id
+          AND c.organization_id = ps.organization_id
+         LEFT JOIN channel_source_failover f
+           ON f.channel_id = ps.channel_id
+          AND f.organization_id = ps.organization_id
+         WHERE ps.id = $1
+         LIMIT 1`,
+        [sourceId],
+      );
+      const source = sourceResult.rows[0];
+      if (!source) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Pull Source not found" });
+      }
+      if (Number(source.media_node_id) !== nodeId) {
+        return res.status(409).json({
+          ok: false,
+          message:
+            "Pull Source channel is not assigned to the requested media node",
+        });
+      }
+
+      if (source.failover_enabled === true) {
+        return res.status(409).json({
+          ok: false,
+          code: "ha_integration_pending",
+          message:
+            "Phase 4D.4D authoritative remote stop is intentionally blocked while Pull Source HA is enabled. Disable HA for controlled validation; HA-aware remote stop is Phase 4D.4F.",
+        });
+      }
+
+      const { node, connection } =
+        await getMediaNodeAgentConnectionForControl(nodeId);
+
+      markedChannelId = Number(source.channel_id);
+      markPullSourceIntentionalStop(
+        markedChannelId,
+        "authoritative_remote_pull_source_stop",
+      );
+
+      const stopResponse = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/pull-sources/${sourceId}/stop`,
+        method: "POST",
+        body: { channel_id: Number(source.channel_id) },
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+
+      // Do not claim durable stopped state while the node still owns a process.
+      // SIGTERM normally exits immediately; the agent has a 5s SIGKILL fallback.
+      const stopWaitDeadline = Date.now() + 7000;
+      let runtimeResponse = null;
+      while (Date.now() < stopWaitDeadline) {
+        runtimeResponse = await requestMediaNodeAgent({
+          baseUrl: connection.baseUrl,
+          token: connection.token,
+          path: `/v1/pull-sources/${sourceId}/status`,
+          method: "GET",
+          timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+          expectedNodeId: node.id,
+        });
+        const runtime = runtimeResponse.data?.runtime || {};
+        if (runtime.active !== true && runtime.process_alive !== true) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+
+      const runtime = runtimeResponse?.data?.runtime || {};
+      if (
+        runtime?.canonical_publish &&
+        typeof runtime.canonical_publish === "object"
+      ) {
+        delete runtime.canonical_publish.stream_name;
+      }
+      const stopped = runtime.active !== true && runtime.process_alive !== true;
+
+      if (!stopped) {
+        return res.status(202).json({
+          ok: true,
+          node: { id: Number(node.id), name: node.name },
+          source: {
+            id: Number(source.id),
+            channel_id: Number(source.channel_id),
+            name: source.name,
+          },
+          state: "stop_in_progress",
+          database_mutated: false,
+          agent_stop: stopResponse.data,
+          runtime,
+        });
+      }
+
+      await pullSourceManager.finalizeRemoteStop(source, {
+        clearActive: true,
+        reason: "authoritative_remote_stop",
+      });
+
+      const finalDbResult = await queryWithRetry(
+        `SELECT id, channel_id, status, is_running, is_active_source,
+                health_status, stopped_at, last_error, last_error_code
+         FROM channel_pull_sources
+         WHERE id = $1
+         LIMIT 1`,
+        [sourceId],
+      );
+      const finalSource = finalDbResult.rows[0] || null;
+
+      return res.status(200).json({
+        ok: true,
+        node: { id: Number(node.id), name: node.name },
+        agent_response_ms: stopResponse.response_ms,
+        source: finalSource
+          ? {
+              id: Number(finalSource.id),
+              channel_id: Number(finalSource.channel_id),
+              status: finalSource.status,
+              is_running: finalSource.is_running === true,
+              is_active_source: finalSource.is_active_source === true,
+              health_status: finalSource.health_status,
+              stopped_at: finalSource.stopped_at,
+              last_error: finalSource.last_error,
+              last_error_code: finalSource.last_error_code,
+            }
+          : null,
+        state: "stopped",
+        database_mutated: true,
+        agent_stop: stopResponse.data,
+        runtime,
+      });
+    } catch (error) {
+      if (markedChannelId) clearPullSourceIntentionalStop(markedChannelId);
+      console.error("Authoritative Pull Source stop error:", error.message);
+      res
+        .status(error.status || (error.code === "AGENT_TIMEOUT" ? 504 : 502))
+        .json({
+          ok: false,
+          message: "Authoritative Pull Source stop failed",
           error: error.message,
         });
     }

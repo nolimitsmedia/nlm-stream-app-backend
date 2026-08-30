@@ -1,7 +1,7 @@
 // pull_source_service.js
-// Phase 4D.4B adds a Super-Admin controlled persistent remote start job, but
-// the production Pull Source manager remains authoritative/local until later
-// phases wire node status, stop, reconnect, and HA ownership into this service.
+// Phase 4D.4D adds authoritative remote stop database finalization while the
+// production Pull Source manager still owns local reconnect and HA decisions.
+// Remote reconnect and HA execution remain deferred to later phases.
 // Pulls external live sources and republishes them into the channel's normal
 // SRS /live/<stream_key> ingest path so the existing NLM lifecycle (ABR, DVR,
 // recording, analytics and Stream Targets) remains the single source of truth.
@@ -1315,6 +1315,32 @@ function createPullSourceManager({ pool }) {
     return { ok: true, message: "Pull source stopped" };
   }
 
+  async function finalizeRemoteStop(source, options = {}) {
+    if (!source?.id) return { ok: false, message: "Pull source is missing" };
+
+    // Phase 4D.4D intentionally updates only durable source/ownership state.
+    // The actual FFmpeg process is owned and stopped by the assigned Media Node
+    // Agent. Do not create a local worker, reconnect timer, or HA switch here.
+    await updateDb(Number(source.id), {
+      status: "stopped",
+      is_running: false,
+      stopped_at: new Date(),
+      health_status: "unknown",
+      last_health_check_at: new Date(),
+      last_error: null,
+      last_error_code: null,
+    });
+
+    if (options.clearActive !== false) {
+      await clearActiveSource(
+        source,
+        options.reason || "remote_source_stopped",
+      );
+    }
+
+    return { ok: true, message: "Remote Pull source stop finalized" };
+  }
+
   async function runFailbackMonitor() {
     if (failoverMonitorBusy) return;
     failoverMonitorBusy = true;
@@ -1593,6 +1619,7 @@ function createPullSourceManager({ pool }) {
     startSource,
     activateSource,
     stopSource,
+    finalizeRemoteStop,
     recordHealth,
     getRuntimeState: publicRuntimeState,
     isSrsStreamLive,
