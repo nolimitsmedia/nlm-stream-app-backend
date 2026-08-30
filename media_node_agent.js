@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4D";
+const AGENT_VERSION = "4D.4E";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -35,6 +35,9 @@ const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
   "http_flv",
 ]);
 const PULL_SOURCE_START_PROTOCOLS = PULL_SOURCE_PROBE_PROTOCOLS;
+const DEFAULT_PULL_SOURCE_RECONNECT_BASE_MS = 3000;
+const DEFAULT_PULL_SOURCE_RECONNECT_MAX_MS = 30000;
+const DEFAULT_PULL_SOURCE_RECONNECT_JITTER = 0.15;
 const INTERNAL_RTMP_BASE = String(
   process.env.PULL_SOURCE_INTERNAL_RTMP_BASE || "rtmp://127.0.0.1:1935/live",
 ).replace(/\/+$/, "");
@@ -281,10 +284,15 @@ function publicJob(job) {
     source_id: job.source_id ?? null,
     protocol: job.protocol ?? null,
     persistent: job.persistent === true,
+    reconnect_enabled: job.reconnect_policy?.enabled === true,
+    reconnect_count: Math.max(0, Number(job.reconnect_count || 0)),
+    next_retry_at: job.next_retry_at || null,
+    last_process_exit_at: job.last_process_exit_at || null,
     status: job.status,
     bitrate_kbps: Math.max(0, Math.round(Number(job.bitrate_kbps || 0))),
     uptime_seconds:
-      startedMs && ["starting", "running", "stopping"].includes(job.status)
+      startedMs &&
+      ["starting", "running", "reconnecting", "stopping"].includes(job.status)
         ? Math.max(0, Math.floor((finishedMs - startedMs) / 1000))
         : 0,
     created_at: job.created_at,
@@ -576,7 +584,7 @@ function findActivePullSourceJob(sourceId, channelId) {
     if (
       job.type === "pull_source_start" &&
       (job.source_id === sourceId || job.channel_id === channelId) &&
-      ["starting", "running", "stopping"].includes(job.status)
+      ["starting", "running", "reconnecting", "stopping"].includes(job.status)
     ) {
       return job;
     }
@@ -584,13 +592,143 @@ function findActivePullSourceJob(sourceId, channelId) {
   return null;
 }
 
+function normalizeReconnectPolicy(value) {
+  const input =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const enabled = input.enabled === true;
+  const baseDelayMs = Math.max(
+    1000,
+    Math.min(
+      60000,
+      Number(input.base_delay_ms || DEFAULT_PULL_SOURCE_RECONNECT_BASE_MS),
+    ),
+  );
+  const maxDelayMs = Math.max(
+    baseDelayMs,
+    Math.min(
+      300000,
+      Number(input.max_delay_ms || DEFAULT_PULL_SOURCE_RECONNECT_MAX_MS),
+    ),
+  );
+  const jitterPercent = Math.max(
+    0,
+    Math.min(
+      0.5,
+      Number(input.jitter_percent ?? DEFAULT_PULL_SOURCE_RECONNECT_JITTER),
+    ),
+  );
+  return {
+    enabled,
+    base_delay_ms: baseDelayMs,
+    max_delay_ms: maxDelayMs,
+    jitter_percent: jitterPercent,
+  };
+}
+
+function pullSourceReconnectDelay(job) {
+  const policy = normalizeReconnectPolicy(job.reconnect_policy);
+  const attempt = Math.max(1, Number(job.reconnect_count || 1));
+  const exponential = Math.min(
+    policy.max_delay_ms,
+    policy.base_delay_ms * Math.pow(2, Math.min(attempt - 1, 10)),
+  );
+  const spread = exponential * policy.jitter_percent;
+  const jitter = spread > 0 ? Math.random() * spread * 2 - spread : 0;
+  return Math.max(1000, Math.round(exponential + jitter));
+}
+
+function clearPullSourceReconnectTimer(job) {
+  if (job?.reconnect_timer) {
+    clearTimeout(job.reconnect_timer);
+    job.reconnect_timer = null;
+  }
+  if (job) job.next_retry_at = null;
+}
+
+function schedulePersistentPullSourceReconnect(job, failureMessage) {
+  const policy = normalizeReconnectPolicy(job.reconnect_policy);
+  if (
+    !policy.enabled ||
+    job.status === "stopping" ||
+    job.status === "stopped"
+  ) {
+    job.status = "failed";
+    job.error = failureMessage;
+    job.finished_at = new Date().toISOString();
+    return;
+  }
+
+  job.reconnect_count = Math.max(0, Number(job.reconnect_count || 0)) + 1;
+  job.status = "reconnecting";
+  job.error = failureMessage;
+  job.finished_at = null;
+  const delay = pullSourceReconnectDelay(job);
+  job.next_retry_at = new Date(Date.now() + delay).toISOString();
+
+  clearPullSourceReconnectTimer(job);
+  job.next_retry_at = new Date(Date.now() + delay).toISOString();
+  job.reconnect_timer = setTimeout(() => {
+    job.reconnect_timer = null;
+    job.next_retry_at = null;
+    if (job.status !== "reconnecting") return;
+    try {
+      spawnPersistentPullSourceAttempt(job);
+    } catch (error) {
+      schedulePersistentPullSourceReconnect(
+        job,
+        error?.message || "Persistent Pull Source reconnect spawn failed",
+      );
+    }
+  }, delay);
+  job.reconnect_timer.unref?.();
+}
+
+function finishPersistentPullSourceAttempt(
+  job,
+  child,
+  code,
+  signal,
+  stderr,
+  spawnError = null,
+) {
+  if (job.child !== child) return;
+
+  job.exit_code = code;
+  job.signal = signal || null;
+  job.last_process_exit_at = new Date().toISOString();
+  job.child = null;
+  job.bitrate_kbps = 0;
+  if (job.stop_timer) {
+    clearTimeout(job.stop_timer);
+    job.stop_timer = null;
+  }
+
+  if (job.status === "stopping") {
+    clearPullSourceReconnectTimer(job);
+    job.status = "stopped";
+    job.error = null;
+    job.finished_at = new Date().toISOString();
+    return;
+  }
+
+  const failureMessage =
+    spawnError?.message ||
+    stderr ||
+    `Persistent Pull Source worker exited code=${code} signal=${signal || "none"}`;
+  schedulePersistentPullSourceReconnect(job, failureMessage);
+}
+
 function attachPersistentPullSourceProcess(job, child) {
   job.child = child;
   job.persistent = true;
   job.status = "running";
   job.bitrate_kbps = 0;
+  job.error = null;
+  job.finished_at = null;
+  job.next_retry_at = null;
   let stderr = "";
   let progressBuffer = "";
+  let finished = false;
 
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
@@ -610,36 +748,37 @@ function attachPersistentPullSourceProcess(job, child) {
     stderr = `${stderr}${chunk}`.slice(-4096);
   });
 
-  child.on("error", (error) => {
-    job.status = "failed";
-    job.error = error.message;
-    job.finished_at = new Date().toISOString();
-    job.child = null;
-  });
+  const finish = (code, signal, spawnError = null) => {
+    if (finished) return;
+    finished = true;
+    finishPersistentPullSourceAttempt(
+      job,
+      child,
+      code,
+      signal,
+      stderr,
+      spawnError,
+    );
+  };
 
-  child.on("exit", (code, signal) => {
-    job.exit_code = code;
-    job.signal = signal || null;
-    job.finished_at = new Date().toISOString();
-    job.child = null;
-    job.bitrate_kbps = 0;
-    if (job.stop_timer) {
-      clearTimeout(job.stop_timer);
-      job.stop_timer = null;
-    }
-
-    if (job.status === "stopping") {
-      job.status = "stopped";
-      job.error = null;
-    } else {
-      job.status = "failed";
-      job.error =
-        stderr ||
-        `Persistent Pull Source worker exited code=${code} signal=${signal || "none"}`;
-    }
-  });
-
+  child.on("error", (error) => finish(null, null, error));
+  child.on("exit", (code, signal) => finish(code, signal));
   return job;
+}
+
+function spawnPersistentPullSourceAttempt(job) {
+  if (!job || job.status === "stopping" || job.status === "stopped") return job;
+  clearPullSourceReconnectTimer(job);
+  const args = buildPersistentPullSourceArgs(
+    job.source_url,
+    job.protocol,
+    job.stream_key,
+  );
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+  return attachPersistentPullSourceProcess(job, child);
 }
 
 function startPersistentPullSource(
@@ -649,6 +788,7 @@ function startPersistentPullSource(
   protocol,
   sourceUrl,
   streamKey,
+  reconnectPolicy = null,
 ) {
   cleanupJobs();
   if (requestId && requestIds.has(requestId)) {
@@ -683,15 +823,16 @@ function startPersistentPullSource(
     persistent: true,
     bitrate_kbps: 0,
     stop_timer: null,
+    reconnect_timer: null,
+    reconnect_count: 0,
+    next_retry_at: null,
+    last_process_exit_at: null,
+    reconnect_policy: normalizeReconnectPolicy(reconnectPolicy),
     sensitive_values: [cleanUrl],
+    source_url: cleanUrl,
     stream_key: streamKey,
   });
-  const args = buildPersistentPullSourceArgs(cleanUrl, normalized, streamKey);
-  const child = spawn("ffmpeg", args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: false,
-  });
-  return attachPersistentPullSourceProcess(job, child);
+  return spawnPersistentPullSourceAttempt(job);
 }
 
 function startPullSourceProbe(
@@ -791,7 +932,9 @@ async function handleCreateJob(req, res) {
             "channel_id",
             "protocol",
             "source_url",
-            ...(body.type === "pull_source_start" ? ["stream_key"] : []),
+            ...(body.type === "pull_source_start"
+              ? ["stream_key", "reconnect_policy"]
+              : []),
           ])
         : new Set(["type", "request_id"]);
 
@@ -856,6 +999,45 @@ async function handleCreateJob(req, res) {
         sendJson(res, 400, { ok: false, error: "Invalid stream key" });
         return;
       }
+      const reconnectPolicy = body.reconnect_policy;
+      if (
+        !reconnectPolicy ||
+        typeof reconnectPolicy !== "object" ||
+        Array.isArray(reconnectPolicy) ||
+        Object.keys(reconnectPolicy).some(
+          (key) =>
+            ![
+              "enabled",
+              "base_delay_ms",
+              "max_delay_ms",
+              "jitter_percent",
+            ].includes(key),
+        )
+      ) {
+        sendJson(res, 400, { ok: false, error: "Invalid reconnect_policy" });
+        return;
+      }
+      const baseDelay = Number(reconnectPolicy.base_delay_ms);
+      const maxDelay = Number(reconnectPolicy.max_delay_ms);
+      const jitter = Number(reconnectPolicy.jitter_percent);
+      if (
+        typeof reconnectPolicy.enabled !== "boolean" ||
+        !Number.isFinite(baseDelay) ||
+        baseDelay < 1000 ||
+        baseDelay > 60000 ||
+        !Number.isFinite(maxDelay) ||
+        maxDelay < baseDelay ||
+        maxDelay > 300000 ||
+        !Number.isFinite(jitter) ||
+        jitter < 0 ||
+        jitter > 0.5
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error: "Invalid reconnect_policy values",
+        });
+        return;
+      }
       try {
         job = startPersistentPullSource(
           requestId,
@@ -864,6 +1046,7 @@ async function handleCreateJob(req, res) {
           protocol,
           sourceUrl,
           streamKey,
+          reconnectPolicy,
         );
       } catch (error) {
         if (error?.status === 409) {
@@ -964,10 +1147,20 @@ function requestPersistentPullSourceStop(job) {
     return { accepted: true, already_stopped: false };
   }
 
+  if (job.status === "reconnecting") {
+    clearPullSourceReconnectTimer(job);
+    job.status = "stopped";
+    job.error = null;
+    job.finished_at = new Date().toISOString();
+    job.bitrate_kbps = 0;
+    return { accepted: true, already_stopped: false };
+  }
+
   if (!["starting", "running"].includes(job.status) || !job.child) {
     return { accepted: false, already_stopped: true };
   }
 
+  clearPullSourceReconnectTimer(job);
   job.status = "stopping";
   const child = job.child;
   child.kill("SIGTERM");
@@ -1058,9 +1251,12 @@ async function handlePullSourceRuntimeStatus(res, sourceId) {
   };
 
   if (job?.stream_key) {
-    canonical.expected = ["starting", "running", "stopping"].includes(
-      job.status,
-    );
+    canonical.expected = [
+      "starting",
+      "running",
+      "reconnecting",
+      "stopping",
+    ].includes(job.status);
     try {
       const streams = await getSanitizedStreams();
       const stream = streams.find(
@@ -1082,7 +1278,8 @@ async function handlePullSourceRuntimeStatus(res, sourceId) {
   }
 
   const active =
-    !!job && ["starting", "running", "stopping"].includes(job.status);
+    !!job &&
+    ["starting", "running", "reconnecting", "stopping"].includes(job.status);
   const processAlive =
     !!job?.child && job.child.exitCode === null && !job.child.killed;
 
@@ -1152,6 +1349,8 @@ function handleCapabilities(res) {
       persistent_pull_source_start: true,
       pull_source_runtime_status: true,
       authoritative_pull_source_stop: true,
+      pull_source_reconnect_execution: true,
+      pull_source_reconnect_policy_source: "control_plane",
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
@@ -1318,6 +1517,7 @@ function shutdown(signal) {
   // restart. Stop agent-owned workers deliberately so no orphan FFmpeg process
   // can continue publishing without a control-plane owner.
   for (const job of jobs.values()) {
+    clearPullSourceReconnectTimer(job);
     if (job.child && ["starting", "running", "stopping"].includes(job.status)) {
       try {
         job.status = "stopping";

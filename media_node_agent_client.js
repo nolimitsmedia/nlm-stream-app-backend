@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.4D — secure transport, strict controlled jobs, runtime status, and authoritative Pull Source stop.
+// Phase 4D.4E — secure transport, strict controlled jobs, runtime status, authoritative stop, and control-plane-authorized reconnect execution.
 
 const net = require("net");
 
@@ -240,7 +240,9 @@ async function requestMediaNodeAgent({
               "channel_id",
               "protocol",
               "source_url",
-              ...(body.type === "pull_source_start" ? ["stream_key"] : []),
+              ...(body.type === "pull_source_start"
+                ? ["stream_key", "reconnect_policy"]
+                : []),
             ])
           : new Set(["type", "request_id"]);
 
@@ -291,6 +293,51 @@ async function requestMediaNodeAgent({
       if (body.type === "pull_source_start") {
         if (!/^[A-Za-z0-9_-]{1,255}$/.test(String(body.stream_key || ""))) {
           throw new Error("Invalid Media Node Pull Source stream key");
+        }
+        const policy = body.reconnect_policy;
+        if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+          throw new Error("Invalid Media Node Pull Source reconnect_policy");
+        }
+        const unknownPolicyKeys = Object.keys(policy).filter(
+          (key) =>
+            ![
+              "enabled",
+              "base_delay_ms",
+              "max_delay_ms",
+              "jitter_percent",
+            ].includes(key),
+        );
+        if (unknownPolicyKeys.length) {
+          throw new Error(
+            `Unsupported Media Node Pull Source reconnect policy fields: ${unknownPolicyKeys.join(", ")}`,
+          );
+        }
+        if (typeof policy.enabled !== "boolean") {
+          throw new Error(
+            "Invalid Media Node Pull Source reconnect enabled flag",
+          );
+        }
+        const baseDelay = Number(policy.base_delay_ms);
+        const maxDelay = Number(policy.max_delay_ms);
+        const jitter = Number(policy.jitter_percent);
+        if (
+          !Number.isFinite(baseDelay) ||
+          baseDelay < 1000 ||
+          baseDelay > 60000
+        ) {
+          throw new Error(
+            "Invalid Media Node Pull Source reconnect base delay",
+          );
+        }
+        if (
+          !Number.isFinite(maxDelay) ||
+          maxDelay < baseDelay ||
+          maxDelay > 300000
+        ) {
+          throw new Error("Invalid Media Node Pull Source reconnect max delay");
+        }
+        if (!Number.isFinite(jitter) || jitter < 0 || jitter > 0.5) {
+          throw new Error("Invalid Media Node Pull Source reconnect jitter");
         }
       }
     }

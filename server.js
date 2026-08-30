@@ -4866,7 +4866,7 @@ app.post(
         return res.status(400).json({
           ok: false,
           message:
-            "Phase 4D.4D permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
+            "Phase 4D.4E permits ffmpeg_probe, ffmpeg_stop_probe, live_stream_probe, pull_source_probe, or pull_source_start",
         });
       }
 
@@ -4918,11 +4918,16 @@ app.post(
         const sourceResult = await queryWithRetry(
           `SELECT ps.id, ps.channel_id, ps.organization_id, ps.protocol,
                   ps.source_url, ps.enabled, ps.status, ps.is_running,
-                  ps.is_active_source, c.media_node_id, c.stream_key, c.is_live
+                  ps.is_active_source, ps.auto_reconnect,
+                  c.media_node_id, c.stream_key, c.is_live,
+                  COALESCE(f.enabled, FALSE) AS failover_enabled
            FROM channel_pull_sources ps
            JOIN channels c
              ON c.id = ps.channel_id
             AND c.organization_id = ps.organization_id
+           LEFT JOIN channel_source_failover f
+             ON f.channel_id = ps.channel_id
+            AND f.organization_id = ps.organization_id
            WHERE ps.id = $1
              AND ps.channel_id = $2
            LIMIT 1`,
@@ -5013,6 +5018,40 @@ app.post(
           clearPullSourceIntentionalStop(source.channel_id);
         }
 
+        const reconnectBaseMs = Math.max(
+          1000,
+          Math.min(
+            60000,
+            Number(process.env.PULL_SOURCE_RECONNECT_DELAY_MS || 3000),
+          ),
+        );
+        const reconnectMaxMs = Math.max(
+          reconnectBaseMs,
+          Math.min(
+            300000,
+            Number(process.env.PULL_SOURCE_MAX_RECONNECT_DELAY_MS || 30000),
+          ),
+        );
+        const reconnectJitter = Math.max(
+          0,
+          Math.min(
+            0.5,
+            Number(process.env.PULL_SOURCE_RECONNECT_JITTER_PERCENT || 0.15),
+          ),
+        );
+        const reconnectPolicy = {
+          // 4D.4E lets the node execute retries only when the central control
+          // plane authorizes auto-reconnect and HA is disabled. HA-enabled
+          // failure/recovery remains intentionally deferred to 4D.4F.
+          enabled:
+            jobType === "pull_source_start" &&
+            source.auto_reconnect === true &&
+            source.failover_enabled !== true,
+          base_delay_ms: reconnectBaseMs,
+          max_delay_ms: reconnectMaxMs,
+          jitter_percent: reconnectJitter,
+        };
+
         agentBody = {
           type: jobType,
           request_id: requestId,
@@ -5020,7 +5059,9 @@ app.post(
           channel_id: channelId,
           protocol,
           source_url: sourceUrl,
-          ...(jobType === "pull_source_start" ? { stream_key: streamKey } : {}),
+          ...(jobType === "pull_source_start"
+            ? { stream_key: streamKey, reconnect_policy: reconnectPolicy }
+            : {}),
         };
       } else if (jobType === "live_stream_probe") {
         const channelId = Number(req.body.channel_id);
@@ -5170,11 +5211,15 @@ app.get(
         `SELECT ps.id, ps.channel_id, ps.organization_id, ps.name, ps.protocol,
                 ps.enabled, ps.status, ps.is_running, ps.is_active_source,
                 ps.health_status, ps.last_health_check_at, ps.reconnect_count,
-                c.name AS channel_name, c.media_node_id, c.is_live
+                ps.auto_reconnect, c.name AS channel_name, c.media_node_id, c.is_live,
+                COALESCE(f.enabled, FALSE) AS failover_enabled
          FROM channel_pull_sources ps
          JOIN channels c
            ON c.id = ps.channel_id
           AND c.organization_id = ps.organization_id
+         LEFT JOIN channel_source_failover f
+           ON f.channel_id = ps.channel_id
+          AND f.organization_id = ps.organization_id
          WHERE ps.id = $1
          LIMIT 1`,
         [sourceId],
@@ -5240,6 +5285,8 @@ app.get(
           database_health_status: source.health_status,
           last_health_check_at: source.last_health_check_at,
           reconnect_count: Number(source.reconnect_count || 0),
+          auto_reconnect: source.auto_reconnect === true,
+          ha_enabled: source.failover_enabled === true,
           channel_name: source.channel_name,
           channel_is_live: source.is_live === true,
         },
@@ -5344,7 +5391,7 @@ app.post(
           ok: false,
           code: "ha_integration_pending",
           message:
-            "Phase 4D.4D authoritative remote stop is intentionally blocked while Pull Source HA is enabled. Disable HA for controlled validation; HA-aware remote stop is Phase 4D.4F.",
+            "Phase 4D.4E still intentionally blocks authoritative remote stop while Pull Source HA is enabled. Disable HA for controlled validation; HA-aware remote stop is Phase 4D.4F.",
         });
       }
 

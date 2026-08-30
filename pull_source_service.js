@@ -1,7 +1,7 @@
 // pull_source_service.js
-// Phase 4D.4D adds authoritative remote stop database finalization while the
-// production Pull Source manager still owns local reconnect and HA decisions.
-// Remote reconnect and HA execution remain deferred to later phases.
+// Phase 4D.4E keeps the production Pull Source manager authoritative for policy
+// while the Media Node Agent can execute an authorized reconnect loop for
+// controlled remote workers. HA-aware remote execution remains Phase 4D.4F.
 // Pulls external live sources and republishes them into the channel's normal
 // SRS /live/<stream_key> ingest path so the existing NLM lifecycle (ABR, DVR,
 // recording, analytics and Stream Targets) remains the single source of truth.
