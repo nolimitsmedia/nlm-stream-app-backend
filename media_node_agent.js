@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4E";
+const AGENT_VERSION = "4D.4F.1";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -1351,6 +1351,7 @@ function handleCapabilities(res) {
       authoritative_pull_source_stop: true,
       pull_source_reconnect_execution: true,
       pull_source_reconnect_policy_source: "control_plane",
+      pull_source_ha_execution_adapter: true,
       stream_migration: false,
       automatic_load_balancing: false,
       secure_remote_transport: useTls,

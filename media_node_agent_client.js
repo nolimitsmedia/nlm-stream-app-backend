@@ -1,6 +1,6 @@
 "use strict";
 
-// Phase 4D.4E — secure transport, strict controlled jobs, runtime status, authoritative stop, and control-plane-authorized reconnect execution.
+// Phase 4D.4F.1 — secure transport plus the strict control-plane transport used by the HA remote-execution adapter.
 
 const net = require("net");
 

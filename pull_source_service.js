@@ -1,7 +1,7 @@
 // pull_source_service.js
-// Phase 4D.4E keeps the production Pull Source manager authoritative for policy
-// while the Media Node Agent can execute an authorized reconnect loop for
-// controlled remote workers. HA-aware remote execution remains Phase 4D.4F.
+// Phase 4D.4F.1 keeps the production Pull Source manager authoritative for HA
+// policy while adding a narrow remote-execution adapter for HA-managed workers.
+// The central service still selects sources, verifies canonical delivery, and owns DB state.
 // Pulls external live sources and republishes them into the channel's normal
 // SRS /live/<stream_key> ingest path so the existing NLM lifecycle (ABR, DVR,
 // recording, analytics and Stream Targets) remains the single source of truth.
@@ -447,6 +447,17 @@ function createPullSourceManager({ pool }) {
   const failbackStableSince = new Map();
   const haEvents = createHaEventService(pool);
   let failoverMonitorBusy = false;
+  let remoteExecutor = null;
+
+  function setRemoteExecutor(executor) {
+    remoteExecutor = executor && typeof executor === "object" ? executor : null;
+  }
+
+  async function shouldUseRemoteExecutor(source, channel, options = {}) {
+    if (!remoteExecutor || typeof remoteExecutor.shouldUse !== "function")
+      return false;
+    return remoteExecutor.shouldUse(source, channel, options);
+  }
 
   function getState(id) {
     return states.get(Number(id)) || null;
@@ -1178,6 +1189,83 @@ function createPullSourceManager({ pool }) {
       reconnect_count: state.reconnectCount,
     });
 
+    if (await shouldUseRemoteExecutor(source, channel, options)) {
+      console.log(
+        `[PULL-SOURCE-REMOTE] Starting HA-managed #${id} (${protocol}) on assigned Media Node -> ${channel.stream_key}`,
+      );
+      let remoteStart;
+      try {
+        remoteStart = await remoteExecutor.start(source, channel, {
+          reconnecting: Boolean(options.reconnecting),
+          reason: options.reason || null,
+        });
+      } catch (error) {
+        state.status = "stopped";
+        state.lastError = error.message;
+        state.lastErrorCode = error.code || "remote_start_failed";
+        await updateDb(id, {
+          status: "stopped",
+          is_running: false,
+          last_error: state.lastError,
+          last_error_code: state.lastErrorCode,
+          health_status: "unhealthy",
+          last_health_check_at: new Date(),
+        });
+        return { ok: false, code: state.lastErrorCode, message: error.message };
+      }
+
+      state.remote = true;
+      state.remoteJobId = remoteStart?.job?.id || null;
+      state.startedAt = Date.now();
+      state.status = "starting";
+
+      const verifyStarted = Date.now();
+      while (Date.now() - verifyStarted < DELIVERY_VERIFY_TIMEOUT_MS) {
+        if (await isSrsStreamLive(channel.stream_key)) {
+          state.status = "streaming";
+          state.isRunning = true;
+          await updateDb(id, {
+            status: "streaming",
+            is_running: true,
+            started_at: new Date(state.startedAt),
+            stopped_at: null,
+            last_error: null,
+            last_error_code: null,
+            reconnect_count: state.reconnectCount,
+            health_status: "healthy",
+            last_health_check_at: new Date(),
+          });
+          return {
+            ok: true,
+            message: "Pull source is streaming on assigned Media Node",
+            execution: "media_node_agent",
+            remote_job_id: state.remoteJobId,
+            runtime: publicRuntimeState(id),
+          };
+        }
+        await sleep(500);
+      }
+
+      try {
+        await remoteExecutor.stop(source, channel, {
+          reason: "publish_verify_timeout",
+        });
+      } catch (error) {
+        console.warn(
+          `[PULL-SOURCE-REMOTE] Cleanup stop failed for #${id}: ${error.message}`,
+        );
+      }
+      state.remote = false;
+      state.remoteJobId = null;
+      state.status = "stopped";
+      return {
+        ok: false,
+        code: "publish_verify_timeout",
+        message:
+          "Assigned Media Node started the source, but canonical delivery was not verified in time",
+      };
+    }
+
     const args = buildWorkerArgs(sourceUrl, protocol, channel.stream_key);
     console.log(
       `[PULL-SOURCE] Starting #${id} (${protocol}) ${maskSourceUrl(sourceUrl)} -> ${channel.stream_key}`,
@@ -1286,6 +1374,28 @@ function createPullSourceManager({ pool }) {
       if (state.retryTimer) {
         clearTimeout(state.retryTimer);
         state.retryTimer = null;
+      }
+      if (
+        state.remote &&
+        remoteExecutor &&
+        typeof remoteExecutor.stop === "function"
+      ) {
+        try {
+          await remoteExecutor.stop(
+            source,
+            { id: source.channel_id },
+            {
+              reason: options.reason || "source_stopped",
+            },
+          );
+        } catch (error) {
+          console.warn(
+            `[PULL-SOURCE-REMOTE] Stop failed for #${id}: ${error.message}`,
+          );
+          throw error;
+        }
+        state.remote = false;
+        state.remoteJobId = null;
       }
       if (state.proc && state.proc.exitCode === null) {
         state.proc.kill("SIGTERM");
@@ -1625,6 +1735,7 @@ function createPullSourceManager({ pool }) {
     isSrsStreamLive,
     reconcileDatabaseState,
     shutdown,
+    setRemoteExecutor,
   };
 }
 

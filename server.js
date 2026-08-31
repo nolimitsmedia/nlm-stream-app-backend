@@ -13766,6 +13766,106 @@ const pullSourceManager = registerPullSourceRoutes(app, pool, {
 // wrapper runs BEFORE the underlying service sends SIGTERM. Internal automatic
 // failover/failback source switches call the service's private stopSource()
 // closure and intentionally bypass this marker.
+// Phase 4D.4F.1 — HA remote-execution adapter. The central Pull Source manager
+// remains the sole HA authority. This adapter only executes the selected worker
+// on the channel's assigned Media Node. Agent-side reconnect is deliberately
+// disabled while HA is enabled so the node can never independently compete with
+// the central Primary/Backup decision loop.
+pullSourceManager.setRemoteExecutor({
+  async shouldUse(source, channel) {
+    const result = await queryWithRetry(
+      `SELECT c.media_node_id,
+              COALESCE(f.enabled, FALSE) AS ha_enabled
+       FROM channels c
+       LEFT JOIN channel_source_failover f
+         ON f.channel_id=c.id AND f.organization_id=c.organization_id
+       WHERE c.id=$1 AND c.organization_id=$2
+       LIMIT 1`,
+      [Number(source?.channel_id || channel?.id), Number(source?.organization_id)],
+    );
+    const row = result.rows[0];
+    return Boolean(row?.ha_enabled && Number(row?.media_node_id) > 0);
+  },
+
+  async start(source, channel) {
+    const sourceId = Number(source?.id);
+    const channelId = Number(source?.channel_id || channel?.id);
+    const result = await queryWithRetry(
+      `SELECT ps.id, ps.channel_id, ps.organization_id, ps.protocol, ps.source_url,
+              ps.enabled, c.media_node_id, c.stream_key,
+              COALESCE(f.enabled, FALSE) AS ha_enabled
+       FROM channel_pull_sources ps
+       JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+       LEFT JOIN channel_source_failover f
+         ON f.channel_id=ps.channel_id AND f.organization_id=ps.organization_id
+       WHERE ps.id=$1 AND ps.channel_id=$2 LIMIT 1`,
+      [sourceId, channelId],
+    );
+    const row = result.rows[0];
+    if (!row || !row.enabled) throw new Error("HA Pull Source is unavailable or disabled");
+    if (!row.ha_enabled) throw new Error("HA remote execution requires failover to be enabled");
+    const nodeId = Number(row.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) throw new Error("Channel has no assigned Media Node");
+
+    const protocol = pullSourceManager.normalizeProtocol(row.protocol);
+    const sourceUrl = decryptSourceUrl(row.source_url);
+    await pullSourceManager.validateSourceUrl(sourceUrl, protocol);
+    const streamKey = String(row.stream_key || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey)) throw new Error("Invalid channel stream key");
+
+    const { node, connection } = await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: "/v1/jobs",
+      method: "POST",
+      body: {
+        type: "pull_source_start",
+        request_id: `ha-${channelId}-${sourceId}-${crypto.randomUUID()}`,
+        source_id: sourceId,
+        channel_id: channelId,
+        protocol,
+        source_url: sourceUrl,
+        stream_key: streamKey,
+        reconnect_policy: {
+          enabled: false,
+          base_delay_ms: Math.max(1000, Math.min(60000, Number(process.env.PULL_SOURCE_RECONNECT_DELAY_MS || 3000))),
+          max_delay_ms: Math.max(1000, Math.min(300000, Number(process.env.PULL_SOURCE_MAX_RECONNECT_DELAY_MS || 30000))),
+          jitter_percent: Math.max(0, Math.min(0.5, Number(process.env.PULL_SOURCE_RECONNECT_JITTER_PERCENT || 0.15))),
+        },
+      },
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+    return response.data;
+  },
+
+  async stop(source) {
+    const sourceId = Number(source?.id);
+    const channelId = Number(source?.channel_id);
+    const result = await queryWithRetry(
+      `SELECT c.media_node_id
+       FROM channel_pull_sources ps
+       JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+       WHERE ps.id=$1 AND ps.channel_id=$2 LIMIT 1`,
+      [sourceId, channelId],
+    );
+    const nodeId = Number(result.rows[0]?.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) throw new Error("Channel has no assigned Media Node");
+    const { node, connection } = await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: `/v1/pull-sources/${sourceId}/stop`,
+      method: "POST",
+      body: { channel_id: channelId },
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+    return response.data;
+  },
+});
+
 const originalPullSourceStop =
   pullSourceManager.stopSource.bind(pullSourceManager);
 pullSourceManager.stopSource = async (source, options = {}) => {
