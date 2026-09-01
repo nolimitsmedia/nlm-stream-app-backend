@@ -1736,17 +1736,39 @@ function createPullSourceManager({ pool }) {
         const primary = primaryResult.rows[0];
         if (!primary) continue;
 
-        let probe;
-        try {
-          probe = await preflightSource(primary);
-        } catch (error) {
-          probe = { ok: false, message: error.message };
-        }
-        await recordHealth(primary.id, probe.ok ? "ready" : "unhealthy").catch(
-          () => {},
-        );
-
         const channelId = Number(row.channel_id);
+        const channel = { id: row.channel_id, stream_key: row.stream_key };
+        const protocol = normalizeProtocol(primary.protocol);
+        const useRemote = await shouldUseRemoteExecutor(primary, channel, {
+          reason: "automatic_failback",
+          reconnecting: true,
+        });
+        const remoteSrt = useRemote && protocol === "srt";
+
+        let probe = { ok: true, message: "remote_srt_controlled_failback" };
+        if (!remoteSrt) {
+          try {
+            probe = await preflightSource(primary);
+          } catch (error) {
+            probe = { ok: false, message: error.message };
+          }
+          await recordHealth(
+            primary.id,
+            probe.ok ? "ready" : "unhealthy",
+          ).catch(() => {});
+        } else {
+          // Phase 4D.4F.3: never consume a remote HA-managed SRT input with a
+          // temporary ffprobe while Backup owns canonical. Listener-style SRT
+          // publishers can terminate when that probe disconnects. Instead use
+          // the configured failback stability window as a controlled-attempt
+          // delay, then let the real agent worker + canonical verification be
+          // authoritative. If activation fails, the previous Backup is restored
+          // immediately below.
+          console.warn(
+            `[PULL-SOURCE-FAILBACK] Remote SRT Primary #${primary.id} is eligible for a controlled failback attempt without destructive preflight.`,
+          );
+        }
+
         if (!probe.ok) {
           failbackStableSince.delete(channelId);
           continue;
@@ -1779,11 +1801,51 @@ function createPullSourceManager({ pool }) {
           },
         });
 
-        await activateSource(
-          primary,
-          { id: row.channel_id, stream_key: row.stream_key },
-          { reason: "automatic_failback", reconnecting: true },
-        );
+        const failbackResult = await activateSource(primary, channel, {
+          reason: "automatic_failback",
+          reconnecting: true,
+        });
+
+        if (!failbackResult?.ok && remoteSrt && row.active_source_id) {
+          // The controlled SRT attempt necessarily retires the old canonical
+          // publisher before the Primary can prove delivery. Roll back to the
+          // previously active Backup immediately if the Primary cannot publish.
+          const backupResult = await pool.query(
+            `SELECT * FROM channel_pull_sources
+             WHERE id=$1 AND channel_id=$2 AND organization_id=$3
+               AND enabled=TRUE
+             LIMIT 1`,
+            [row.active_source_id, row.channel_id, row.organization_id],
+          );
+          const previousBackup = backupResult.rows[0];
+          if (previousBackup) {
+            console.warn(
+              `[PULL-SOURCE-FAILBACK] Primary #${primary.id} did not establish canonical delivery; restoring Backup #${previousBackup.id}.`,
+            );
+            const rollback = await activateSource(previousBackup, channel, {
+              reason: "automatic_failback_rollback",
+              reconnecting: true,
+            });
+            await haEvents.recordEvent({
+              organizationId: row.organization_id,
+              channelId,
+              eventType: rollback?.ok
+                ? "failback_rolled_back"
+                : "switch_failed",
+              sourceId: primary.id,
+              previousSourceId: primary.id,
+              newSourceId: rollback?.ok ? previousBackup.id : null,
+              reason: "automatic_failback_rollback",
+              status: rollback?.ok ? "completed" : "failed",
+              metadata: {
+                primaryName: primary.name || null,
+                backupName: previousBackup.name || null,
+                failbackMessage: failbackResult?.message || null,
+                rollbackMessage: rollback?.message || null,
+              },
+            });
+          }
+        }
         failbackStableSince.delete(channelId);
       }
     } catch (error) {
