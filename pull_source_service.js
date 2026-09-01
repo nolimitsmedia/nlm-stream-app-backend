@@ -1258,11 +1258,34 @@ function createPullSourceManager({ pool }) {
       state.remote = false;
       state.remoteJobId = null;
       state.status = "stopped";
+      state.isRunning = false;
+      state.lastError =
+        "Assigned Media Node started the source, but canonical delivery was not verified in time";
+      state.lastErrorCode = "publish_verify_timeout";
+
+      // Phase 4D.4F.1b: a failed remote activation must not leave the durable
+      // Pull Source row stranded in `starting`. The agent worker has already
+      // been retired above, so persist the same stopped/unhealthy lifecycle
+      // state that the control plane now holds in memory. Ownership is not
+      // committed by activateSource() unless startSource() returns ok=true.
+      await updateDb(id, {
+        status: "stopped",
+        is_running: false,
+        last_error: state.lastError,
+        last_error_code: state.lastErrorCode,
+        health_status: "unhealthy",
+        last_health_check_at: new Date(),
+        stopped_at: new Date(),
+      });
+
+      console.warn(
+        `[PULL-SOURCE-REMOTE] Activation timeout cleanup finalized #${id} as stopped/unhealthy.`,
+      );
+
       return {
         ok: false,
-        code: "publish_verify_timeout",
-        message:
-          "Assigned Media Node started the source, but canonical delivery was not verified in time",
+        code: state.lastErrorCode,
+        message: state.lastError,
       };
     }
 
