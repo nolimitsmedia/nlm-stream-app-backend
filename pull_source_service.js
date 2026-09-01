@@ -1497,7 +1497,39 @@ function createPullSourceManager({ pool }) {
         const candidates = sources.filter((source) => source.enabled);
 
         let recovered = null;
+        let recoveryResult = null;
         for (const candidate of candidates) {
+          const protocol = normalizeProtocol(candidate.protocol);
+          const useRemote = await shouldUseRemoteExecutor(candidate, channel, {
+            reason: "automatic_source_recovery",
+            reconnecting: true,
+          });
+
+          // SRT listener-style test/encoder sources are single-session inputs.
+          // A separate ffprobe preflight connects successfully and then closes,
+          // which can terminate the upstream listener before the real Media Node
+          // worker gets a chance to connect. For HA-managed remote SRT sources,
+          // the controlled start + canonical SRS verification is itself the
+          // authoritative readiness test. Do not consume the source first.
+          if (useRemote && protocol === "srt") {
+            console.warn(
+              `[PULL-SOURCE-RECOVERY] Channel ${channelId} attempting remote SRT #${candidate.id} (${candidate.name}) without destructive preflight.`,
+            );
+            recoveryResult = await activateSource(candidate, channel, {
+              reason: "automatic_source_recovery",
+              reconnecting: true,
+            });
+            if (recoveryResult?.ok) {
+              recovered = candidate;
+              break;
+            }
+            await recordHealth(candidate.id, "unhealthy").catch(() => {});
+            console.warn(
+              `[PULL-SOURCE-RECOVERY] Remote SRT #${candidate.id} did not establish canonical delivery: ${recoveryResult?.message || "unknown error"}`,
+            );
+            continue;
+          }
+
           let probe;
           try {
             probe = await preflightSource(candidate);
@@ -1521,18 +1553,20 @@ function createPullSourceManager({ pool }) {
           continue;
         }
 
-        console.warn(
-          `[PULL-SOURCE-RECOVERY] Channel ${channelId} has no active source; recovered #${recovered.id} (${recovered.name}).`,
-        );
-
-        const result = await activateSource(recovered, channel, {
-          reason: "automatic_source_recovery",
-          reconnecting: true,
-        });
-
-        if (!result?.ok) {
+        if (!recoveryResult?.ok) {
           console.warn(
-            `[PULL-SOURCE-RECOVERY] Could not activate recovered #${recovered.id} for channel ${channelId}: ${result?.message || "unknown error"}`,
+            `[PULL-SOURCE-RECOVERY] Channel ${channelId} has no active source; recovered #${recovered.id} (${recovered.name}).`,
+          );
+
+          recoveryResult = await activateSource(recovered, channel, {
+            reason: "automatic_source_recovery",
+            reconnecting: true,
+          });
+        }
+
+        if (!recoveryResult?.ok) {
+          console.warn(
+            `[PULL-SOURCE-RECOVERY] Could not activate recovered #${recovered.id} for channel ${channelId}: ${recoveryResult?.message || "unknown error"}`,
           );
         }
       }

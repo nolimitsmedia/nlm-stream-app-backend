@@ -13781,7 +13781,10 @@ pullSourceManager.setRemoteExecutor({
          ON f.channel_id=c.id AND f.organization_id=c.organization_id
        WHERE c.id=$1 AND c.organization_id=$2
        LIMIT 1`,
-      [Number(source?.channel_id || channel?.id), Number(source?.organization_id)],
+      [
+        Number(source?.channel_id || channel?.id),
+        Number(source?.organization_id),
+      ],
     );
     const row = result.rows[0];
     return Boolean(row?.ha_enabled && Number(row?.media_node_id) > 0);
@@ -13802,18 +13805,23 @@ pullSourceManager.setRemoteExecutor({
       [sourceId, channelId],
     );
     const row = result.rows[0];
-    if (!row || !row.enabled) throw new Error("HA Pull Source is unavailable or disabled");
-    if (!row.ha_enabled) throw new Error("HA remote execution requires failover to be enabled");
+    if (!row || !row.enabled)
+      throw new Error("HA Pull Source is unavailable or disabled");
+    if (!row.ha_enabled)
+      throw new Error("HA remote execution requires failover to be enabled");
     const nodeId = Number(row.media_node_id);
-    if (!Number.isInteger(nodeId) || nodeId <= 0) throw new Error("Channel has no assigned Media Node");
+    if (!Number.isInteger(nodeId) || nodeId <= 0)
+      throw new Error("Channel has no assigned Media Node");
 
     const protocol = pullSourceManager.normalizeProtocol(row.protocol);
     const sourceUrl = decryptSourceUrl(row.source_url);
     await pullSourceManager.validateSourceUrl(sourceUrl, protocol);
     const streamKey = String(row.stream_key || "").trim();
-    if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey)) throw new Error("Invalid channel stream key");
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey))
+      throw new Error("Invalid channel stream key");
 
-    const { node, connection } = await getMediaNodeAgentConnectionForControl(nodeId);
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
     const response = await requestMediaNodeAgent({
       baseUrl: connection.baseUrl,
       token: connection.token,
@@ -13829,9 +13837,27 @@ pullSourceManager.setRemoteExecutor({
         stream_key: streamKey,
         reconnect_policy: {
           enabled: false,
-          base_delay_ms: Math.max(1000, Math.min(60000, Number(process.env.PULL_SOURCE_RECONNECT_DELAY_MS || 3000))),
-          max_delay_ms: Math.max(1000, Math.min(300000, Number(process.env.PULL_SOURCE_MAX_RECONNECT_DELAY_MS || 30000))),
-          jitter_percent: Math.max(0, Math.min(0.5, Number(process.env.PULL_SOURCE_RECONNECT_JITTER_PERCENT || 0.15))),
+          base_delay_ms: Math.max(
+            1000,
+            Math.min(
+              60000,
+              Number(process.env.PULL_SOURCE_RECONNECT_DELAY_MS || 3000),
+            ),
+          ),
+          max_delay_ms: Math.max(
+            1000,
+            Math.min(
+              300000,
+              Number(process.env.PULL_SOURCE_MAX_RECONNECT_DELAY_MS || 30000),
+            ),
+          ),
+          jitter_percent: Math.max(
+            0,
+            Math.min(
+              0.5,
+              Number(process.env.PULL_SOURCE_RECONNECT_JITTER_PERCENT || 0.15),
+            ),
+          ),
         },
       },
       timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
@@ -13851,8 +13877,10 @@ pullSourceManager.setRemoteExecutor({
       [sourceId, channelId],
     );
     const nodeId = Number(result.rows[0]?.media_node_id);
-    if (!Number.isInteger(nodeId) || nodeId <= 0) throw new Error("Channel has no assigned Media Node");
-    const { node, connection } = await getMediaNodeAgentConnectionForControl(nodeId);
+    if (!Number.isInteger(nodeId) || nodeId <= 0)
+      throw new Error("Channel has no assigned Media Node");
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
     const response = await requestMediaNodeAgent({
       baseUrl: connection.baseUrl,
       token: connection.token,
