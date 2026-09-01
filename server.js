@@ -13866,6 +13866,32 @@ pullSourceManager.setRemoteExecutor({
     return response.data;
   },
 
+  async status(source) {
+    const sourceId = Number(source?.id);
+    const channelId = Number(source?.channel_id);
+    const result = await queryWithRetry(
+      `SELECT c.media_node_id
+       FROM channel_pull_sources ps
+       JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+       WHERE ps.id=$1 AND ps.channel_id=$2 LIMIT 1`,
+      [sourceId, channelId],
+    );
+    const nodeId = Number(result.rows[0]?.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0)
+      throw new Error("Channel has no assigned Media Node");
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: `/v1/pull-sources/${sourceId}/status`,
+      method: "GET",
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+    return response.data?.runtime || {};
+  },
+
   async stop(source) {
     const sourceId = Number(source?.id);
     const channelId = Number(source?.channel_id);

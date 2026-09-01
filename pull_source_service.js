@@ -445,6 +445,7 @@ function buildWorkerArgs(sourceUrl, protocol, streamKey) {
 function createPullSourceManager({ pool }) {
   const states = new Map();
   const failbackStableSince = new Map();
+  const remoteRuntimeFailures = new Map();
   const haEvents = createHaEventService(pool);
   let failoverMonitorBusy = false;
   let remoteExecutor = null;
@@ -860,6 +861,19 @@ function createPullSourceManager({ pool }) {
 
     for (const candidate of candidates) {
       try {
+        const protocol = normalizeProtocol(candidate.protocol);
+        const useRemote = await shouldUseRemoteExecutor(candidate, channel, {
+          reason: "automatic_failover",
+          reconnecting: true,
+        });
+
+        // HA-managed SRT inputs may be listener-style/single-session sources.
+        // A separate ffprobe would consume and disconnect that session before
+        // the selected Media Node worker starts. For remote SRT failover, let
+        // activateSource() + canonical publish verification be the readiness
+        // test, exactly like the no-active recovery path.
+        if (useRemote && protocol === "srt") return candidate;
+
         const probe = await preflightSource(candidate);
         await recordHealth(candidate.id, probe.ok ? "ready" : "unhealthy");
         if (probe.ok) return candidate;
@@ -1474,10 +1488,107 @@ function createPullSourceManager({ pool }) {
     return { ok: true, message: "Remote Pull source stop finalized" };
   }
 
+  async function watchActiveRemoteSources() {
+    if (!remoteExecutor || typeof remoteExecutor.status !== "function") return;
+
+    const active = await pool.query(`
+      SELECT ps.*, c.stream_key, f.failure_threshold_seconds
+      FROM channel_source_failover f
+      JOIN channels c ON c.id=f.channel_id AND c.organization_id=f.organization_id
+      JOIN channel_pull_sources ps ON ps.id=f.active_source_id
+        AND ps.channel_id=f.channel_id AND ps.organization_id=f.organization_id
+      JOIN organizations o ON o.id=f.organization_id
+      WHERE f.enabled=TRUE
+        AND c.is_active=TRUE
+        AND o.is_active=TRUE
+        AND ps.is_active_source=TRUE
+    `);
+
+    const seen = new Set();
+    for (const source of active.rows) {
+      const sourceId = Number(source.id);
+      seen.add(sourceId);
+      const channel = { id: source.channel_id, stream_key: source.stream_key };
+      if (
+        !(await shouldUseRemoteExecutor(source, channel, {
+          reason: "runtime_watch",
+        }))
+      ) {
+        remoteRuntimeFailures.delete(sourceId);
+        continue;
+      }
+
+      let runtime;
+      try {
+        runtime = await remoteExecutor.status(source, channel);
+      } catch (error) {
+        // Agent/network reachability alone is not proof that media died. Do not
+        // fail over on control-plane request errors; log and retry next poll.
+        console.warn(
+          `[PULL-SOURCE-HA-WATCH] Runtime check failed for #${sourceId}: ${error.message}`,
+        );
+        continue;
+      }
+
+      const healthy =
+        runtime?.active === true && runtime?.process_alive === true;
+      if (healthy) {
+        remoteRuntimeFailures.delete(sourceId);
+        continue;
+      }
+
+      const failures = (remoteRuntimeFailures.get(sourceId) || 0) + 1;
+      remoteRuntimeFailures.set(sourceId, failures);
+      console.warn(
+        `[PULL-SOURCE-HA-WATCH] Active remote #${sourceId} is not running (${failures}/2).`,
+      );
+      if (failures < 2) continue;
+
+      const state = getState(sourceId) || {
+        proc: null,
+        retryTimer: null,
+        reconnectCount: Number(source.reconnect_count || 0),
+        startedAt: null,
+        bitrateKbps: 0,
+        outTimeMs: 0,
+        manualStop: false,
+        remote: true,
+        remoteJobId: runtime?.job?.id || null,
+      };
+      states.set(sourceId, state);
+      if (state.retryTimer || state.manualStop) continue;
+
+      state.remote = false;
+      state.remoteJobId = runtime?.job?.id || state.remoteJobId || null;
+      state.isRunning = false;
+      remoteRuntimeFailures.delete(sourceId);
+
+      await scheduleFailover(
+        source,
+        channel,
+        state,
+        {
+          code: "remote_worker_exited",
+          message:
+            "Assigned Media Node Pull Source worker is no longer running",
+          retryable: true,
+        },
+        source,
+      );
+    }
+
+    for (const sourceId of remoteRuntimeFailures.keys()) {
+      if (!seen.has(sourceId)) remoteRuntimeFailures.delete(sourceId);
+    }
+  }
+
   async function runFailbackMonitor() {
     if (failoverMonitorBusy) return;
     failoverMonitorBusy = true;
     try {
+      // Phase 4D.4F.2: the Media Node Agent owns the actual FFmpeg process, so
+      // central HA must observe agent runtime before running recovery/failback.
+      await watchActiveRemoteSources();
       // Recovery path for a channel that currently has NO active Pull Source.
       // This is the state reached when the active source fails and every other
       // configured source is unavailable at that moment. Previously the code
