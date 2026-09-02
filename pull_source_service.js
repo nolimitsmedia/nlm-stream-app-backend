@@ -446,9 +446,12 @@ function createPullSourceManager({ pool }) {
   const states = new Map();
   const failbackStableSince = new Map();
   const remoteRuntimeFailures = new Map();
+  const startupBlockedChannels = new Set();
   const haEvents = createHaEventService(pool);
   let failoverMonitorBusy = false;
   let remoteExecutor = null;
+  let startupReconcileInProgress = false;
+  let startupReconcileComplete = false;
 
   function setRemoteExecutor(executor) {
     remoteExecutor = executor && typeof executor === "object" ? executor : null;
@@ -1530,8 +1533,13 @@ function createPullSourceManager({ pool }) {
         continue;
       }
 
+      const canonical = runtime?.canonical_publish || {};
       const healthy =
-        runtime?.active === true && runtime?.process_alive === true;
+        runtime?.active === true &&
+        runtime?.process_alive === true &&
+        runtime?.job?.status === "running" &&
+        canonical.expected === true &&
+        canonical.publish_active === true;
       if (healthy) {
         remoteRuntimeFailures.delete(sourceId);
         continue;
@@ -1619,6 +1627,12 @@ function createPullSourceManager({ pool }) {
       for (const row of noActiveChannels.rows) {
         const channelId = Number(row.channel_id);
         const channel = { id: row.channel_id, stream_key: row.stream_key };
+
+        // Startup reconciliation can deliberately quarantine a channel when an
+        // existing remote worker cannot be safely identified/stopped. Never
+        // start a competing HA worker behind that ambiguity. A backend restart
+        // retries reconciliation after the underlying agent issue is corrected.
+        if (startupBlockedChannels.has(channelId)) continue;
 
         // Direct push ingest (OBS/SRT push) still wins. If SRS already has the
         // canonical stream while no Pull Source owns it, do not compete with it.
@@ -1867,6 +1881,7 @@ function createPullSourceManager({ pool }) {
 
   function startFailoverMonitor() {
     if (failoverMonitorTimer) return;
+    if (!startupReconcileComplete) return;
     failoverMonitorTimer = setInterval(
       runFailbackMonitor,
       FAILOVER_MONITOR_INTERVAL_MS,
@@ -1877,15 +1892,18 @@ function createPullSourceManager({ pool }) {
   async function discoverRemoteStartupWorkers() {
     const adopted = new Map();
     const blockedChannels = new Set();
+    const staleWorkers = [];
 
     if (!remoteExecutor || typeof remoteExecutor.status !== "function") {
-      return { adopted, blockedChannels };
+      return { adopted, blockedChannels, staleWorkers };
     }
 
-    // Phase 4D.4F.3a — backend restarts must not erase ownership of a healthy
-    // persistent worker that is still running on the assigned Media Node.
-    // Inspect HA sources before durable runtime flags are reset. Central still
-    // decides ownership; the agent only reports process/canonical health.
+    // Phase 4D.4F.3b — inspect every HA-managed remote source before startup is
+    // allowed to reset DB runtime state or launch recovery. A persistent agent
+    // worker falls into exactly one safe class:
+    //   1) healthy canonical worker -> adopt it;
+    //   2) live process without canonical publication -> controlled stale cleanup;
+    //   3) unverified/identity-conflicting runtime -> quarantine the channel.
     const result = await pool.query(`
       SELECT ps.*, c.stream_key, c.media_node_id
       FROM channel_pull_sources ps
@@ -1902,7 +1920,10 @@ function createPullSourceManager({ pool }) {
     `);
 
     const healthyByChannel = new Map();
+    const liveRuntimeByChannel = new Map();
+
     for (const source of result.rows) {
+      const channelId = Number(source.channel_id);
       const channel = { id: source.channel_id, stream_key: source.stream_key };
       let useRemote = false;
       try {
@@ -1910,8 +1931,9 @@ function createPullSourceManager({ pool }) {
           reason: "backend_restart_reconcile",
         });
       } catch (error) {
+        blockedChannels.add(channelId);
         console.warn(
-          `[PULL-SOURCE-STARTUP-RECONCILE] Could not resolve remote execution for #${source.id}: ${error.message}`,
+          `[PULL-SOURCE-STARTUP-RECONCILE] Could not resolve remote execution for #${source.id}; channel ${channelId} is quarantined: ${error.message}`,
         );
         continue;
       }
@@ -1923,32 +1945,66 @@ function createPullSourceManager({ pool }) {
       } catch (error) {
         // A control-plane timeout is not proof that media is dead. We cannot
         // safely adopt OR replace an unverified remote worker during startup.
-        blockedChannels.add(Number(source.channel_id));
+        blockedChannels.add(channelId);
         console.warn(
-          `[PULL-SOURCE-STARTUP-RECONCILE] Runtime check failed for #${source.id}; channel ${source.channel_id} will not auto-start a competing worker: ${error.message}`,
+          `[PULL-SOURCE-STARTUP-RECONCILE] Runtime check failed for #${source.id}; channel ${channelId} is quarantined: ${error.message}`,
         );
         continue;
       }
 
       const job = runtime?.job || {};
       const canonical = runtime?.canonical_publish || {};
+      const processPresent =
+        runtime?.found === true ||
+        runtime?.active === true ||
+        runtime?.process_alive === true ||
+        Boolean(job?.id);
+      if (!processPresent) continue;
+
       const matchesIdentity =
         Number(job.source_id) === Number(source.id) &&
-        Number(job.channel_id) === Number(source.channel_id);
+        Number(job.channel_id) === channelId;
+
+      if (!matchesIdentity) {
+        blockedChannels.add(channelId);
+        console.error(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Runtime identity mismatch while checking #${source.id} on channel ${channelId}; refusing automatic recovery.`,
+        );
+        continue;
+      }
+
+      const liveList = liveRuntimeByChannel.get(channelId) || [];
+      liveList.push({ source, runtime, channel });
+      liveRuntimeByChannel.set(channelId, liveList);
+
       const healthy =
         runtime?.active === true &&
         runtime?.process_alive === true &&
         job.status === "running" &&
-        matchesIdentity &&
         canonical.expected === true &&
         canonical.publish_active === true;
 
-      if (!healthy) continue;
+      if (healthy) {
+        const list = healthyByChannel.get(channelId) || [];
+        list.push({ source, runtime, channel });
+        healthyByChannel.set(channelId, list);
+        continue;
+      }
 
-      const channelId = Number(source.channel_id);
-      const list = healthyByChannel.get(channelId) || [];
-      list.push({ source, runtime });
-      healthyByChannel.set(channelId, list);
+      // The process exists but it is not delivering canonical media. It cannot
+      // be adopted as healthy ownership, and leaving it alive would make every
+      // subsequent agent start fail with "worker already active". Retire it in
+      // a serialized startup cleanup before normal Primary/Backup recovery.
+      staleWorkers.push({ source, runtime, channel });
+    }
+
+    for (const [channelId, workers] of liveRuntimeByChannel.entries()) {
+      if (workers.length > 1) {
+        blockedChannels.add(channelId);
+        console.error(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} has ${workers.length} existing remote workers; refusing automatic adoption/recovery until the conflict is resolved.`,
+        );
+      }
     }
 
     for (const [channelId, workers] of healthyByChannel.entries()) {
@@ -1959,145 +2015,239 @@ function createPullSourceManager({ pool }) {
         );
         continue;
       }
-      if (blockedChannels.has(channelId)) {
-        console.warn(
-          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} has a healthy remote worker but at least one sibling runtime could not be verified; refusing automatic adoption/start to avoid duplicate canonical publishers.`,
-        );
-        continue;
-      }
+      if (blockedChannels.has(channelId)) continue;
       adopted.set(channelId, workers[0]);
     }
 
-    return { adopted, blockedChannels };
+    // A channel with a healthy worker is never also treated as stale. If an
+    // impossible mixed state is reported, quarantine rather than stopping the
+    // healthy publisher.
+    for (const item of staleWorkers) {
+      const channelId = Number(item.source.channel_id);
+      if (adopted.has(channelId)) {
+        adopted.delete(channelId);
+        blockedChannels.add(channelId);
+      }
+    }
+
+    return { adopted, blockedChannels, staleWorkers };
+  }
+
+  async function stopStaleRemoteStartupWorker(item) {
+    const { source, channel } = item;
+    const channelId = Number(source.channel_id);
+
+    if (!remoteExecutor || typeof remoteExecutor.stop !== "function") {
+      throw new Error("Remote executor stop is unavailable");
+    }
+
+    console.warn(
+      `[PULL-SOURCE-STARTUP-RECONCILE] Retiring stale remote worker #${source.id} on channel ${channelId} before recovery.`,
+    );
+
+    await remoteExecutor.stop(source, channel, {
+      reason: "startup_stale_runtime_reconcile",
+    });
+
+    // Agent stop is expected to be synchronous enough to return after SIGTERM,
+    // but confirm the runtime slot is actually clear before allowing a new
+    // Primary/Backup worker to start on this channel.
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) {
+      await sleep(250);
+      let runtime;
+      try {
+        runtime = await remoteExecutor.status(source, channel);
+      } catch (error) {
+        // Losing control-plane visibility immediately after stop is ambiguous;
+        // never interpret it as proof that the process disappeared.
+        throw new Error(`Could not verify stale worker stop: ${error.message}`);
+      }
+      const stillPresent =
+        runtime?.active === true ||
+        runtime?.process_alive === true ||
+        runtime?.job?.status === "running";
+      if (!stillPresent) {
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Stale remote worker #${source.id} retired; channel ${channelId} may enter normal recovery.`,
+        );
+        return true;
+      }
+    }
+
+    throw new Error(
+      `Stale remote worker #${source.id} did not stop within the startup reconciliation window`,
+    );
   }
 
   async function reconcileDatabaseState() {
-    // Discover persistent agent workers before clearing stale DB runtime flags.
-    // The agent runtime is authoritative for process existence; central remains
-    // authoritative for whether that verified worker may be adopted as owner.
-    const { adopted, blockedChannels } = await discoverRemoteStartupWorkers();
+    if (startupReconcileInProgress) return;
+    startupReconcileInProgress = true;
+    startupReconcileComplete = false;
+    startupBlockedChannels.clear();
 
-    await pool.query(`
-      UPDATE channel_pull_sources
-      SET status='stopped',
-          is_running=FALSE,
-          is_active_source=FALSE,
-          started_at=NULL,
-          updated_at=NOW()
-      WHERE is_running=TRUE
-         OR is_active_source=TRUE
-         OR status IN ('starting','streaming','reconnecting','waiting')
-    `);
-    await pool.query(`
-      UPDATE channel_source_failover
-      SET active_source_id=NULL, updated_at=NOW()
-      WHERE active_source_id IS NOT NULL
-    `);
+    try {
+      // Discovery and stale-worker cleanup happen before any durable reset and
+      // before the HA monitor exists. This removes the restart race where normal
+      // recovery contended with a persistent agent worker while DB ownership was
+      // already NULL.
+      const discovered = await discoverRemoteStartupWorkers();
+      const adopted = discovered.adopted;
+      const blockedChannels = discovered.blockedChannels;
 
-    for (const [channelId, entry] of adopted.entries()) {
-      const source = entry.source;
-      const runtime = entry.runtime || {};
-      const job = runtime.job || {};
-      const startedAt = job.started_at ? new Date(job.started_at) : new Date();
-      const safeStartedAt = Number.isNaN(startedAt.getTime())
-        ? new Date()
-        : startedAt;
-
-      await pool.query(
-        `UPDATE channel_pull_sources
-         SET status='streaming',
-             is_running=TRUE,
-             is_active_source=TRUE,
-             started_at=$2,
-             stopped_at=NULL,
-             health_status='healthy',
-             last_health_check_at=NOW(),
-             last_error=NULL,
-             last_error_code=NULL,
-             updated_at=NOW()
-         WHERE id=$1`,
-        [Number(source.id), safeStartedAt],
-      );
-      await pool.query(
-        `UPDATE channel_source_failover
-         SET active_source_id=$2, updated_at=NOW()
-         WHERE channel_id=$1 AND organization_id=$3 AND enabled=TRUE`,
-        [channelId, Number(source.id), Number(source.organization_id)],
-      );
-
-      states.set(Number(source.id), {
-        proc: null,
-        retryTimer: null,
-        reconnectCount: Number(
-          job.reconnect_count || source.reconnect_count || 0,
-        ),
-        startedAt: safeStartedAt,
-        bitrateKbps: Number(job.bitrate_kbps || 0),
-        outTimeMs: 0,
-        manualStop: false,
-        remote: true,
-        remoteJobId: job.id || null,
-        isRunning: true,
-      });
-      remoteRuntimeFailures.delete(Number(source.id));
-
-      console.warn(
-        `[PULL-SOURCE-STARTUP-RECONCILE] Adopted existing remote worker #${source.id} as channel ${channelId} owner; no replacement FFmpeg was started.`,
-      );
-    }
-
-    const result = await pool.query(`
-      SELECT ps.*, c.stream_key, c.is_active AS channel_active
-      FROM channel_pull_sources ps
-      JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
-      JOIN organizations o ON o.id=ps.organization_id
-      WHERE ps.enabled=TRUE AND ps.auto_start=TRUE
-        AND c.is_active=TRUE AND o.is_active=TRUE
-      ORDER BY ps.channel_id,
-               CASE WHEN ps.role='primary' THEN 0 ELSE 1 END,
-               ps.priority,
-               ps.id
-    `);
-
-    // Only one Pull Source may own a channel's canonical stream. Even if older
-    // data accidentally has Auto Start enabled on multiple sources, start only
-    // the highest-priority source for each channel.
-    const chosenByChannel = new Map();
-    for (const row of result.rows) {
-      if (!chosenByChannel.has(Number(row.channel_id))) {
-        chosenByChannel.set(Number(row.channel_id), row);
-      }
-    }
-
-    let delay = 1000;
-    for (const row of chosenByChannel.values()) {
-      const channelId = Number(row.channel_id);
-      if (adopted.has(channelId)) continue;
-      if (blockedChannels.has(channelId)) {
-        console.warn(
-          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} auto-start suppressed because an existing remote worker could not be safely reconciled.`,
-        );
-        continue;
-      }
-      const channel = { id: row.channel_id, stream_key: row.stream_key };
-      setTimeout(() => {
-        activateSource(row, channel, {
-          reason: "backend_restart",
-          reconnecting: true,
-        }).catch((error) =>
+      for (const item of discovered.staleWorkers) {
+        const channelId = Number(item.source.channel_id);
+        if (blockedChannels.has(channelId) || adopted.has(channelId)) continue;
+        try {
+          await stopStaleRemoteStartupWorker(item);
+        } catch (error) {
+          blockedChannels.add(channelId);
           console.error(
-            `[PULL-SOURCE] Startup reconcile failed for #${row.id}:`,
-            error.message,
-          ),
-        );
-      }, delay).unref?.();
-      delay += 250;
-    }
+            `[PULL-SOURCE-STARTUP-RECONCILE] Could not safely retire stale worker #${item.source.id}; channel ${channelId} is quarantined: ${error.message}`,
+          );
+        }
+      }
 
-    // Startup DB reconciliation is now complete. Only now may the failover
-    // monitor probe/recover sources, so its ownership writes cannot be erased
-    // by the startup reset above.
-    startFailoverMonitor();
+      for (const channelId of blockedChannels) {
+        startupBlockedChannels.add(Number(channelId));
+      }
+
+      await pool.query(`
+        UPDATE channel_pull_sources
+        SET status='stopped',
+            is_running=FALSE,
+            is_active_source=FALSE,
+            started_at=NULL,
+            updated_at=NOW()
+        WHERE is_running=TRUE
+           OR is_active_source=TRUE
+           OR status IN ('starting','streaming','reconnecting','waiting')
+      `);
+      await pool.query(`
+        UPDATE channel_source_failover
+        SET active_source_id=NULL, updated_at=NOW()
+        WHERE active_source_id IS NOT NULL
+      `);
+
+      for (const [channelId, entry] of adopted.entries()) {
+        const source = entry.source;
+        const runtime = entry.runtime || {};
+        const job = runtime.job || {};
+        const startedAt = job.started_at
+          ? new Date(job.started_at)
+          : new Date();
+        const safeStartedAt = Number.isNaN(startedAt.getTime())
+          ? new Date()
+          : startedAt;
+
+        await pool.query(
+          `UPDATE channel_pull_sources
+           SET status='streaming',
+               is_running=TRUE,
+               is_active_source=TRUE,
+               started_at=$2,
+               stopped_at=NULL,
+               health_status='healthy',
+               last_health_check_at=NOW(),
+               last_error=NULL,
+               last_error_code=NULL,
+               updated_at=NOW()
+           WHERE id=$1`,
+          [Number(source.id), safeStartedAt],
+        );
+        await pool.query(
+          `UPDATE channel_source_failover
+           SET active_source_id=$2, updated_at=NOW()
+           WHERE channel_id=$1 AND organization_id=$3 AND enabled=TRUE`,
+          [channelId, Number(source.id), Number(source.organization_id)],
+        );
+
+        states.set(Number(source.id), {
+          proc: null,
+          retryTimer: null,
+          reconnectCount: Number(
+            job.reconnect_count || source.reconnect_count || 0,
+          ),
+          startedAt: safeStartedAt,
+          bitrateKbps: Number(job.bitrate_kbps || 0),
+          outTimeMs: 0,
+          manualStop: false,
+          remote: true,
+          remoteJobId: job.id || null,
+          isRunning: true,
+          status: "streaming",
+        });
+        remoteRuntimeFailures.delete(Number(source.id));
+
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Adopted existing remote worker #${source.id} as channel ${channelId} owner; no replacement FFmpeg was started.`,
+        );
+      }
+
+      const result = await pool.query(`
+        SELECT ps.*, c.stream_key, c.is_active AS channel_active
+        FROM channel_pull_sources ps
+        JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+        JOIN organizations o ON o.id=ps.organization_id
+        WHERE ps.enabled=TRUE AND ps.auto_start=TRUE
+          AND c.is_active=TRUE AND o.is_active=TRUE
+        ORDER BY ps.channel_id,
+                 CASE WHEN ps.role='primary' THEN 0 ELSE 1 END,
+                 ps.priority,
+                 ps.id
+      `);
+
+      // Only one Auto Start candidate is attempted per channel during startup.
+      // Unlike 4F.3a, the attempts are awaited serially. The failover monitor is
+      // not started until every attempt has finished, eliminating competition
+      // between delayed backend_restart timers and no-active-source recovery.
+      const chosenByChannel = new Map();
+      for (const row of result.rows) {
+        if (!chosenByChannel.has(Number(row.channel_id))) {
+          chosenByChannel.set(Number(row.channel_id), row);
+        }
+      }
+
+      for (const row of chosenByChannel.values()) {
+        const channelId = Number(row.channel_id);
+        if (adopted.has(channelId)) continue;
+        if (blockedChannels.has(channelId)) {
+          console.warn(
+            `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} auto-start suppressed because an existing remote runtime could not be safely reconciled.`,
+          );
+          continue;
+        }
+
+        const channel = { id: row.channel_id, stream_key: row.stream_key };
+        await sleep(250);
+        try {
+          const result = await activateSource(row, channel, {
+            reason: "backend_restart",
+            reconnecting: true,
+          });
+          if (!result?.ok) {
+            console.warn(
+              `[PULL-SOURCE-STARTUP-RECONCILE] Startup activation for #${row.id} did not establish canonical delivery: ${result?.message || "unknown error"}`,
+            );
+          }
+        } catch (error) {
+          console.error(
+            `[PULL-SOURCE-STARTUP-RECONCILE] Startup activation failed for #${row.id}: ${error.message}`,
+          );
+        }
+      }
+
+      startupReconcileComplete = true;
+      console.warn(
+        `[PULL-SOURCE-STARTUP-RECONCILE] Serialized startup reconciliation complete; blocked_channels=${startupBlockedChannels.size}.`,
+      );
+
+      // Only after discovery, stale cleanup, DB normalization/adoption and all
+      // startup activation attempts have settled may periodic HA recovery begin.
+      startFailoverMonitor();
+    } finally {
+      startupReconcileInProgress = false;
+    }
   }
 
   async function shutdown() {
