@@ -1874,7 +1874,109 @@ function createPullSourceManager({ pool }) {
     failoverMonitorTimer.unref?.();
   }
 
+  async function discoverRemoteStartupWorkers() {
+    const adopted = new Map();
+    const blockedChannels = new Set();
+
+    if (!remoteExecutor || typeof remoteExecutor.status !== "function") {
+      return { adopted, blockedChannels };
+    }
+
+    // Phase 4D.4F.3a — backend restarts must not erase ownership of a healthy
+    // persistent worker that is still running on the assigned Media Node.
+    // Inspect HA sources before durable runtime flags are reset. Central still
+    // decides ownership; the agent only reports process/canonical health.
+    const result = await pool.query(`
+      SELECT ps.*, c.stream_key, c.media_node_id
+      FROM channel_pull_sources ps
+      JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+      JOIN organizations o ON o.id=ps.organization_id
+      JOIN channel_source_failover f
+        ON f.channel_id=ps.channel_id AND f.organization_id=ps.organization_id
+      WHERE f.enabled=TRUE
+        AND ps.enabled=TRUE
+        AND c.is_active=TRUE
+        AND o.is_active=TRUE
+        AND c.media_node_id IS NOT NULL
+      ORDER BY ps.channel_id, ps.priority, ps.id
+    `);
+
+    const healthyByChannel = new Map();
+    for (const source of result.rows) {
+      const channel = { id: source.channel_id, stream_key: source.stream_key };
+      let useRemote = false;
+      try {
+        useRemote = await shouldUseRemoteExecutor(source, channel, {
+          reason: "backend_restart_reconcile",
+        });
+      } catch (error) {
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Could not resolve remote execution for #${source.id}: ${error.message}`,
+        );
+        continue;
+      }
+      if (!useRemote) continue;
+
+      let runtime;
+      try {
+        runtime = await remoteExecutor.status(source, channel);
+      } catch (error) {
+        // A control-plane timeout is not proof that media is dead. We cannot
+        // safely adopt OR replace an unverified remote worker during startup.
+        blockedChannels.add(Number(source.channel_id));
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Runtime check failed for #${source.id}; channel ${source.channel_id} will not auto-start a competing worker: ${error.message}`,
+        );
+        continue;
+      }
+
+      const job = runtime?.job || {};
+      const canonical = runtime?.canonical_publish || {};
+      const matchesIdentity =
+        Number(job.source_id) === Number(source.id) &&
+        Number(job.channel_id) === Number(source.channel_id);
+      const healthy =
+        runtime?.active === true &&
+        runtime?.process_alive === true &&
+        job.status === "running" &&
+        matchesIdentity &&
+        canonical.expected === true &&
+        canonical.publish_active === true;
+
+      if (!healthy) continue;
+
+      const channelId = Number(source.channel_id);
+      const list = healthyByChannel.get(channelId) || [];
+      list.push({ source, runtime });
+      healthyByChannel.set(channelId, list);
+    }
+
+    for (const [channelId, workers] of healthyByChannel.entries()) {
+      if (workers.length !== 1) {
+        blockedChannels.add(channelId);
+        console.error(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} has ${workers.length} healthy remote canonical workers; refusing automatic ownership adoption/start until the conflict is resolved.`,
+        );
+        continue;
+      }
+      if (blockedChannels.has(channelId)) {
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} has a healthy remote worker but at least one sibling runtime could not be verified; refusing automatic adoption/start to avoid duplicate canonical publishers.`,
+        );
+        continue;
+      }
+      adopted.set(channelId, workers[0]);
+    }
+
+    return { adopted, blockedChannels };
+  }
+
   async function reconcileDatabaseState() {
+    // Discover persistent agent workers before clearing stale DB runtime flags.
+    // The agent runtime is authoritative for process existence; central remains
+    // authoritative for whether that verified worker may be adopted as owner.
+    const { adopted, blockedChannels } = await discoverRemoteStartupWorkers();
+
     await pool.query(`
       UPDATE channel_pull_sources
       SET status='stopped',
@@ -1891,6 +1993,58 @@ function createPullSourceManager({ pool }) {
       SET active_source_id=NULL, updated_at=NOW()
       WHERE active_source_id IS NOT NULL
     `);
+
+    for (const [channelId, entry] of adopted.entries()) {
+      const source = entry.source;
+      const runtime = entry.runtime || {};
+      const job = runtime.job || {};
+      const startedAt = job.started_at ? new Date(job.started_at) : new Date();
+      const safeStartedAt = Number.isNaN(startedAt.getTime())
+        ? new Date()
+        : startedAt;
+
+      await pool.query(
+        `UPDATE channel_pull_sources
+         SET status='streaming',
+             is_running=TRUE,
+             is_active_source=TRUE,
+             started_at=$2,
+             stopped_at=NULL,
+             health_status='healthy',
+             last_health_check_at=NOW(),
+             last_error=NULL,
+             last_error_code=NULL,
+             updated_at=NOW()
+         WHERE id=$1`,
+        [Number(source.id), safeStartedAt],
+      );
+      await pool.query(
+        `UPDATE channel_source_failover
+         SET active_source_id=$2, updated_at=NOW()
+         WHERE channel_id=$1 AND organization_id=$3 AND enabled=TRUE`,
+        [channelId, Number(source.id), Number(source.organization_id)],
+      );
+
+      states.set(Number(source.id), {
+        proc: null,
+        retryTimer: null,
+        reconnectCount: Number(
+          job.reconnect_count || source.reconnect_count || 0,
+        ),
+        startedAt: safeStartedAt,
+        bitrateKbps: Number(job.bitrate_kbps || 0),
+        outTimeMs: 0,
+        manualStop: false,
+        remote: true,
+        remoteJobId: job.id || null,
+        isRunning: true,
+      });
+      remoteRuntimeFailures.delete(Number(source.id));
+
+      console.warn(
+        `[PULL-SOURCE-STARTUP-RECONCILE] Adopted existing remote worker #${source.id} as channel ${channelId} owner; no replacement FFmpeg was started.`,
+      );
+    }
 
     const result = await pool.query(`
       SELECT ps.*, c.stream_key, c.is_active AS channel_active
@@ -1917,6 +2071,14 @@ function createPullSourceManager({ pool }) {
 
     let delay = 1000;
     for (const row of chosenByChannel.values()) {
+      const channelId = Number(row.channel_id);
+      if (adopted.has(channelId)) continue;
+      if (blockedChannels.has(channelId)) {
+        console.warn(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Channel ${channelId} auto-start suppressed because an existing remote worker could not be safely reconciled.`,
+        );
+        continue;
+      }
       const channel = { id: row.channel_id, stream_key: row.stream_key };
       setTimeout(() => {
         activateSource(row, channel, {
