@@ -1954,12 +1954,54 @@ function createPullSourceManager({ pool }) {
 
       const job = runtime?.job || {};
       const canonical = runtime?.canonical_publish || {};
+      const jobStatus = String(job?.status || "")
+        .trim()
+        .toLowerCase();
+      const terminalJobStatuses = new Set([
+        "failed",
+        "stopped",
+        "succeeded",
+        "completed",
+        "cancelled",
+        "canceled",
+      ]);
+      const terminalRuntimeRecord =
+        runtime?.active !== true &&
+        runtime?.process_alive !== true &&
+        terminalJobStatuses.has(jobStatus);
+
+      // Phase 4D.4F.3c — the agent intentionally retains terminal job history.
+      // A historical failed/stopped/completed record is not an existing worker
+      // when no process is alive and the runtime is inactive. Counting those
+      // records as live workers quarantined channels forever after ordinary
+      // activation failures, even though there was nothing left to adopt/stop.
+      if (terminalRuntimeRecord) {
+        console.log(
+          `[PULL-SOURCE-STARTUP-RECONCILE] Ignoring terminal runtime record for #${source.id} on channel ${channelId} (${jobStatus}).`,
+        );
+        continue;
+      }
+
       const processPresent =
-        runtime?.found === true ||
         runtime?.active === true ||
         runtime?.process_alive === true ||
-        Boolean(job?.id);
-      if (!processPresent) continue;
+        ["queued", "starting", "running", "reconnecting", "stopping"].includes(
+          jobStatus,
+        );
+
+      // found=true/job.id by themselves only prove that the agent remembers a
+      // runtime record. If the record is non-terminal but provides no recognized
+      // live lifecycle signal, its state is ambiguous; quarantine rather than
+      // adopting, stopping, or launching a competing worker.
+      if (!processPresent) {
+        if (runtime?.found === true || Boolean(job?.id)) {
+          blockedChannels.add(channelId);
+          console.warn(
+            `[PULL-SOURCE-STARTUP-RECONCILE] Runtime #${source.id} on channel ${channelId} has an unrecognized non-live state (${jobStatus || "unknown"}); channel is quarantined.`,
+          );
+        }
+        continue;
+      }
 
       const matchesIdentity =
         Number(job.source_id) === Number(source.id) &&
