@@ -445,6 +445,8 @@ function buildWorkerArgs(sourceUrl, protocol, streamKey) {
 function createPullSourceManager({ pool }) {
   const states = new Map();
   const failbackStableSince = new Map();
+  const failbackCooldownUntil = new Map();
+  const haTransitionChannels = new Map();
   const remoteRuntimeFailures = new Map();
   const startupBlockedChannels = new Set();
   const haEvents = createHaEventService(pool);
@@ -456,6 +458,31 @@ function createPullSourceManager({ pool }) {
   function setRemoteExecutor(executor) {
     remoteExecutor = executor && typeof executor === "object" ? executor : null;
   }
+
+  // Phase 4D.4F.4: serialize HA ownership changes per channel. Failover timers run
+  // outside the periodic monitor, so without a channel transition lock the
+  // no-active recovery path can observe the short ownership gap inside
+  // activateSource() and start a competing worker.
+  function beginHaTransition(channelId, type) {
+    const id = Number(channelId);
+    if (!id || haTransitionChannels.has(id)) return false;
+    haTransitionChannels.set(id, { type, startedAt: Date.now() });
+    return true;
+  }
+
+  function endHaTransition(channelId, type = null) {
+    const id = Number(channelId);
+    const current = haTransitionChannels.get(id);
+    if (!current) return;
+    if (type && current.type !== type) return;
+    haTransitionChannels.delete(id);
+  }
+
+  function isHaTransitionActive(channelId) {
+    return haTransitionChannels.has(Number(channelId));
+  }
+
+  const FAILED_FAILBACK_COOLDOWN_MS = 5 * 60 * 1000;
 
   async function shouldUseRemoteExecutor(source, channel, options = {}) {
     if (!remoteExecutor || typeof remoteExecutor.shouldUse !== "function")
@@ -933,10 +960,17 @@ function createPullSourceManager({ pool }) {
       },
     });
 
+    if (!beginHaTransition(source.channel_id, "failover")) {
+      console.warn(
+        `[PULL-SOURCE-FAILOVER] Channel ${source.channel_id} already has an HA transition in progress; duplicate failover suppressed.`,
+      );
+      return;
+    }
+
     state.retryTimer = setTimeout(async () => {
       state.retryTimer = null;
-      if (state.manualStop) return;
       try {
+        if (state.manualStop) return;
         const stillActive = await isActiveSource(source);
         if (!stillActive) return;
 
@@ -997,6 +1031,8 @@ function createPullSourceManager({ pool }) {
             message: error.message || null,
           },
         });
+      } finally {
+        endHaTransition(source.channel_id, "failover");
       }
     }, thresholdMs);
     state.retryTimer.unref?.();
@@ -1414,6 +1450,9 @@ function createPullSourceManager({ pool }) {
       if (state.retryTimer) {
         clearTimeout(state.retryTimer);
         state.retryTimer = null;
+        // If this timer belonged to a pending automatic failover, manual/
+        // authoritative stop cancellation must also release the channel lock.
+        endHaTransition(source.channel_id, "failover");
       }
       if (
         state.remote &&
@@ -1512,6 +1551,15 @@ function createPullSourceManager({ pool }) {
       const sourceId = Number(source.id);
       seen.add(sourceId);
       const channel = { id: source.channel_id, stream_key: source.stream_key };
+
+      // A controlled failover/failback is already changing canonical ownership.
+      // Do not let the runtime watcher schedule a second transition for the same
+      // channel while that operation is still proving delivery.
+      if (isHaTransitionActive(source.channel_id)) {
+        remoteRuntimeFailures.delete(sourceId);
+        continue;
+      }
+
       if (
         !(await shouldUseRemoteExecutor(source, channel, {
           reason: "runtime_watch",
@@ -1634,6 +1682,11 @@ function createPullSourceManager({ pool }) {
         // retries reconciliation after the underlying agent issue is corrected.
         if (startupBlockedChannels.has(channelId)) continue;
 
+        // A failover/failback callback can be running outside this monitor and
+        // temporarily clear durable ownership while it starts the selected
+        // worker. Never interpret that intentional gap as no-source recovery.
+        if (isHaTransitionActive(channelId)) continue;
+
         // Direct push ingest (OBS/SRT push) still wins. If SRS already has the
         // canonical stream while no Pull Source owns it, do not compete with it.
         if (await isSrsStreamLive(row.stream_key)) continue;
@@ -1752,6 +1805,19 @@ function createPullSourceManager({ pool }) {
 
         const channelId = Number(row.channel_id);
         const channel = { id: row.channel_id, stream_key: row.stream_key };
+
+        if (isHaTransitionActive(channelId)) {
+          failbackStableSince.delete(channelId);
+          continue;
+        }
+
+        const cooldownUntil = Number(failbackCooldownUntil.get(channelId) || 0);
+        if (cooldownUntil > Date.now()) {
+          failbackStableSince.delete(channelId);
+          continue;
+        }
+        if (cooldownUntil) failbackCooldownUntil.delete(channelId);
+
         const protocol = normalizeProtocol(primary.protocol);
         const useRemote = await shouldUseRemoteExecutor(primary, channel, {
           reason: "automatic_failback",
@@ -1778,9 +1844,9 @@ function createPullSourceManager({ pool }) {
           // delay, then let the real agent worker + canonical verification be
           // authoritative. If activation fails, the previous Backup is restored
           // immediately below.
-          console.warn(
-            `[PULL-SOURCE-FAILBACK] Remote SRT Primary #${primary.id} is eligible for a controlled failback attempt without destructive preflight.`,
-          );
+          // No probe is run here. The stability timer below is only a delay
+          // before a controlled attempt; it is not evidence that Primary media
+          // is healthy or reachable.
         }
 
         if (!probe.ok) {
@@ -1788,79 +1854,118 @@ function createPullSourceManager({ pool }) {
           continue;
         }
 
-        const firstHealthyAt = failbackStableSince.get(channelId) || Date.now();
+        const existingStableSince = failbackStableSince.get(channelId);
+        const firstHealthyAt = existingStableSince || Date.now();
         failbackStableSince.set(channelId, firstHealthyAt);
+        if (!existingStableSince && remoteSrt) {
+          console.warn(
+            `[PULL-SOURCE-FAILBACK] Remote SRT Primary #${primary.id} entered the controlled failback delay; no destructive preflight will be used.`,
+          );
+        }
         const stableForMs = Date.now() - firstHealthyAt;
         const requiredMs =
           Math.max(3, Number(row.failback_stability_seconds || 15)) * 1000;
         if (stableForMs < requiredMs) continue;
 
         console.warn(
-          `[PULL-SOURCE-FAILBACK] Primary #${primary.id} has been healthy for ${Math.round(stableForMs / 1000)}s; switching channel ${channelId} back.`,
+          remoteSrt
+            ? `[PULL-SOURCE-FAILBACK] Controlled delay for remote SRT Primary #${primary.id} reached ${Math.round(stableForMs / 1000)}s; attempting channel ${channelId} failback.`
+            : `[PULL-SOURCE-FAILBACK] Primary #${primary.id} has been healthy for ${Math.round(stableForMs / 1000)}s; switching channel ${channelId} back.`,
         );
 
-        await haEvents.recordEvent({
-          organizationId: row.organization_id,
-          channelId,
-          eventType: "failback_started",
-          sourceId: primary.id,
-          previousSourceId: row.active_source_id || null,
-          newSourceId: primary.id,
-          reason: "automatic_failback",
-          status: "started",
-          metadata: {
-            primaryName: primary.name || null,
-            stableForMs,
-            requiredMs,
-          },
-        });
+        if (!beginHaTransition(channelId, "failback")) {
+          failbackStableSince.delete(channelId);
+          continue;
+        }
 
-        const failbackResult = await activateSource(primary, channel, {
-          reason: "automatic_failback",
-          reconnecting: true,
-        });
+        try {
+          await haEvents.recordEvent({
+            organizationId: row.organization_id,
+            channelId,
+            eventType: "failback_started",
+            sourceId: primary.id,
+            previousSourceId: row.active_source_id || null,
+            newSourceId: primary.id,
+            reason: "automatic_failback",
+            status: "started",
+            metadata: {
+              primaryName: primary.name || null,
+              stableForMs,
+              requiredMs,
+            },
+          });
 
-        if (!failbackResult?.ok && remoteSrt && row.active_source_id) {
-          // The controlled SRT attempt necessarily retires the old canonical
-          // publisher before the Primary can prove delivery. Roll back to the
-          // previously active Backup immediately if the Primary cannot publish.
-          const backupResult = await pool.query(
-            `SELECT * FROM channel_pull_sources
+          let failbackResult;
+          try {
+            failbackResult = await activateSource(primary, channel, {
+              reason: "automatic_failback",
+              reconnecting: true,
+            });
+          } catch (error) {
+            failbackResult = {
+              ok: false,
+              code: error.code || "automatic_failback_failed",
+              message: error.message || "Automatic failback failed",
+            };
+            console.error(
+              `[PULL-SOURCE-FAILBACK] Controlled failback to Primary #${primary.id} failed: ${failbackResult.message}`,
+            );
+          }
+
+          if (failbackResult?.ok) {
+            failbackCooldownUntil.delete(channelId);
+          } else {
+            const cooldownUntil = Date.now() + FAILED_FAILBACK_COOLDOWN_MS;
+            failbackCooldownUntil.set(channelId, cooldownUntil);
+            console.warn(
+              `[PULL-SOURCE-FAILBACK] Failback to Primary #${primary.id} did not establish delivery; suppressing another failback attempt for ${Math.round(FAILED_FAILBACK_COOLDOWN_MS / 60000)} minutes.`,
+            );
+          }
+
+          if (!failbackResult?.ok && remoteSrt && row.active_source_id) {
+            // The controlled SRT attempt necessarily retires the old canonical
+            // publisher before the Primary can prove delivery. Roll back to the
+            // previously active Backup immediately if the Primary cannot publish.
+            const backupResult = await pool.query(
+              `SELECT * FROM channel_pull_sources
              WHERE id=$1 AND channel_id=$2 AND organization_id=$3
                AND enabled=TRUE
              LIMIT 1`,
-            [row.active_source_id, row.channel_id, row.organization_id],
-          );
-          const previousBackup = backupResult.rows[0];
-          if (previousBackup) {
-            console.warn(
-              `[PULL-SOURCE-FAILBACK] Primary #${primary.id} did not establish canonical delivery; restoring Backup #${previousBackup.id}.`,
+              [row.active_source_id, row.channel_id, row.organization_id],
             );
-            const rollback = await activateSource(previousBackup, channel, {
-              reason: "automatic_failback_rollback",
-              reconnecting: true,
-            });
-            await haEvents.recordEvent({
-              organizationId: row.organization_id,
-              channelId,
-              eventType: rollback?.ok
-                ? "failback_rolled_back"
-                : "switch_failed",
-              sourceId: primary.id,
-              previousSourceId: primary.id,
-              newSourceId: rollback?.ok ? previousBackup.id : null,
-              reason: "automatic_failback_rollback",
-              status: rollback?.ok ? "completed" : "failed",
-              metadata: {
-                primaryName: primary.name || null,
-                backupName: previousBackup.name || null,
-                failbackMessage: failbackResult?.message || null,
-                rollbackMessage: rollback?.message || null,
-              },
-            });
+            const previousBackup = backupResult.rows[0];
+            if (previousBackup) {
+              console.warn(
+                `[PULL-SOURCE-FAILBACK] Primary #${primary.id} did not establish canonical delivery; restoring Backup #${previousBackup.id}.`,
+              );
+              const rollback = await activateSource(previousBackup, channel, {
+                reason: "automatic_failback_rollback",
+                reconnecting: true,
+              });
+              await haEvents.recordEvent({
+                organizationId: row.organization_id,
+                channelId,
+                eventType: rollback?.ok
+                  ? "failback_rolled_back"
+                  : "switch_failed",
+                sourceId: primary.id,
+                previousSourceId: primary.id,
+                newSourceId: rollback?.ok ? previousBackup.id : null,
+                reason: "automatic_failback_rollback",
+                status: rollback?.ok ? "completed" : "failed",
+                metadata: {
+                  primaryName: primary.name || null,
+                  backupName: previousBackup.name || null,
+                  failbackMessage: failbackResult?.message || null,
+                  rollbackMessage: rollback?.message || null,
+                },
+              });
+            }
           }
+          failbackStableSince.delete(channelId);
+        } finally {
+          endHaTransition(channelId, "failback");
         }
-        failbackStableSince.delete(channelId);
       }
     } catch (error) {
       console.error("[PULL-SOURCE-FAILOVER] Monitor failed:", error.message);
