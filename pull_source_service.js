@@ -798,31 +798,113 @@ function createPullSourceManager({ pool }) {
       }
     }
 
-    // Direct push ingest (OBS/SRT push) still wins over Pull Sources. The only
-    // canonical publisher we are allowed to replace is another managed Pull Source.
-    if (await isSrsStreamLive(channel.stream_key)) {
-      return {
-        ok: false,
-        code: "channel_already_live",
-        message:
-          "This channel already has a live publisher that is not the selected Pull Source.",
+    // Phase 4D.4F.4a: a failed HA transition can leave an already-running
+    // Agent-owned Pull Source publishing canonical media while durable ownership
+    // is temporarily NULL. Before treating an existing canonical publisher as
+    // direct push/foreign media, prove whether it is THIS selected remote source.
+    let result = null;
+    const canonicalAlreadyLive = await isSrsStreamLive(channel.stream_key);
+
+    if (canonicalAlreadyLive) {
+      let adoptedRemoteRuntime = null;
+
+      try {
+        const useRemote = await shouldUseRemoteExecutor(freshSource, channel, {
+          reason: options.reason || "source_activation_reconcile",
+          reconnecting: Boolean(options.reconnecting),
+        });
+
+        if (
+          useRemote &&
+          remoteExecutor &&
+          typeof remoteExecutor.status === "function"
+        ) {
+          const runtime = await remoteExecutor.status(freshSource, channel);
+          const canonical = runtime?.canonical_publish || {};
+          const job = runtime?.job || {};
+
+          const healthySelectedRemote =
+            runtime?.active === true &&
+            runtime?.process_alive === true &&
+            String(job.status || "").toLowerCase() === "running" &&
+            Number(job.source_id) === Number(freshSource.id) &&
+            Number(job.channel_id) === Number(freshSource.channel_id) &&
+            canonical.expected === true &&
+            canonical.publish_active === true;
+
+          if (healthySelectedRemote) adoptedRemoteRuntime = runtime;
+        }
+      } catch (error) {
+        console.warn(
+          `[PULL-SOURCE-HA-RECONCILE] Could not verify existing canonical publisher for #${freshSource.id}: ${error.message}`,
+        );
+      }
+
+      if (!adoptedRemoteRuntime) {
+        return {
+          ok: false,
+          code: "channel_already_live",
+          message:
+            "This channel already has a live publisher that is not the selected Pull Source.",
+        };
+      }
+
+      const runtimeJob = adoptedRemoteRuntime.job || {};
+      const existingState = getState(freshSource.id) || {
+        proc: null,
+        retryTimer: null,
+        reconnectCount: Number(freshSource.reconnect_count || 0),
+        startedAt: null,
+        bitrateKbps: 0,
+        outTimeMs: 0,
+        manualStop: false,
       };
-    }
 
-    // Start and verify media delivery BEFORE committing DB ownership.  The old
-    // ordering marked a source active before FFmpeg/SRS delivery was proven;
-    // recovery/health probes could then race with that provisional state and
-    // leave a successfully streaming backup with stale inactive/unhealthy DB
-    // flags.  Ownership now becomes authoritative only after startSource()
-    // confirms the canonical SRS stream is live.
-    const result = await startSource(freshSource, channel, {
-      reconnecting: Boolean(options.reconnecting),
-      activated: true,
-    });
+      existingState.proc = null;
+      existingState.retryTimer = null;
+      existingState.manualStop = false;
+      existingState.remote = true;
+      existingState.remoteJobId = runtimeJob.id || null;
+      existingState.status = "streaming";
+      existingState.isRunning = true;
+      existingState.startedAt =
+        Date.parse(runtimeJob.started_at || "") ||
+        existingState.startedAt ||
+        Date.now();
+      existingState.bitrateKbps = Math.max(
+        0,
+        Number(runtimeJob.bitrate_kbps || existingState.bitrateKbps || 0),
+      );
+      existingState.lastError = null;
+      existingState.lastErrorCode = null;
 
-    if (!result.ok) {
-      await clearActiveSource(freshSource, "source_start_failed");
-      return result;
+      states.set(Number(freshSource.id), existingState);
+
+      console.warn(
+        `[PULL-SOURCE-HA-RECONCILE] Adopting healthy existing Agent worker for #${freshSource.id} on channel ${freshSource.channel_id}; restoring durable ownership without restarting media.`,
+      );
+
+      result = {
+        ok: true,
+        message:
+          "Existing healthy Media Node Pull Source worker adopted and ownership reconciled",
+        execution: "media_node_agent",
+        remote_job_id: runtimeJob.id || null,
+        reconciled: true,
+        runtime: publicRuntimeState(freshSource.id),
+      };
+    } else {
+      // Start and verify media delivery BEFORE committing DB ownership.
+      result = await startSource(freshSource, channel, {
+        reconnecting: Boolean(options.reconnecting),
+        activated: true,
+        reason: options.reason || null,
+      });
+
+      if (!result.ok) {
+        await clearActiveSource(freshSource, "source_start_failed");
+        return result;
+      }
     }
 
     // Media delivery is confirmed. Commit active ownership and normalize the
