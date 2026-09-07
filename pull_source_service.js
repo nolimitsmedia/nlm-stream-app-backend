@@ -446,6 +446,14 @@ function createPullSourceManager({ pool }) {
   const states = new Map();
   const failbackStableSince = new Map();
   const failbackCooldownUntil = new Map();
+
+  // Phase 4D.4F.5:
+  // A failed remote-SRT failback must not be retried forever merely because a
+  // timer expired. Listener-style SRT publishers can be consumed by a real
+  // connection attempt, so failed remote-SRT Primaries remain suppressed until
+  // explicitly re-armed by a future readiness/operator signal.
+  const remoteSrtFailbackSuppressed = new Map();
+
   const haTransitionChannels = new Map();
   const remoteRuntimeFailures = new Map();
   const startupBlockedChannels = new Set();
@@ -827,6 +835,8 @@ function createPullSourceManager({ pool }) {
             runtime?.active === true &&
             runtime?.process_alive === true &&
             String(job.status || "").toLowerCase() === "running" &&
+            String(job.type || "").toLowerCase() === "pull_source_start" &&
+            job.persistent === true &&
             Number(job.source_id) === Number(freshSource.id) &&
             Number(job.channel_id) === Number(freshSource.channel_id) &&
             canonical.expected === true &&
@@ -957,6 +967,12 @@ function createPullSourceManager({ pool }) {
 
     if (String(freshSource.role || "backup") === "backup") {
       failbackStableSince.delete(Number(freshSource.channel_id));
+    } else if (
+      String(freshSource.role || "").toLowerCase() === "primary" &&
+      normalizeProtocol(freshSource.protocol) === "srt"
+    ) {
+      remoteSrtFailbackSuppressed.delete(Number(freshSource.channel_id));
+      failbackCooldownUntil.delete(Number(freshSource.channel_id));
     }
     return result;
   }
@@ -1907,6 +1923,26 @@ function createPullSourceManager({ pool }) {
         });
         const remoteSrt = useRemote && protocol === "srt";
 
+        if (remoteSrt) {
+          const suppressedPrimaryId = Number(
+            remoteSrtFailbackSuppressed.get(channelId) || 0,
+          );
+
+          if (suppressedPrimaryId === Number(primary.id)) {
+            failbackStableSince.delete(channelId);
+            continue;
+          }
+
+          // If the configured Primary changed, stale suppression must never
+          // suppress the replacement source.
+          if (
+            suppressedPrimaryId &&
+            suppressedPrimaryId !== Number(primary.id)
+          ) {
+            remoteSrtFailbackSuppressed.delete(channelId);
+          }
+        }
+
         let probe = { ok: true, message: "remote_srt_controlled_failback" };
         if (!remoteSrt) {
           try {
@@ -1996,6 +2032,13 @@ function createPullSourceManager({ pool }) {
 
           if (failbackResult?.ok) {
             failbackCooldownUntil.delete(channelId);
+            remoteSrtFailbackSuppressed.delete(channelId);
+          } else if (remoteSrt) {
+            failbackCooldownUntil.delete(channelId);
+            remoteSrtFailbackSuppressed.set(channelId, Number(primary.id));
+            console.warn(
+              `[PULL-SOURCE-FAILBACK] Failback to remote SRT Primary #${primary.id} did not establish delivery; automatic failback is now suppressed until the source is explicitly re-armed.`,
+            );
           } else {
             const cooldownUntil = Date.now() + FAILED_FAILBACK_COOLDOWN_MS;
             failbackCooldownUntil.set(channelId, cooldownUntil);
