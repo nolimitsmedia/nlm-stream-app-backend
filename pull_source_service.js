@@ -467,6 +467,80 @@ function createPullSourceManager({ pool }) {
     remoteExecutor = executor && typeof executor === "object" ? executor : null;
   }
 
+  // Phase 4D.4F.5b:
+  // Explicitly re-arm a previously suppressed remote-SRT Primary without
+  // switching media immediately. The existing HA monitor remains the sole
+  // authority for the subsequent controlled failback transition.
+  function rearmRemoteSrtPrimary(source) {
+    const channelId = Number(source?.channel_id);
+    const sourceId = Number(source?.id);
+    const role = String(source?.role || "").toLowerCase();
+    const protocol = normalizeProtocol(source?.protocol);
+
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      return {
+        ok: false,
+        code: "invalid_channel",
+        message: "Pull Source channel is invalid",
+      };
+    }
+
+    if (!Number.isInteger(sourceId) || sourceId <= 0) {
+      return {
+        ok: false,
+        code: "invalid_source",
+        message: "Pull Source is invalid",
+      };
+    }
+
+    if (role !== "primary") {
+      return {
+        ok: false,
+        code: "not_primary",
+        message: "Only a Primary Pull Source can be re-armed for failback",
+      };
+    }
+
+    if (protocol !== "srt") {
+      return {
+        ok: false,
+        code: "not_srt",
+        message:
+          "Explicit failback re-arm is currently required only for SRT Primaries",
+      };
+    }
+
+    const suppressedPrimaryId = Number(
+      remoteSrtFailbackSuppressed.get(channelId) || 0,
+    );
+
+    if (suppressedPrimaryId && suppressedPrimaryId !== sourceId) {
+      return {
+        ok: false,
+        code: "different_primary_suppressed",
+        message: `Channel ${channelId} is suppressing a different Primary Pull Source`,
+      };
+    }
+
+    remoteSrtFailbackSuppressed.delete(channelId);
+    failbackStableSince.delete(channelId);
+    failbackCooldownUntil.delete(channelId);
+
+    console.warn(
+      `[PULL-SOURCE-FAILBACK] Remote SRT Primary #${sourceId} explicitly re-armed for channel ${channelId}; the normal controlled failback delay will restart before any media switch.`,
+    );
+
+    return {
+      ok: true,
+      rearmed: true,
+      source_id: sourceId,
+      channel_id: channelId,
+      was_suppressed: suppressedPrimaryId === sourceId,
+      message:
+        "Remote SRT Primary re-armed; controlled failback will be evaluated by the HA monitor",
+    };
+  }
+
   // Phase 4D.4F.4: serialize HA ownership changes per channel. Failover timers run
   // outside the periodic monitor, so without a channel transition lock the
   // no-active recovery path can observe the short ownership gap inside
@@ -2544,6 +2618,7 @@ function createPullSourceManager({ pool }) {
     activateSource,
     stopSource,
     finalizeRemoteStop,
+    rearmRemoteSrtPrimary,
     recordHealth,
     getRuntimeState: publicRuntimeState,
     isSrsStreamLive,
