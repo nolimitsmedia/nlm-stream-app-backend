@@ -13905,9 +13905,11 @@ pullSourceManager.setRemoteExecutor({
     const nodeId = Number(result.rows[0]?.media_node_id);
     if (!Number.isInteger(nodeId) || nodeId <= 0)
       throw new Error("Channel has no assigned Media Node");
+
     const { node, connection } =
       await getMediaNodeAgentConnectionForControl(nodeId);
-    const response = await requestMediaNodeAgent({
+
+    const stopResponse = await requestMediaNodeAgent({
       baseUrl: connection.baseUrl,
       token: connection.token,
       path: `/v1/pull-sources/${sourceId}/stop`,
@@ -13916,7 +13918,46 @@ pullSourceManager.setRemoteExecutor({
       timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
       expectedNodeId: node.id,
     });
-    return response.data;
+
+    // Phase 4D.4F.5a — Agent stop is asynchronous. Do not let the HA manager
+    // clear durable source ownership until the assigned Media Node proves the
+    // persistent Pull Source worker is actually gone.
+    const stopWaitDeadline = Date.now() + 7000;
+    let runtime = null;
+
+    while (Date.now() < stopWaitDeadline) {
+      const runtimeResponse = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/pull-sources/${sourceId}/status`,
+        method: "GET",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+
+      runtime = runtimeResponse.data?.runtime || {};
+
+      const stopped =
+        runtime.active !== true &&
+        runtime.process_alive !== true;
+
+      if (stopped) {
+        return {
+          ...stopResponse.data,
+          verified_stopped: true,
+          runtime,
+        };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    const error = new Error(
+      `Media Node Agent did not confirm Pull Source #${sourceId} stopped within 7 seconds`,
+    );
+    error.code = "REMOTE_PULL_SOURCE_STOP_TIMEOUT";
+    error.runtime = runtime;
+    throw error;
   },
 });
 

@@ -1110,6 +1110,76 @@ module.exports = function registerPullSourceRoutes(app, pool, deps) {
     },
   );
 
+  // Phase 4D.4F.5b:
+  // Explicitly re-arm a suppressed remote-SRT Primary. This endpoint does not
+  // stop the active Backup or start the Primary directly. It only clears the
+  // failback suppression/timers so the normal HA monitor performs the existing
+  // controlled failback sequence.
+  app.post(
+    "/api/channels/:channelId/pull-source/:id/rearm",
+    ...manageMw,
+    async (req, res) => {
+      try {
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+
+        if (!channel) {
+          return res.status(404).json({
+            ok: false,
+            message: "Channel not found",
+          });
+        }
+
+        const source = await loadSource(
+          req.params.id,
+          channel.id,
+          req.organization.id,
+        );
+
+        if (!source) {
+          return res.status(404).json({
+            ok: false,
+            message: "Pull Source not found",
+          });
+        }
+
+        if (!source.enabled) {
+          return res.status(409).json({
+            ok: false,
+            code: "source_disabled",
+            message:
+              "Pull Source must be enabled before it can be re-armed",
+          });
+        }
+
+        const failover = await loadFailover(channel);
+
+        if (!failover.enabled || !failover.failback_enabled) {
+          return res.status(409).json({
+            ok: false,
+            code: "failback_disabled",
+            message:
+              "Automatic failover and failback must be enabled before re-arming the Primary",
+          });
+        }
+
+        const result = manager.rearmRemoteSrtPrimary(source);
+
+        return res.status(result.ok ? 200 : 409).json(result);
+      } catch (error) {
+        console.error("Re-arm Pull Source Error:", error);
+
+        return res.status(500).json({
+          ok: false,
+          message: error.message || "Failed to re-arm Pull Source",
+          code: error.code || null,
+        });
+      }
+    },
+  );
+
   // Intentional Stop never triggers automatic failover. Automatic failover is
   // reserved for transport/source failures detected by the manager.
   app.post(
