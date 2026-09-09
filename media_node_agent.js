@@ -15,7 +15,7 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "4D.4F.1";
+const AGENT_VERSION = "5A.2a";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -35,6 +35,31 @@ const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
   "http_flv",
 ]);
 const PULL_SOURCE_START_PROTOCOLS = PULL_SOURCE_PROBE_PROTOCOLS;
+const STREAM_TARGET_START_PROTOCOLS = new Set(["rtmp", "rtmps", "srt"]);
+const STREAM_TARGET_MIN_VERIFIED_BYTES = Math.max(
+  1,
+  Number(process.env.STREAM_TARGET_MIN_VERIFIED_BYTES || 1024),
+);
+const STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS = Math.max(
+  0,
+  Number(process.env.STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS || 500),
+);
+const STREAM_TARGET_AUDIO_MODE =
+  String(process.env.STREAM_TARGET_AUDIO_MODE || "transcode").toLowerCase() ===
+  "copy"
+    ? "copy"
+    : "transcode";
+const STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE = Math.max(
+  8000,
+  Number(process.env.STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE || 44100),
+);
+const STREAM_TARGET_SRT_AUDIO_CHANNELS = Math.max(
+  1,
+  Math.min(2, Number(process.env.STREAM_TARGET_SRT_AUDIO_CHANNELS || 2)),
+);
+const STREAM_TARGET_INTERNAL_RTMP_BASE = String(
+  process.env.STREAM_TARGET_INTERNAL_RTMP_BASE || "rtmp://127.0.0.1:1935/live",
+).replace(/\/+$/, "");
 const DEFAULT_PULL_SOURCE_RECONNECT_BASE_MS = 3000;
 const DEFAULT_PULL_SOURCE_RECONNECT_MAX_MS = 30000;
 const DEFAULT_PULL_SOURCE_RECONNECT_JITTER = 0.15;
@@ -269,6 +294,12 @@ function sanitizeJobError(job, value) {
       /(?:rtmps?|rtsp|srt|https?):\/\/[^\s]+/gi,
       "[source-url-redacted]",
     );
+  } else if (job?.type === "stream_target_start") {
+    for (const sensitive of job.sensitive_values || []) {
+      if (sensitive)
+        text = text.split(String(sensitive)).join("[target-url-redacted]");
+    }
+    text = text.replace(/(?:rtmps?|srt):\/\/[^\s]+/gi, "[target-url-redacted]");
   }
   return text;
 }
@@ -282,6 +313,7 @@ function publicJob(job) {
     type: job.type,
     channel_id: job.channel_id ?? null,
     source_id: job.source_id ?? null,
+    target_id: job.target_id ?? null,
     protocol: job.protocol ?? null,
     persistent: job.persistent === true,
     reconnect_enabled: job.reconnect_policy?.enabled === true,
@@ -290,6 +322,12 @@ function publicJob(job) {
     last_process_exit_at: job.last_process_exit_at || null,
     status: job.status,
     bitrate_kbps: Math.max(0, Math.round(Number(job.bitrate_kbps || 0))),
+    output_bytes: Math.max(0, Number(job.output_bytes || 0)),
+    output_time_ms: Math.max(0, Number(job.output_time_ms || 0)),
+    output_frames: Math.max(0, Number(job.output_frames || 0)),
+    dropped_frames: Math.max(0, Number(job.dropped_frames || 0)),
+    delivery_verified: job.delivery_verified === true,
+    delivery_verified_at: job.delivery_verified_at || null,
     uptime_seconds:
       startedMs &&
       ["starting", "running", "reconnecting", "stopping"].includes(job.status)
@@ -577,6 +615,358 @@ function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
     "flv",
     `${INTERNAL_RTMP_BASE}/${streamKey}`,
   ];
+}
+
+function normalizeStreamTargetProtocol(value) {
+  const protocol = String(value || "")
+    .trim()
+    .toLowerCase();
+  return STREAM_TARGET_START_PROTOCOLS.has(protocol) ? protocol : null;
+}
+
+function normalizeStreamTargetSourceMode(value, protocol) {
+  // RTMP/RTMPS outputs deliberately consume canonical RTMP so a Pull Source
+  // handoff reconnects with a fresh FFmpeg timeline. SRT may use either source.
+  if (protocol === "rtmp" || protocol === "rtmps") return "rtmp";
+  return String(value || "rtmp")
+    .trim()
+    .toLowerCase() === "hls"
+    ? "hls"
+    : "rtmp";
+}
+
+function validateStreamTargetDestination(destinationUrl, protocol) {
+  const normalized = normalizeStreamTargetProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported Stream Target protocol");
+
+  const raw = String(destinationUrl || "").trim();
+  if (!raw || raw.length > 4096 || /[\r\n\0]/.test(raw)) {
+    throw new Error("Invalid Stream Target destination URL");
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Invalid Stream Target destination URL");
+  }
+
+  if (parsed.protocol.toLowerCase() !== `${normalized}:`) {
+    throw new Error("Stream Target protocol does not match destination URL");
+  }
+  if (!parsed.hostname)
+    throw new Error("Stream Target destination host is missing");
+  if (normalized === "srt" && !parsed.port) {
+    throw new Error("SRT Stream Target destinations require an explicit port");
+  }
+  return parsed.toString();
+}
+
+function getStreamTargetAudioArgs(protocol) {
+  if (STREAM_TARGET_AUDIO_MODE === "copy") return ["-c:a", "copy"];
+  const args = ["-c:a", "aac", "-b:a", "128k"];
+  if (protocol === "srt") {
+    args.push(
+      "-ar",
+      String(STREAM_TARGET_SRT_AUDIO_SAMPLE_RATE),
+      "-ac",
+      String(STREAM_TARGET_SRT_AUDIO_CHANNELS),
+    );
+  }
+  args.push("-af", "aresample=async=1:first_pts=0");
+  return args;
+}
+
+function buildPersistentStreamTargetArgs(
+  streamKey,
+  protocol,
+  destinationUrl,
+  sourceMode = "rtmp",
+) {
+  const normalized = normalizeStreamTargetProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported Stream Target protocol");
+  if (!isValidStreamKey(streamKey)) throw new Error("Invalid stream key");
+  const cleanDestination = validateStreamTargetDestination(
+    destinationUrl,
+    normalized,
+  );
+  const normalizedSourceMode = normalizeStreamTargetSourceMode(
+    sourceMode,
+    normalized,
+  );
+  const sourceUrl =
+    normalizedSourceMode === "hls"
+      ? `${srsHlsBaseUrl}/live/${encodeURIComponent(streamKey)}.m3u8`
+      : `${STREAM_TARGET_INTERNAL_RTMP_BASE}/${encodeURIComponent(streamKey)}`;
+
+  const sourceIsHls = normalizedSourceMode === "hls";
+  const input = [
+    "-analyzeduration",
+    "3000000",
+    "-probesize",
+    "1000000",
+    "-fflags",
+    sourceIsHls ? "+genpts+discardcorrupt+igndts" : "+genpts+discardcorrupt",
+    "-avoid_negative_ts",
+    "make_zero",
+    ...(sourceIsHls ? ["-dts_delta_threshold", "1"] : []),
+  ];
+  const audioArgs = getStreamTargetAudioArgs(normalized);
+  const output =
+    normalized === "srt"
+      ? [
+          "-c:v",
+          "copy",
+          ...audioArgs,
+          "-err_detect",
+          "ignore_err",
+          "-pes_payload_size",
+          "0",
+          "-flush_packets",
+          "1",
+          "-f",
+          "mpegts",
+          cleanDestination,
+        ]
+      : [
+          "-c:v",
+          "copy",
+          ...audioArgs,
+          "-err_detect",
+          "ignore_err",
+          "-f",
+          "flv",
+          cleanDestination,
+        ];
+
+  return [
+    ...input,
+    "-i",
+    sourceUrl,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-nostats",
+    "-progress",
+    "pipe:1",
+    ...output,
+  ];
+}
+
+function findActiveStreamTargetJob(targetId, channelId) {
+  for (const job of jobs.values()) {
+    if (
+      job.type === "stream_target_start" &&
+      (job.target_id === targetId ||
+        (job.channel_id === channelId && job.target_id === targetId)) &&
+      ["starting", "running", "stopping"].includes(job.status)
+    ) {
+      return job;
+    }
+  }
+  return null;
+}
+
+function updateStreamTargetProgress(job, line) {
+  const index = String(line || "").indexOf("=");
+  if (index <= 0) return;
+  const key = line.slice(0, index);
+  const value = line.slice(index + 1);
+
+  if (key === "bitrate") {
+    const match = value.match(/([0-9.]+)kbits\/s/i);
+    if (match) job.bitrate_kbps = Number(match[1]);
+  } else if (key === "total_size") {
+    const size = Number(value);
+    if (Number.isFinite(size)) job.output_bytes = Math.max(0, size);
+  } else if (key === "out_time_ms") {
+    // FFmpeg's progress protocol calls this out_time_ms although builds
+    // commonly report microseconds. Match the control-plane parser.
+    const raw = Number(value);
+    if (Number.isFinite(raw)) {
+      job.output_time_ms = Math.max(
+        0,
+        raw >= 100000 ? Math.floor(raw / 1000) : raw,
+      );
+    }
+  } else if (key === "out_time_us") {
+    const micros = Number(value);
+    if (Number.isFinite(micros)) {
+      job.output_time_ms = Math.max(0, Math.floor(micros / 1000));
+    }
+  } else if (key === "frame") {
+    const frames = Number(value);
+    if (Number.isFinite(frames)) job.output_frames = Math.max(0, frames);
+  } else if (key === "drop_frames") {
+    const dropped = Number(value);
+    if (Number.isFinite(dropped)) job.dropped_frames = Math.max(0, dropped);
+  }
+
+  if (
+    job.delivery_verified !== true &&
+    Number(job.output_bytes || 0) >= STREAM_TARGET_MIN_VERIFIED_BYTES &&
+    Number(job.output_time_ms || 0) >= STREAM_TARGET_MIN_VERIFIED_OUT_TIME_MS &&
+    (Number(job.output_frames || 0) > 0 || Number(job.bitrate_kbps || 0) > 0)
+  ) {
+    job.delivery_verified = true;
+    job.delivery_verified_at = new Date().toISOString();
+  }
+}
+
+function finishPersistentStreamTarget(
+  job,
+  child,
+  code,
+  signal,
+  stderr,
+  spawnError,
+) {
+  if (job.child !== child) return;
+  job.exit_code = code;
+  job.signal = signal || null;
+  job.last_process_exit_at = new Date().toISOString();
+  job.child = null;
+  job.bitrate_kbps = 0;
+  if (job.stop_timer) {
+    clearTimeout(job.stop_timer);
+    job.stop_timer = null;
+  }
+
+  if (job.status === "stopping") {
+    job.status = "stopped";
+    job.error = null;
+  } else {
+    job.status = "failed";
+    job.error =
+      spawnError?.message ||
+      stderr ||
+      `Persistent Stream Target worker exited code=${code} signal=${signal || "none"}`;
+  }
+  job.finished_at = new Date().toISOString();
+}
+
+function attachPersistentStreamTargetProcess(job, child) {
+  job.child = child;
+  job.persistent = true;
+  job.status = "running";
+  job.bitrate_kbps = 0;
+  job.output_bytes = 0;
+  job.output_time_ms = 0;
+  job.output_frames = 0;
+  job.dropped_frames = 0;
+  job.delivery_verified = false;
+  job.delivery_verified_at = null;
+  job.error = null;
+  job.finished_at = null;
+  let stderr = "";
+  let progressBuffer = "";
+  let finished = false;
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    progressBuffer += chunk;
+    const lines = progressBuffer.split(/\r?\n/);
+    progressBuffer = lines.pop() || "";
+    for (const line of lines) updateStreamTargetProgress(job, line);
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-12000);
+  });
+
+  const finish = (code, signal, spawnError = null) => {
+    if (finished) return;
+    finished = true;
+    finishPersistentStreamTarget(job, child, code, signal, stderr, spawnError);
+  };
+  child.on("error", (error) => finish(null, null, error));
+  child.on("exit", (code, signal) => finish(code, signal));
+  return job;
+}
+
+function startPersistentStreamTarget(
+  requestId,
+  targetId,
+  channelId,
+  protocol,
+  streamKey,
+  destinationUrl,
+  sourceMode = "rtmp",
+  reconnectPolicy = null,
+) {
+  cleanupJobs();
+  if (requestId && requestIds.has(requestId)) {
+    return jobs.get(requestIds.get(requestId));
+  }
+  if (!Number.isInteger(targetId) || targetId <= 0)
+    throw new Error("Invalid target_id");
+  if (!Number.isInteger(channelId) || channelId <= 0)
+    throw new Error("Invalid channel_id");
+  if (!isValidStreamKey(streamKey)) throw new Error("Invalid stream key");
+
+  const normalized = normalizeStreamTargetProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported Stream Target protocol");
+  const cleanDestination = validateStreamTargetDestination(
+    destinationUrl,
+    normalized,
+  );
+  const policy = normalizeReconnectPolicy(reconnectPolicy);
+  if (policy.enabled) {
+    throw new Error(
+      "Agent-side Stream Target reconnect must remain disabled; the control plane owns reconnect decisions",
+    );
+  }
+
+  const existing = findActiveStreamTargetJob(targetId, channelId);
+  if (existing) {
+    const error = new Error(
+      "A persistent Stream Target worker is already active",
+    );
+    error.status = 409;
+    error.existingJob = existing;
+    throw error;
+  }
+
+  const normalizedSourceMode = normalizeStreamTargetSourceMode(
+    sourceMode,
+    normalized,
+  );
+  const job = makeJob(requestId, "stream_target_start", {
+    target_id: targetId,
+    channel_id: channelId,
+    protocol: normalized,
+    source_mode: normalizedSourceMode,
+    stream_key: streamKey,
+    destination_url: cleanDestination,
+    persistent: true,
+    reconnect_policy: policy,
+    reconnect_count: 0,
+    next_retry_at: null,
+    last_process_exit_at: null,
+    bitrate_kbps: 0,
+    output_bytes: 0,
+    output_time_ms: 0,
+    output_frames: 0,
+    dropped_frames: 0,
+    delivery_verified: false,
+    delivery_verified_at: null,
+    stop_timer: null,
+    sensitive_values: [cleanDestination],
+  });
+
+  const args = buildPersistentStreamTargetArgs(
+    streamKey,
+    normalized,
+    cleanDestination,
+    normalizedSourceMode,
+  );
+  const child = spawn("ffmpeg", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+  return attachPersistentStreamTargetProcess(job, child);
 }
 
 function findActivePullSourceJob(sourceId, channelId) {
@@ -915,6 +1305,7 @@ async function handleCreateJob(req, res) {
     "live_stream_probe",
     "pull_source_probe",
     "pull_source_start",
+    "stream_target_start",
   ]);
   if (!allowedTypes.has(body.type)) {
     sendJson(res, 400, { ok: false, error: "Unsupported job type" });
@@ -936,7 +1327,19 @@ async function handleCreateJob(req, res) {
               ? ["stream_key", "reconnect_policy"]
               : []),
           ])
-        : new Set(["type", "request_id"]);
+        : body.type === "stream_target_start"
+          ? new Set([
+              "type",
+              "request_id",
+              "target_id",
+              "channel_id",
+              "protocol",
+              "stream_key",
+              "destination_url",
+              "source_mode",
+              "reconnect_policy",
+            ])
+          : new Set(["type", "request_id"]);
 
   const unknownKeys = Object.keys(body).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length) {
@@ -1069,6 +1472,118 @@ async function handleCreateJob(req, res) {
         sourceUrl,
       );
     }
+  } else if (body.type === "stream_target_start") {
+    const targetId = Number(body.target_id);
+    const channelId = Number(body.channel_id);
+    const protocol = normalizeStreamTargetProtocol(body.protocol);
+    const streamKey = String(body.stream_key || "").trim();
+    const destinationUrl = String(body.destination_url || "").trim();
+    const sourceMode = String(body.source_mode || "rtmp")
+      .trim()
+      .toLowerCase();
+
+    if (!Number.isInteger(targetId) || targetId <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid target_id" });
+      return;
+    }
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid channel_id" });
+      return;
+    }
+    if (!protocol) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Unsupported Stream Target protocol",
+      });
+      return;
+    }
+    if (!isValidStreamKey(streamKey)) {
+      sendJson(res, 400, { ok: false, error: "Invalid stream key" });
+      return;
+    }
+    if (!["rtmp", "hls"].includes(sourceMode)) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Invalid Stream Target source_mode",
+      });
+      return;
+    }
+    try {
+      validateStreamTargetDestination(destinationUrl, protocol);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+
+    const reconnectPolicy = body.reconnect_policy;
+    if (
+      !reconnectPolicy ||
+      typeof reconnectPolicy !== "object" ||
+      Array.isArray(reconnectPolicy) ||
+      Object.keys(reconnectPolicy).some(
+        (key) =>
+          ![
+            "enabled",
+            "base_delay_ms",
+            "max_delay_ms",
+            "jitter_percent",
+          ].includes(key),
+      )
+    ) {
+      sendJson(res, 400, { ok: false, error: "Invalid reconnect_policy" });
+      return;
+    }
+    if (reconnectPolicy.enabled !== false) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Agent-side Stream Target reconnect must be disabled",
+      });
+      return;
+    }
+    const baseDelay = Number(reconnectPolicy.base_delay_ms);
+    const maxDelay = Number(reconnectPolicy.max_delay_ms);
+    const jitter = Number(reconnectPolicy.jitter_percent);
+    if (
+      !Number.isFinite(baseDelay) ||
+      baseDelay < 1000 ||
+      baseDelay > 60000 ||
+      !Number.isFinite(maxDelay) ||
+      maxDelay < baseDelay ||
+      maxDelay > 300000 ||
+      !Number.isFinite(jitter) ||
+      jitter < 0 ||
+      jitter > 0.5
+    ) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Invalid reconnect_policy values",
+      });
+      return;
+    }
+
+    try {
+      job = startPersistentStreamTarget(
+        requestId,
+        targetId,
+        channelId,
+        protocol,
+        streamKey,
+        destinationUrl,
+        sourceMode,
+        reconnectPolicy,
+      );
+    } catch (error) {
+      if (error?.status === 409) {
+        sendJson(res, 409, {
+          ok: false,
+          ...baseIdentity(),
+          error: error.message,
+          job: error.existingJob ? publicJob(error.existingJob) : null,
+        });
+        return;
+      }
+      throw error;
+    }
   } else if (body.type === "live_stream_probe") {
     const channelId = Number(body.channel_id);
     const streamKey = String(body.stream_key || "").trim();
@@ -1098,11 +1613,13 @@ function handleGetJob(res, id) {
 function handleStopJob(res, id) {
   const job = jobs.get(id);
   if (!job) return sendJson(res, 404, { ok: false, error: "Job not found" });
-  if (job.type === "pull_source_start") {
+  if (job.type === "pull_source_start" || job.type === "stream_target_start") {
     return sendJson(res, 409, {
       ok: false,
       error:
-        "Persistent Pull Source jobs must be stopped through the authoritative Pull Source stop endpoint",
+        job.type === "pull_source_start"
+          ? "Persistent Pull Source jobs must be stopped through the authoritative Pull Source stop endpoint"
+          : "Persistent Stream Target jobs must be stopped through the authoritative Stream Target stop endpoint",
       job: publicJob(job),
     });
   }
@@ -1303,6 +1820,131 @@ async function handlePullSourceRuntimeStatus(res, sourceId) {
   });
 }
 
+function latestStreamTargetJob(targetId, channelId = null) {
+  return (
+    Array.from(jobs.values())
+      .filter(
+        (job) =>
+          job.type === "stream_target_start" &&
+          job.target_id === targetId &&
+          (channelId == null || job.channel_id === channelId),
+      )
+      .sort(
+        (a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0),
+      )[0] || null
+  );
+}
+
+function requestPersistentStreamTargetStop(job) {
+  if (!job) return { accepted: false, already_stopped: true };
+  if (job.status === "stopping") {
+    return { accepted: true, already_stopped: false };
+  }
+  if (!["starting", "running"].includes(job.status) || !job.child) {
+    return { accepted: false, already_stopped: true };
+  }
+
+  job.status = "stopping";
+  const child = job.child;
+  child.kill("SIGTERM");
+  if (job.stop_timer) clearTimeout(job.stop_timer);
+  job.stop_timer = setTimeout(() => {
+    if (job.child === child && child.exitCode === null) child.kill("SIGKILL");
+  }, 5000);
+  job.stop_timer.unref?.();
+  return { accepted: true, already_stopped: false };
+}
+
+async function handleStreamTargetStop(req, res, targetId) {
+  cleanupJobs();
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid target_id" });
+  }
+
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: "Stream Target stop body must be an object",
+    });
+  }
+  const unknownKeys = Object.keys(body).filter((key) => key !== "channel_id");
+  if (unknownKeys.length) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: `Unsupported Stream Target stop fields: ${unknownKeys.join(", ")}`,
+    });
+  }
+  const channelId = Number(body.channel_id);
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid channel_id" });
+  }
+
+  const job = latestStreamTargetJob(targetId, channelId);
+  if (!job) {
+    return sendJson(res, 200, {
+      ok: true,
+      ...baseIdentity(),
+      target_id: targetId,
+      channel_id: channelId,
+      result: "not_running",
+      stop_accepted: false,
+      already_stopped: true,
+      job: null,
+    });
+  }
+
+  const stop = requestPersistentStreamTargetStop(job);
+  sendJson(res, stop.accepted ? 202 : 200, {
+    ok: true,
+    ...baseIdentity(),
+    target_id: targetId,
+    channel_id: channelId,
+    result: stop.accepted ? "stopping" : "already_stopped",
+    stop_accepted: stop.accepted,
+    already_stopped: stop.already_stopped,
+    job: publicJob(job),
+  });
+}
+
+async function handleStreamTargetRuntimeStatus(res, targetId) {
+  cleanupJobs();
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Invalid target_id" });
+  }
+  const job = latestStreamTargetJob(targetId);
+  const active =
+    !!job && ["starting", "running", "stopping"].includes(job.status);
+  const processAlive =
+    !!job?.child && job.child.exitCode === null && !job.child.killed;
+
+  sendJson(res, 200, {
+    ok: true,
+    ...baseIdentity(),
+    target_id: targetId,
+    runtime: {
+      found: !!job,
+      active,
+      process_alive: processAlive,
+      child_pid: processAlive ? job.child.pid : null,
+      status: job?.status || "stopped",
+      bitrate_kbps: Math.max(0, Number(job?.bitrate_kbps || 0)),
+      output_bytes: Math.max(0, Number(job?.output_bytes || 0)),
+      output_time_ms: Math.max(0, Number(job?.output_time_ms || 0)),
+      output_frames: Math.max(0, Number(job?.output_frames || 0)),
+      dropped_frames: Math.max(0, Number(job?.dropped_frames || 0)),
+      delivery_verified: job?.delivery_verified === true,
+      delivery_verified_at: job?.delivery_verified_at || null,
+      healthy:
+        !!job &&
+        job.status === "running" &&
+        processAlive &&
+        job.delivery_verified === true,
+      job: job ? publicJob(job) : null,
+    },
+  });
+}
+
 async function handleHealth(res) {
   const startedAt = Date.now();
   const system = getLocalSystemMetrics();
@@ -1345,8 +1987,13 @@ function handleCapabilities(res) {
         "live_stream_probe",
         "pull_source_probe",
         "pull_source_start",
+        "stream_target_start",
       ],
       persistent_pull_source_start: true,
+      persistent_stream_target_start: true,
+      stream_target_runtime_status: true,
+      authoritative_stream_target_stop: true,
+      stream_target_reconnect_policy_source: "control_plane",
       pull_source_runtime_status: true,
       authoritative_pull_source_stop: true,
       pull_source_reconnect_execution: true,
@@ -1361,6 +2008,7 @@ function handleCapabilities(res) {
       ingest: ["rtmp", "rtmps", "srt"],
       pull_foundation: ["rtmp", "rtmps", "rtsp", "srt", "hls", "http-flv"],
       playback: ["hls"],
+      output: ["rtmp", "rtmps", "srt"],
     },
   });
 }
@@ -1437,6 +2085,23 @@ const requestHandler = async (req, res) => {
       await handlePullSourceRuntimeStatus(
         res,
         Number(pullSourceStatusMatch[1]),
+      );
+      return;
+    }
+    const streamTargetStopMatch = url.pathname.match(
+      /^\/v1\/stream-targets\/(\d+)\/stop$/,
+    );
+    if (streamTargetStopMatch && req.method === "POST") {
+      await handleStreamTargetStop(req, res, Number(streamTargetStopMatch[1]));
+      return;
+    }
+    const streamTargetStatusMatch = url.pathname.match(
+      /^\/v1\/stream-targets\/(\d+)\/status$/,
+    );
+    if (streamTargetStatusMatch && req.method === "GET") {
+      await handleStreamTargetRuntimeStatus(
+        res,
+        Number(streamTargetStatusMatch[1]),
       );
       return;
     }
@@ -1518,7 +2183,7 @@ function shutdown(signal) {
   // restart. Stop agent-owned workers deliberately so no orphan FFmpeg process
   // can continue publishing without a control-plane owner.
   for (const job of jobs.values()) {
-    clearPullSourceReconnectTimer(job);
+    if (job.type === "pull_source_start") clearPullSourceReconnectTimer(job);
     if (job.child && ["starting", "running", "stopping"].includes(job.status)) {
       try {
         job.status = "stopping";
