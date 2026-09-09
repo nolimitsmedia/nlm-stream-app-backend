@@ -149,6 +149,15 @@ const MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE =
     .trim()
     .toLowerCase() === "true";
 
+// Phase 5A.2 — Stream Target execution on the channel's assigned Media Node.
+// Default OFF for a controlled rolling deployment. Once the Media Node Agent
+// has been restarted onto the 5A.2a code and validated, set this to true and
+// restart only the backend to activate node-aware Stream Target workers.
+const STREAM_TARGET_MEDIA_NODE_EXECUTION_ENABLED =
+  String(process.env.STREAM_TARGET_MEDIA_NODE_EXECUTION_ENABLED || "false")
+    .trim()
+    .toLowerCase() === "true";
+
 let mediaNodeHeartbeat = null;
 
 // Internal Stream Target receiver allow-list.
@@ -13732,9 +13741,248 @@ embedRoutes.register(app, pool, {
 
 /*
 |--------------------------------------------------------------------------
-| STREAM TARGETS — Phase 2 generic simulcast/output subsystem
+| STREAM TARGETS — Phase 5A.2 Media-Node-aware execution
 |--------------------------------------------------------------------------
+| OAuth/platform orchestration, destination preflight, retry policy and durable
+| target state stay in the control plane. The Media Node Agent receives only a
+| fully resolved destination URL plus strict target/channel/protocol fields and
+| constructs the approved FFmpeg command locally. It never receives arbitrary
+| commands or FFmpeg arguments.
+|
+| The feature flag deliberately defaults OFF so this code can be deployed before
+| the Agent restart. With the flag off, stream_target_service.js keeps using its
+| existing local FFmpeg worker path.
 */
+const mediaNodeStreamTargetExecutor = {
+  async start({
+    targetId,
+    channelId,
+    protocol,
+    streamKey: _requestedStreamKey,
+    destinationUrl,
+    sourceMode,
+  }) {
+    const cleanTargetId = Number(targetId);
+    const cleanChannelId = Number(channelId);
+    if (!Number.isInteger(cleanTargetId) || cleanTargetId <= 0) {
+      throw new Error("Invalid Stream Target id");
+    }
+    if (!Number.isInteger(cleanChannelId) || cleanChannelId <= 0) {
+      throw new Error("Invalid Stream Target channel id");
+    }
+
+    const result = await queryWithRetry(
+      `SELECT sd.id, sd.channel_id, sd.enabled,
+              c.media_node_id, c.stream_key
+       FROM social_destinations sd
+       JOIN channels c ON c.id=sd.channel_id
+       WHERE sd.id=$1 AND sd.channel_id=$2
+       LIMIT 1`,
+      [cleanTargetId, cleanChannelId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Stream Target not found");
+    if (!row.enabled) throw new Error("Stream Target is disabled");
+
+    const nodeId = Number(row.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) {
+      throw new Error("Channel has no assigned Media Node");
+    }
+
+    // The canonical channel stream key is always loaded from the database.
+    // Never trust a caller-supplied routing credential for Agent execution.
+    const canonicalStreamKey = String(row.stream_key || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(canonicalStreamKey)) {
+      throw new Error("Invalid channel stream key");
+    }
+
+    const normalizedProtocol = String(protocol || "")
+      .trim()
+      .toLowerCase();
+    if (!["rtmp", "rtmps", "srt"].includes(normalizedProtocol)) {
+      throw new Error("Unsupported Stream Target protocol");
+    }
+
+    const normalizedSourceMode =
+      String(sourceMode || "rtmp")
+        .trim()
+        .toLowerCase() === "hls"
+        ? "hls"
+        : "rtmp";
+
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: "/v1/jobs",
+      method: "POST",
+      body: {
+        type: "stream_target_start",
+        request_id: `target-${cleanChannelId}-${cleanTargetId}-${crypto.randomUUID()}`,
+        target_id: cleanTargetId,
+        channel_id: cleanChannelId,
+        protocol: normalizedProtocol,
+        stream_key: canonicalStreamKey,
+        destination_url: String(destinationUrl || "").trim(),
+        source_mode: normalizedSourceMode,
+        reconnect_policy: {
+          // The control plane remains the only reconnect authority. This avoids
+          // a node-local retry loop competing with OAuth refresh, preflight,
+          // bounded retry/backoff and recovery logic in stream_target_service.
+          enabled: false,
+          base_delay_ms: Math.max(
+            1000,
+            Math.min(
+              60000,
+              Number(process.env.STREAM_TARGET_RECONNECT_DELAY_MS || 5000),
+            ),
+          ),
+          max_delay_ms: Math.max(
+            1000,
+            Math.min(
+              300000,
+              Number(process.env.STREAM_TARGET_MAX_RECONNECT_DELAY_MS || 30000),
+            ),
+          ),
+          jitter_percent: Math.max(
+            0,
+            Math.min(
+              0.5,
+              Number(
+                process.env.STREAM_TARGET_RECONNECT_JITTER_PERCENT || 0.15,
+              ),
+            ),
+          ),
+        },
+      },
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+
+    return response.data;
+  },
+
+  async status({ targetId, channelId }) {
+    const cleanTargetId = Number(targetId);
+    const cleanChannelId = Number(channelId);
+    if (!Number.isInteger(cleanTargetId) || cleanTargetId <= 0) {
+      throw new Error("Invalid Stream Target id");
+    }
+    if (!Number.isInteger(cleanChannelId) || cleanChannelId <= 0) {
+      throw new Error("Invalid Stream Target channel id");
+    }
+
+    const result = await queryWithRetry(
+      `SELECT c.media_node_id
+       FROM social_destinations sd
+       JOIN channels c ON c.id=sd.channel_id
+       WHERE sd.id=$1 AND sd.channel_id=$2
+       LIMIT 1`,
+      [cleanTargetId, cleanChannelId],
+    );
+    if (!result.rows[0]) throw new Error("Stream Target not found");
+
+    const nodeId = Number(result.rows[0].media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) {
+      throw new Error("Channel has no assigned Media Node");
+    }
+
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: `/v1/stream-targets/${cleanTargetId}/status`,
+      method: "GET",
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+
+    return response.data?.runtime || {};
+  },
+
+  async stop({ targetId, channelId }) {
+    const cleanTargetId = Number(targetId);
+    const cleanChannelId = Number(channelId);
+    if (!Number.isInteger(cleanTargetId) || cleanTargetId <= 0) {
+      throw new Error("Invalid Stream Target id");
+    }
+    if (!Number.isInteger(cleanChannelId) || cleanChannelId <= 0) {
+      throw new Error("Invalid Stream Target channel id");
+    }
+
+    const result = await queryWithRetry(
+      `SELECT c.media_node_id
+       FROM social_destinations sd
+       JOIN channels c ON c.id=sd.channel_id
+       WHERE sd.id=$1 AND sd.channel_id=$2
+       LIMIT 1`,
+      [cleanTargetId, cleanChannelId],
+    );
+    if (!result.rows[0]) throw new Error("Stream Target not found");
+
+    const nodeId = Number(result.rows[0].media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) {
+      throw new Error("Channel has no assigned Media Node");
+    }
+
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+
+    const stopResponse = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: `/v1/stream-targets/${cleanTargetId}/stop`,
+      method: "POST",
+      body: { channel_id: cleanChannelId },
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+
+    // Agent stop is asynchronous. Do not clear durable target runtime state
+    // until the assigned Media Node proves the worker has actually exited.
+    const stopWaitDeadline = Date.now() + 7000;
+    let runtime = null;
+
+    while (Date.now() < stopWaitDeadline) {
+      const runtimeResponse = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/stream-targets/${cleanTargetId}/status`,
+        method: "GET",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+
+      runtime = runtimeResponse.data?.runtime || {};
+      const stopped = runtime.active !== true && runtime.process_alive !== true;
+
+      if (stopped) {
+        return {
+          ...stopResponse.data,
+          verified_stopped: true,
+          runtime,
+        };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    const error = new Error(
+      `Media Node Agent did not confirm Stream Target #${cleanTargetId} stopped within 7 seconds`,
+    );
+    error.code = "REMOTE_STREAM_TARGET_STOP_TIMEOUT";
+    error.runtime = runtime;
+    throw error;
+  },
+};
+
+const streamTargetExecutor = STREAM_TARGET_MEDIA_NODE_EXECUTION_ENABLED
+  ? mediaNodeStreamTargetExecutor
+  : null;
+
 const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   authenticateAdmin,
   resolveOrganizationForRequest,
@@ -13742,6 +13990,7 @@ const streamTargetManager = registerStreamTargetRoutes(app, pool, {
   requireOrganizationRole,
   getInternalHlsSourceUrl,
   inputResilienceFlags,
+  streamTargetExecutor,
 });
 
 /*
@@ -13937,9 +14186,7 @@ pullSourceManager.setRemoteExecutor({
 
       runtime = runtimeResponse.data?.runtime || {};
 
-      const stopped =
-        runtime.active !== true &&
-        runtime.process_alive !== true;
+      const stopped = runtime.active !== true && runtime.process_alive !== true;
 
       if (stopped) {
         return {

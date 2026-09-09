@@ -67,12 +67,14 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     requireOrganizationRole,
     getInternalHlsSourceUrl,
     inputResilienceFlags,
+    streamTargetExecutor = null,
   } = deps;
 
   const manager = createStreamTargetManager({
     pool,
     getInternalHlsSourceUrl,
     inputResilienceFlags,
+    streamTargetExecutor,
   });
 
   async function getOwnedChannel(channelId, organizationId) {
