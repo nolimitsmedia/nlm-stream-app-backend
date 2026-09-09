@@ -202,10 +202,18 @@ async function requestMediaNodeAgent({
   const jobPath = /^\/v1\/jobs(?:\/[0-9a-f-]{36})?$/i.test(path);
   const pullSourceStatusPath = /^\/v1\/pull-sources\/\d+\/status$/i.test(path);
   const pullSourceStopPath = /^\/v1\/pull-sources\/\d+\/stop$/i.test(path);
+  const streamTargetStatusPath = /^\/v1\/stream-targets\/\d+\/status$/i.test(
+    path,
+  );
+  const streamTargetStopPath = /^\/v1\/stream-targets\/\d+\/stop$/i.test(path);
   const allowed =
     (normalizedMethod === "GET" &&
-      (ALLOWED_GET_PATHS.has(path) || jobPath || pullSourceStatusPath)) ||
-    (normalizedMethod === "POST" && (jobPath || pullSourceStopPath));
+      (ALLOWED_GET_PATHS.has(path) ||
+        jobPath ||
+        pullSourceStatusPath ||
+        streamTargetStatusPath)) ||
+    (normalizedMethod === "POST" &&
+      (jobPath || pullSourceStopPath || streamTargetStopPath));
   if (!allowed)
     throw new Error(
       `Unsupported Media Node Agent request: ${normalizedMethod} ${path}`,
@@ -224,6 +232,7 @@ async function requestMediaNodeAgent({
       "live_stream_probe",
       "pull_source_probe",
       "pull_source_start",
+      "stream_target_start",
     ]);
     if (!allowedTypes.has(body.type)) {
       throw new Error("Unsupported Media Node job type");
@@ -244,7 +253,19 @@ async function requestMediaNodeAgent({
                 ? ["stream_key", "reconnect_policy"]
                 : []),
             ])
-          : new Set(["type", "request_id"]);
+          : body.type === "stream_target_start"
+            ? new Set([
+                "type",
+                "request_id",
+                "target_id",
+                "channel_id",
+                "protocol",
+                "stream_key",
+                "destination_url",
+                "source_mode",
+                "reconnect_policy",
+              ])
+            : new Set(["type", "request_id"]);
 
     const unknownKeys = Object.keys(body).filter(
       (key) => !allowedKeys.has(key),
@@ -341,19 +362,121 @@ async function requestMediaNodeAgent({
         }
       }
     }
-  } else if (normalizedMethod === "POST" && pullSourceStopPath) {
+
+    if (body.type === "stream_target_start") {
+      const targetId = Number(body.target_id);
+      const channelId = Number(body.channel_id);
+      const protocol = String(body.protocol || "")
+        .trim()
+        .toLowerCase();
+      const streamKey = String(body.stream_key || "");
+      const destinationUrl = String(body.destination_url || "").trim();
+      const sourceMode = String(body.source_mode || "rtmp")
+        .trim()
+        .toLowerCase();
+
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        throw new Error("Invalid Media Node Stream Target target_id");
+      }
+      if (!Number.isInteger(channelId) || channelId <= 0) {
+        throw new Error("Invalid Media Node Stream Target channel_id");
+      }
+      if (!["rtmp", "rtmps", "srt"].includes(protocol)) {
+        throw new Error("Unsupported Media Node Stream Target protocol");
+      }
+      if (!/^[A-Za-z0-9_-]{1,255}$/.test(streamKey)) {
+        throw new Error("Invalid Media Node Stream Target stream key");
+      }
+      if (!["rtmp", "hls"].includes(sourceMode)) {
+        throw new Error("Invalid Media Node Stream Target source_mode");
+      }
+      if (!destinationUrl || destinationUrl.length > 4096) {
+        throw new Error("Invalid Media Node Stream Target destination URL");
+      }
+
+      let parsedDestination;
+      try {
+        parsedDestination = new URL(destinationUrl);
+      } catch {
+        throw new Error("Invalid Media Node Stream Target destination URL");
+      }
+      if (parsedDestination.protocol.toLowerCase() !== `${protocol}:`) {
+        throw new Error(
+          "Media Node Stream Target destination protocol mismatch",
+        );
+      }
+      if (!parsedDestination.hostname) {
+        throw new Error("Media Node Stream Target destination host is missing");
+      }
+      if (protocol === "srt" && !parsedDestination.port) {
+        throw new Error(
+          "Media Node Stream Target SRT destination requires a port",
+        );
+      }
+
+      const policy = body.reconnect_policy;
+      if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+        throw new Error("Invalid Media Node Stream Target reconnect_policy");
+      }
+      const unknownPolicyKeys = Object.keys(policy).filter(
+        (key) =>
+          ![
+            "enabled",
+            "base_delay_ms",
+            "max_delay_ms",
+            "jitter_percent",
+          ].includes(key),
+      );
+      if (unknownPolicyKeys.length) {
+        throw new Error(
+          `Unsupported Media Node Stream Target reconnect policy fields: ${unknownPolicyKeys.join(", ")}`,
+        );
+      }
+      if (policy.enabled !== false) {
+        throw new Error(
+          "Media Node Stream Target Agent-side reconnect must remain disabled",
+        );
+      }
+      const baseDelay = Number(policy.base_delay_ms);
+      const maxDelay = Number(policy.max_delay_ms);
+      const jitter = Number(policy.jitter_percent);
+      if (
+        !Number.isFinite(baseDelay) ||
+        baseDelay < 1000 ||
+        baseDelay > 60000
+      ) {
+        throw new Error(
+          "Invalid Media Node Stream Target reconnect base delay",
+        );
+      }
+      if (
+        !Number.isFinite(maxDelay) ||
+        maxDelay < baseDelay ||
+        maxDelay > 300000
+      ) {
+        throw new Error("Invalid Media Node Stream Target reconnect max delay");
+      }
+      if (!Number.isFinite(jitter) || jitter < 0 || jitter > 0.5) {
+        throw new Error("Invalid Media Node Stream Target reconnect jitter");
+      }
+    }
+  } else if (
+    normalizedMethod === "POST" &&
+    (pullSourceStopPath || streamTargetStopPath)
+  ) {
+    const label = pullSourceStopPath ? "Pull Source" : "Stream Target";
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      throw new Error("Media Node Pull Source stop body must be an object");
+      throw new Error(`Media Node ${label} stop body must be an object`);
     }
     const unknownKeys = Object.keys(body).filter((key) => key !== "channel_id");
     if (unknownKeys.length) {
       throw new Error(
-        `Unsupported Media Node Pull Source stop fields: ${unknownKeys.join(", ")}`,
+        `Unsupported Media Node ${label} stop fields: ${unknownKeys.join(", ")}`,
       );
     }
     const channelId = Number(body.channel_id);
     if (!Number.isInteger(channelId) || channelId <= 0) {
-      throw new Error("Invalid Media Node Pull Source stop channel_id");
+      throw new Error(`Invalid Media Node ${label} stop channel_id`);
     }
   } else if (body != null) {
     throw new Error(
