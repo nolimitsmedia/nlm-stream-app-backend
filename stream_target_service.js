@@ -635,6 +635,7 @@ function createStreamTargetManager({
   pool,
   getInternalHlsSourceUrl,
   inputResilienceFlags = [],
+  streamTargetExecutor = null,
 }) {
   const processStates = new Map();
   let recoverySweepTimer = null;
@@ -1242,9 +1243,351 @@ function createStreamTargetManager({
     if (state.metricsTimer) clearInterval(state.metricsTimer);
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
     if (state.deliveryVerifyTimer) clearTimeout(state.deliveryVerifyTimer);
+    if (state.remoteStatusTimer) clearTimeout(state.remoteStatusTimer);
     state.metricsTimer = null;
     state.reconnectTimer = null;
     state.deliveryVerifyTimer = null;
+    state.remoteStatusTimer = null;
+  }
+
+  function hasRemoteStreamTargetExecutor() {
+    return Boolean(
+      streamTargetExecutor &&
+      typeof streamTargetExecutor.start === "function" &&
+      typeof streamTargetExecutor.status === "function" &&
+      typeof streamTargetExecutor.stop === "function",
+    );
+  }
+
+  function normalizeRemoteRuntime(response) {
+    const runtime = response?.runtime || response?.job || response || {};
+    return {
+      found: runtime.found !== false,
+      active: Boolean(
+        runtime.active ??
+        runtime.process_alive ??
+        ["starting", "running", "stopping"].includes(
+          String(runtime.status || "").toLowerCase(),
+        ),
+      ),
+      processAlive: Boolean(
+        runtime.process_alive ??
+        ["starting", "running"].includes(
+          String(runtime.status || "").toLowerCase(),
+        ),
+      ),
+      pid: Number(runtime.child_pid || runtime.pid || 0) || null,
+      status: String(runtime.status || "").toLowerCase() || "unknown",
+      bitrateKbps: safeNumber(runtime.bitrate_kbps),
+      outputBytes: safeNumber(runtime.output_bytes),
+      outputTimeMs: safeNumber(runtime.output_time_ms),
+      outputFrames: safeNumber(runtime.output_frames),
+      droppedFrames: safeNumber(runtime.dropped_frames),
+      deliveryVerified: runtime.delivery_verified === true,
+      deliveryVerifiedAt: runtime.delivery_verified_at || null,
+      healthy: runtime.healthy === true,
+      error: runtime.error || runtime.last_error || runtime.job?.error || null,
+    };
+  }
+
+  async function markRemoteTargetLost(target, channel, state, runtime) {
+    if (!state || state.intentionalStop || !state.remoteActive) return;
+    state.remoteActive = false;
+    state.proc = null;
+    state.pid = null;
+    if (state.remoteStatusTimer) clearTimeout(state.remoteStatusTimer);
+    state.remoteStatusTimer = null;
+    if (state.metricsTimer) clearInterval(state.metricsTimer);
+    state.metricsTimer = null;
+    if (state.deliveryVerifyTimer) clearTimeout(state.deliveryVerifyTimer);
+    state.deliveryVerifyTimer = null;
+
+    const fresh = await getDestinationAndChannel(Number(target.id)).catch(
+      () => null,
+    );
+    const canReconnect = Boolean(fresh?.enabled && fresh?.auto_reconnect);
+    const remoteError =
+      runtime?.error ||
+      state.lastError ||
+      "Media Node Stream Target worker stopped unexpectedly.";
+
+    state.status = canReconnect ? "reconnecting" : "disconnected";
+    state.lastError = remoteError;
+    state.failureCode = "remote_worker_stopped";
+    state.failureCategory = "worker";
+    state.failureScope = "worker";
+    state.failureRetryable = true;
+    state.lastFailureAt = Date.now();
+    state.nextRetryAt = null;
+
+    await pool.query(
+      `UPDATE social_destinations
+       SET is_running=false, ffmpeg_pid=NULL,
+           status=$1, current_bitrate_kbps=0,
+           last_disconnected_at=now(), last_error=$2, updated_at=now()
+       WHERE id=$3`,
+      [state.status, remoteError, Number(target.id)],
+    );
+
+    if (!canReconnect) processStates.set(Number(target.id), state);
+  }
+
+  function scheduleRemoteStatusPoll(target, channel, state) {
+    if (!state || state.intentionalStop || !state.remoteActive) return;
+    if (state.remoteStatusTimer) clearTimeout(state.remoteStatusTimer);
+
+    state.remoteStatusTimer = setTimeout(async () => {
+      state.remoteStatusTimer = null;
+      if (state.intentionalStop || !state.remoteActive) return;
+
+      try {
+        const response = await streamTargetExecutor.status({
+          targetId: Number(target.id),
+          channelId: Number(channel.id),
+        });
+        const runtime = normalizeRemoteRuntime(response);
+
+        state.pid = runtime.pid;
+        state.currentBitrateKbps = runtime.bitrateKbps;
+        state.outputBytes = runtime.outputBytes;
+        state.outputTimeMs = runtime.outputTimeMs;
+        state.outputFrames = runtime.outputFrames;
+        state.droppedFrames = runtime.droppedFrames;
+        state.deliveryVerified = runtime.deliveryVerified;
+        state.deliveryVerifiedAt = runtime.deliveryVerifiedAt
+          ? new Date(runtime.deliveryVerifiedAt).getTime()
+          : state.deliveryVerifiedAt;
+        if (runtime.deliveryVerified && state.deliveryVerifyTimer) {
+          clearTimeout(state.deliveryVerifyTimer);
+          state.deliveryVerifyTimer = null;
+        }
+        state.status = runtime.deliveryVerified
+          ? "streaming"
+          : runtime.processAlive
+            ? "connecting"
+            : runtime.status || "disconnected";
+
+        if (runtime.processAlive) {
+          await pool.query(
+            `UPDATE social_destinations
+             SET is_running=$1, ffmpeg_pid=$2, status=$3,
+                 current_bitrate_kbps=$4, dropped_frames=$5,
+                 last_error=CASE WHEN $1::boolean THEN NULL ELSE last_error END,
+                 updated_at=now()
+             WHERE id=$6`,
+            [
+              runtime.processAlive,
+              runtime.pid,
+              runtime.deliveryVerified ? "streaming" : "connecting",
+              runtime.bitrateKbps,
+              runtime.droppedFrames,
+              Number(target.id),
+            ],
+          );
+          scheduleRemoteStatusPoll(target, channel, state);
+          return;
+        }
+
+        await markRemoteTargetLost(target, channel, state, runtime);
+      } catch (error) {
+        // A single control-plane/Agent request failure is not proof that the
+        // remote FFmpeg worker died. Keep ownership and retry status polling.
+        state.lastError = error?.message || "Media Node status check failed";
+        scheduleRemoteStatusPoll(target, channel, state);
+      }
+    }, 2000);
+    state.remoteStatusTimer.unref?.();
+  }
+
+  async function spawnRemotePush(
+    target,
+    channel,
+    destinationUrl,
+    { reconnect = false } = {},
+  ) {
+    const destinationId = Number(target.id);
+    const targetType = normalizeTargetType(
+      target.target_type || target.platform,
+    );
+    const protocol = normalizeProtocol(target.protocol, targetType);
+    const preferredSource = getHandoffSafePreferredSource(
+      channel.stream_key,
+      target.source_mode || STREAM_TARGET_SOURCE_MODE,
+      protocol,
+    );
+
+    const existing = processStates.get(destinationId);
+    if (existing?.remoteActive) {
+      return { ok: false, message: "Target is already streaming" };
+    }
+
+    const state = existing || {
+      destinationId,
+      currentBitrateKbps: 0,
+      droppedFrames: safeNumber(target.dropped_frames),
+      reconnectCount: safeNumber(target.reconnect_count),
+      retryAttempt: 0,
+      nextRetryAt: null,
+      maxReconnectAttempts: STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
+      sourceHlsFault: false,
+      intentionalStop: false,
+      failureCode: null,
+      failureCategory: null,
+      failureScope: null,
+      failureRetryable: true,
+      lastFailureAt: null,
+      preflight: null,
+      outputBytes: 0,
+      outputTimeMs: 0,
+      outputFrames: 0,
+      deliveryVerified: false,
+      deliveryVerifiedAt: null,
+      deliveryVerifyTimer: null,
+    };
+
+    clearStateTimers(state);
+    state.intentionalStop = false;
+    state.remote = true;
+    state.remoteActive = true;
+    state.destinationUrl = destinationUrl;
+    state.targetType = targetType;
+    state.protocol = protocol;
+    state.channelId = Number(channel.id);
+    state.channelStreamKey = channel.stream_key;
+    state.sourceMode = preferredSource.mode;
+    state.sourceUrl = null;
+    state.currentBitrateKbps = 0;
+    state.outputBytes = 0;
+    state.outputTimeMs = 0;
+    state.outputFrames = 0;
+    state.stderr = "";
+    state.deliveryVerified = false;
+    state.deliveryVerifiedAt = null;
+    state.status = "connecting";
+    if (!state.startedAt || !reconnect) {
+      state.startedAt =
+        reconnect && target.started_at
+          ? new Date(target.started_at).getTime()
+          : Date.now();
+    }
+    processStates.set(destinationId, state);
+
+    try {
+      const response = await streamTargetExecutor.start({
+        targetId: destinationId,
+        channelId: Number(channel.id),
+        protocol,
+        streamKey: channel.stream_key,
+        destinationUrl,
+        sourceMode: preferredSource.mode,
+        reconnect: Boolean(reconnect),
+      });
+      const runtime = normalizeRemoteRuntime(response);
+      state.pid = runtime.pid;
+      state.currentBitrateKbps = runtime.bitrateKbps;
+      state.outputBytes = runtime.outputBytes;
+      state.outputTimeMs = runtime.outputTimeMs;
+      state.outputFrames = runtime.outputFrames;
+      state.droppedFrames = runtime.droppedFrames;
+      state.deliveryVerified = runtime.deliveryVerified;
+      state.deliveryVerifiedAt = runtime.deliveryVerifiedAt
+        ? new Date(runtime.deliveryVerifiedAt).getTime()
+        : null;
+      state.status = runtime.deliveryVerified ? "streaming" : "connecting";
+
+      await pool.query(
+        `UPDATE social_destinations
+         SET is_running=$1, ffmpeg_pid=$2, status=$3,
+             started_at=CASE WHEN $4::boolean THEN COALESCE(started_at, now()) ELSE now() END,
+             last_connected_at=now(), last_error=NULL,
+             active_destination_url=$5, current_bitrate_kbps=$6, updated_at=now()
+         WHERE id=$7`,
+        [
+          runtime.processAlive,
+          runtime.pid,
+          runtime.deliveryVerified ? "streaming" : "connecting",
+          reconnect,
+          destinationUrl,
+          runtime.bitrateKbps,
+          destinationId,
+        ],
+      );
+
+      state.deliveryVerifyTimer = setTimeout(async () => {
+        if (
+          state.intentionalStop ||
+          !state.remoteActive ||
+          state.deliveryVerified
+        ) {
+          return;
+        }
+
+        state.lastError =
+          "Destination delivery could not be verified: Media Node worker produced no confirmed output media.";
+        state.failureCode = "delivery_not_verified";
+        state.failureCategory = "delivery";
+        state.failureScope = "destination";
+        state.failureRetryable = true;
+        state.lastFailureAt = Date.now();
+
+        try {
+          await streamTargetExecutor.stop({
+            targetId: destinationId,
+            channelId: Number(channel.id),
+          });
+        } catch (error) {
+          console.warn(
+            `[STREAM-TARGET #${destinationId}] Media Node delivery-timeout stop failed:`,
+            error?.message || error,
+          );
+        }
+
+        await markRemoteTargetLost(target, channel, state, {
+          error: state.lastError,
+        }).catch((error) => {
+          console.error(
+            `[STREAM-TARGET #${destinationId}] Media Node delivery-timeout reconciliation failed:`,
+            error.message,
+          );
+        });
+      }, STREAM_TARGET_DELIVERY_VERIFY_TIMEOUT_MS);
+      state.deliveryVerifyTimer.unref?.();
+
+      scheduleRemoteStatusPoll(target, channel, state);
+      return {
+        ok: true,
+        message: reconnect ? "Target reconnected" : "Stream target started",
+        execution: "media_node",
+      };
+    } catch (error) {
+      state.remoteActive = false;
+      state.status = reconnect ? "reconnecting" : "failed";
+      state.lastError =
+        error?.message || "Media Node Stream Target start failed";
+      state.failureCode = error?.code || "remote_start_failed";
+      state.failureCategory = "worker";
+      state.failureScope = "worker";
+      state.failureRetryable = true;
+      state.lastFailureAt = Date.now();
+
+      await pool.query(
+        `UPDATE social_destinations
+         SET is_running=false, ffmpeg_pid=NULL, status=$1,
+             current_bitrate_kbps=0, last_error=$2, updated_at=now()
+         WHERE id=$3`,
+        [state.status, state.lastError, destinationId],
+      );
+      return {
+        ok: false,
+        message: state.lastError,
+        failure: {
+          code: state.failureCode,
+          category: "worker",
+          retryable: true,
+          stage: "media_node_start",
+        },
+      };
+    }
   }
 
   async function spawnPush(
@@ -1253,6 +1596,10 @@ function createStreamTargetManager({
     destinationUrl,
     { reconnect = false } = {},
   ) {
+    if (hasRemoteStreamTargetExecutor()) {
+      return spawnRemotePush(target, channel, destinationUrl, { reconnect });
+    }
+
     const destinationId = Number(target.id);
     const targetType = normalizeTargetType(
       target.target_type || target.platform,
@@ -1781,7 +2128,8 @@ function createStreamTargetManager({
   async function startTarget(target, channel, organizationId, options = {}) {
     if (!target.enabled)
       return { ok: false, message: "This stream target is disabled" };
-    if (processStates.get(Number(target.id))?.proc)
+    const existingRuntimeState = processStates.get(Number(target.id));
+    if (existingRuntimeState?.proc || existingRuntimeState?.remoteActive)
       return { ok: false, message: "Target is already streaming" };
 
     const live = await isSrsStreamLive(channel.stream_key);
@@ -2010,9 +2358,27 @@ function createStreamTargetManager({
     if (state) {
       state.intentionalStop = true;
       clearStateTimers(state);
-      if (state.proc && !state.proc.killed) state.proc.kill("SIGTERM");
+
+      if (state.remote && hasRemoteStreamTargetExecutor()) {
+        await streamTargetExecutor.stop({
+          targetId: destinationId,
+          channelId: Number(target.channel_id),
+        });
+      } else if (state.proc && !state.proc.killed) {
+        state.proc.kill("SIGTERM");
+      }
+
+      state.remoteActive = false;
       state.proc = null;
       processStates.delete(destinationId);
+    } else if (hasRemoteStreamTargetExecutor() && target.channel_id) {
+      // The backend may have restarted while the Agent-owned worker survived.
+      // Ask the authoritative Media Node endpoint to stop it by target/channel
+      // identity instead of trusting a stale database PID.
+      await streamTargetExecutor.stop({
+        targetId: destinationId,
+        channelId: Number(target.channel_id),
+      });
     } else if (target.ffmpeg_pid) {
       // Never blindly kill an arbitrary PID recovered from a prior backend
       // process. The DB state is reconciled below; process ownership belongs
@@ -2201,8 +2567,9 @@ function createStreamTargetManager({
         const destinationId = Number(target.id);
         const existing = processStates.get(destinationId);
 
-        // A live worker owned by this Node process is authoritative.
+        // A live worker owned locally or by the assigned Media Node is authoritative.
         if (existing?.proc && !existing.proc.killed) continue;
+        if (existing?.remoteActive) continue;
         if (existing?.recoveryInProgress) continue;
 
         const sourceLive = await isSrsStreamLive(target.channel_stream_key);
@@ -2412,15 +2779,17 @@ function createStreamTargetManager({
     if (!state) return null;
 
     const startedAtMs = Number(state.startedAt || 0);
+    const workerRunning = Boolean(state.proc || state.remoteActive);
     const uptimeSeconds =
-      state.proc && startedAtMs > 0
+      workerRunning && startedAtMs > 0
         ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
         : 0;
 
     return {
-      pid: state.proc?.pid || null,
-      is_running: Boolean(state.proc && state.deliveryVerified),
-      worker_running: Boolean(state.proc),
+      pid: state.proc?.pid || state.pid || null,
+      is_running: Boolean(workerRunning && state.deliveryVerified),
+      worker_running: workerRunning,
+      execution: state.remote ? "media_node" : "local",
       delivery_verified: Boolean(state.deliveryVerified),
       delivery_verified_at: state.deliveryVerifiedAt
         ? new Date(state.deliveryVerifiedAt).toISOString()
@@ -2431,14 +2800,14 @@ function createStreamTargetManager({
       current_bitrate_kbps: state.currentBitrateKbps || 0,
       dropped_frames: state.droppedFrames || 0,
       reconnect_count: state.reconnectCount || 0,
-      runtime_status: state.proc
+      runtime_status: workerRunning
         ? state.deliveryVerified
           ? "streaming"
           : state.status === "reconnecting"
             ? "reconnecting"
             : "connecting"
         : state.status || "disconnected",
-      status: state.proc
+      status: workerRunning
         ? state.deliveryVerified
           ? "streaming"
           : state.status === "reconnecting"
