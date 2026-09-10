@@ -12,6 +12,11 @@ const {
   encryptOAuthToken,
   decryptOAuthAccount,
 } = require("./social_oauth_schema");
+const {
+  encryptTargetCredential,
+  decryptTargetCredential,
+  decryptTargetCredentials,
+} = require("./stream_target_schema");
 
 const TARGET_TYPES = {
   facebook: {
@@ -581,6 +586,7 @@ function combineDestinationUrl(destinationUrl, streamKey, protocol) {
 }
 
 function validateManualTarget(target) {
+  target = decryptTargetCredentials(target);
   const type = normalizeTargetType(target.target_type || target.platform);
   if (!type) return "Unsupported target type";
 
@@ -818,7 +824,7 @@ function createStreamTargetManager({
        LIMIT 1`,
       [destinationId],
     );
-    return result.rows[0] || null;
+    return result.rows[0] ? decryptTargetCredentials(result.rows[0]) : null;
   }
 
   async function ensureYoutubeAccessToken(rawAccount) {
@@ -948,6 +954,7 @@ function createStreamTargetManager({
   }
 
   function buildManualDestinationUrl(target) {
+    target = decryptTargetCredentials(target);
     const type = normalizeTargetType(target.target_type || target.platform);
     const config = TARGET_TYPES[type] || {};
     const protocol = normalizeProtocol(target.protocol, type);
@@ -1047,6 +1054,8 @@ function createStreamTargetManager({
         message: "Stream target was not found",
       };
     }
+
+    target = decryptTargetCredentials(target);
 
     if (target.automation_mode === "oauth") {
       return {
@@ -1512,7 +1521,7 @@ function createStreamTargetManager({
           runtime.pid,
           runtime.deliveryVerified ? "streaming" : "connecting",
           reconnect,
-          destinationUrl,
+          encryptTargetCredential(destinationUrl),
           runtime.bitrateKbps,
           destinationId,
         ],
@@ -1739,7 +1748,12 @@ function createStreamTargetManager({
            current_bitrate_kbps = 0,
            updated_at = now()
        WHERE id = $4`,
-      [proc.pid, reconnect, destinationUrl, destinationId],
+      [
+        proc.pid,
+        reconnect,
+        encryptTargetCredential(destinationUrl),
+        destinationId,
+      ],
     );
     // Remain in CONNECTING until actual output delivery is verified.
     // A live FFmpeg PID or progress heartbeat alone is insufficient.
@@ -2131,6 +2145,7 @@ function createStreamTargetManager({
   }
 
   async function startTarget(target, channel, organizationId, options = {}) {
+    target = decryptTargetCredentials(target);
     if (!target.enabled)
       return { ok: false, message: "This stream target is disabled" };
     const existingRuntimeState = processStates.get(Number(target.id));
@@ -2310,7 +2325,12 @@ function createStreamTargetManager({
            last_error = NULL,
            updated_at = now()
        WHERE id = $4`,
-      [platformBroadcastId, platformStreamId, destinationUrl, target.id],
+      [
+        platformBroadcastId,
+        platformStreamId,
+        encryptTargetCredential(destinationUrl),
+        target.id,
+      ],
     );
 
     return spawnPush(target, channel, destinationUrl, {
@@ -2763,6 +2783,8 @@ function createStreamTargetManager({
     if (!hasRemoteStreamTargetExecutor())
       return { adopted: false, definitive: true };
 
+    target = decryptTargetCredentials(target);
+
     const destinationId = Number(target.id);
     const channelId = Number(target.channel_id);
     if (!Number.isInteger(destinationId) || destinationId <= 0) {
@@ -2835,7 +2857,8 @@ function createStreamTargetManager({
       pid: runtime.pid,
       channelId,
       channelStreamKey: target.channel_stream_key,
-      destinationUrl: target.active_destination_url || null,
+      destinationUrl:
+        decryptTargetCredential(target.active_destination_url) || null,
       targetType,
       protocol,
       sourceMode: preferredSource.mode,

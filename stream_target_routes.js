@@ -5,6 +5,11 @@ const {
   createStreamTargetManager,
   TARGET_TYPES,
 } = require("./stream_target_service");
+const {
+  encryptTargetCredential,
+  decryptTargetCredentials,
+  targetCredentialLookupHash,
+} = require("./stream_target_schema");
 
 function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null);
@@ -39,10 +44,19 @@ function normalizeTargetRequestBody(body = {}) {
 function sanitizeTarget(row, runtimeState = null) {
   if (!row) return row;
   const merged = { ...row, ...(runtimeState || {}) };
-  // Do not echo active OAuth ingest URLs back to the browser; they contain
-  // per-broadcast credentials. Manual stream_key remains available because the
-  // existing UI already manages it and admins need to edit it.
-  if (merged.automation_mode === "oauth") merged.active_destination_url = null;
+
+  // Phase 5A.4b: Stream Target credentials are write-only through the API.
+  // The UI can tell whether a value is configured without receiving the secret.
+  merged.destination_url_configured = Boolean(merged.destination_url);
+  merged.stream_key_configured = Boolean(merged.stream_key);
+  merged.active_destination_url_configured = Boolean(
+    merged.active_destination_url,
+  );
+  merged.destination_url = null;
+  merged.stream_key = null;
+  merged.active_destination_url = null;
+  delete merged.stream_key_lookup_hash;
+  delete merged.credential_encryption_version;
   const runtimeUptime = Number(runtimeState?.uptime_seconds);
   const startedAt = merged.started_at
     ? new Date(merged.started_at).getTime()
@@ -90,7 +104,7 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
       `SELECT * FROM social_destinations WHERE id = $1 AND channel_id = $2`,
       [id, channelId],
     );
-    return result.rows[0] || null;
+    return result.rows[0] ? decryptTargetCredentials(result.rows[0]) : null;
   }
 
   async function validateOAuthPlatformMatch(
@@ -294,11 +308,13 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           [
             channel.id,
             internalPlatform,
-            body.stream_key ||
-              (automationMode === "oauth" ? "oauth-managed" : null),
+            encryptTargetCredential(
+              body.stream_key ||
+                (automationMode === "oauth" ? "oauth-managed" : null),
+            ),
             body.name || config.label,
             targetType,
-            body.destination_url || null,
+            encryptTargetCredential(body.destination_url || null),
             protocol,
             automationMode,
             body.enabled !== false,
@@ -323,10 +339,12 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           [
             channel.id,
             internalPlatform,
-            body.stream_key || (protocol === "srt" ? "url-managed" : null),
+            encryptTargetCredential(
+              body.stream_key || (protocol === "srt" ? "url-managed" : null),
+            ),
             body.name || config.label,
             targetType,
-            body.destination_url || null,
+            encryptTargetCredential(body.destination_url || null),
             protocol,
             body.enabled !== false,
             Boolean(body.auto_start),
@@ -334,10 +352,22 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           ],
         );
       }
+      const createdRow = result.rows[0];
+      const createdPlaintext = decryptTargetCredentials(createdRow);
+      await pool.query(
+        `UPDATE social_destinations
+         SET stream_key_lookup_hash=$1, credential_encryption_version=1
+         WHERE id=$2`,
+        [
+          targetCredentialLookupHash(createdPlaintext.stream_key),
+          createdRow.id,
+        ],
+      );
+
       res.json({
         ok: true,
-        target: sanitizeTarget(result.rows[0]),
-        destination: sanitizeTarget(result.rows[0]),
+        target: sanitizeTarget(createdRow),
+        destination: sanitizeTarget(createdRow),
       });
     } catch (error) {
       console.error("Create Stream Target Error:", error);
@@ -432,18 +462,20 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
         const result = await pool.query(
           `UPDATE social_destinations
          SET name=$1, target_type=$2, destination_url=$3, stream_key=$4,
-             protocol=$5, enabled=$6, auto_start=$7, auto_reconnect=$8, updated_at=now()
-         WHERE id=$9 AND channel_id=$10
+             protocol=$5, enabled=$6, auto_start=$7, auto_reconnect=$8,
+             stream_key_lookup_hash=$9, credential_encryption_version=1, updated_at=now()
+         WHERE id=$10 AND channel_id=$11
          RETURNING *`,
           [
             next.name,
             targetType,
-            next.destination_url || null,
-            next.stream_key || null,
+            encryptTargetCredential(next.destination_url || null),
+            encryptTargetCredential(next.stream_key || null),
             protocol,
             next.enabled,
             next.auto_start,
             next.auto_reconnect,
+            targetCredentialLookupHash(next.stream_key),
             existing.id,
             channel.id,
           ],

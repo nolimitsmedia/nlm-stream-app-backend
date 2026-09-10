@@ -91,7 +91,11 @@ const {
   encryptOAuthToken,
   decryptOAuthAccount,
 } = require("./social_oauth_schema");
-const { ensureStreamTargetColumns } = require("./stream_target_schema");
+const {
+  ensureStreamTargetColumns,
+  decryptTargetCredentials,
+  targetCredentialLookupHash,
+} = require("./stream_target_schema");
 const registerStreamTargetRoutes = require("./stream_target_routes");
 const {
   ensurePullSourceTables,
@@ -179,6 +183,12 @@ const INTERNAL_TARGET_TRUSTED_RTMPS_HOST = String(
 const INTERNAL_TARGET_TRUSTED_RTMPS_PORT = String(
   process.env.INTERNAL_TARGET_TRUSTED_RTMPS_PORT || "1936",
 ).trim();
+
+const streamLogId = (streamKey) => {
+  const value = String(streamKey || "");
+  if (!value) return "[none]";
+  return `[key:${crypto.createHash("sha256").update(value).digest("hex").slice(0, 10)}]`;
+};
 
 const isAllowedInternalTargetDestination = (destinationUrl, protocol) => {
   try {
@@ -11571,7 +11581,7 @@ async function finalizeCanonicalStreamEnd(
     autoSyncRecordingsDelayed(orgId, 8000, endedChannelId, streamKey);
   }
 
-  console.log(`[SRS] Stream offline: ${streamKey} (${reason})`);
+  console.log(`[SRS] Stream offline: ${streamLogId(streamKey)} (${reason})`);
 
   return {
     channelId: endedChannelId || null,
@@ -11697,7 +11707,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
   const streamKey = req.body?.stream || req.body?.name || "";
   const publishApp = req.body?.app || "";
   console.log(
-    `[SRS] on_publish — app: ${publishApp}, stream key: ${streamKey}`,
+    `[SRS] on_publish — app: ${publishApp}, stream=${streamLogId(streamKey)}`,
   );
 
   // Skip transcoded variant streams (they re-publish to SRS too) — this
@@ -11731,7 +11741,10 @@ app.post("/api/srs/on_publish", async (req, res) => {
         FROM social_destinations sd
         JOIN channels c ON c.id = sd.channel_id
         JOIN organizations o ON o.id = c.organization_id
-        WHERE sd.stream_key = $1
+        WHERE (
+            sd.stream_key_lookup_hash = $1
+            OR sd.stream_key = $2
+          )
           AND sd.enabled = TRUE
           AND c.is_active = TRUE
           AND o.is_active = TRUE
@@ -11739,32 +11752,43 @@ app.post("/api/srs/on_publish", async (req, res) => {
         ORDER BY sd.id DESC
         LIMIT 10
         `,
-        [streamKey],
+        [targetCredentialLookupHash(streamKey), streamKey],
       );
 
-      const internalTarget = internalTargetResult.rows.find((target) =>
-        isAllowedInternalTargetDestination(
-          target.destination_url,
-          target.protocol,
-        ),
-      );
+      const internalTarget = internalTargetResult.rows
+        .map((target) => {
+          try {
+            return decryptTargetCredentials(target);
+          } catch {
+            return null;
+          }
+        })
+        .find(
+          (target) =>
+            target &&
+            target.stream_key === streamKey &&
+            isAllowedInternalTargetDestination(
+              target.destination_url,
+              target.protocol,
+            ),
+        );
 
       if (!internalTarget) {
         console.warn(
-          `[SRS] REJECTED internal target — unknown, disabled, or untrusted receiver: ${streamKey}`,
+          `[SRS] REJECTED internal target — unknown, disabled, or untrusted receiver: ${streamLogId(streamKey)}`,
         );
         return res.json({ code: 403 });
       }
 
       console.log(
-        `[SRS] INTERNAL TARGET ALLOWED — ${streamKey} ` +
+        `[SRS] INTERNAL TARGET ALLOWED — ${streamLogId(streamKey)} ` +
           `(target: ${internalTarget.id}, org: ${internalTarget.org_name})`,
       );
 
       return res.json({ code: 0 });
     } catch (err) {
       console.error(
-        `[SRS] Internal target validation failed for ${streamKey}:`,
+        `[SRS] Internal target validation failed for ${streamLogId(streamKey)}:`,
         err.message,
       );
       return res.json({ code: 403 });
@@ -11803,7 +11827,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
 
     if (!channelResult.rows[0]) {
       console.warn(
-        `[SRS] REJECTED — Unknown or inactive stream key: ${streamKey}`,
+        `[SRS] REJECTED — Unknown or inactive stream key: ${streamLogId(streamKey)}`,
       );
       return res.json({ code: 403 }); // SRS will kick the connection
     }
@@ -11867,7 +11891,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
     // OAuth targets, generic RTMP/RTMPS/SRT targets, reconnects, and metrics.
     if (recoveredFromSourceHandoff) {
       console.log(
-        `[STREAM-TARGET-HANDOFF] Skipping fresh target auto-start for ${streamKey}; ` +
+        `[STREAM-TARGET-HANDOFF] Skipping fresh target auto-start for ${streamLogId(streamKey)}; ` +
           `existing targets will reconnect to their preserved destination sessions.`,
       );
     } else {
@@ -11894,7 +11918,9 @@ app.post("/api/srs/on_publish", async (req, res) => {
       });
     }
 
-    console.log(`[SRS] ALLOWED — ${streamKey} (org: ${channel.org_name})`);
+    console.log(
+      `[SRS] ALLOWED — ${streamLogId(streamKey)} (org: ${channel.org_name})`,
+    );
     res.json({ code: 0 });
   } catch (err) {
     console.error("[SRS] on_publish error:", err.message);
@@ -11911,7 +11937,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
   const streamKey = req.body?.stream || req.body?.name || "";
   const publishApp = req.body?.app || "";
   console.log(
-    `[SRS] on_unpublish — app: ${publishApp}, stream key: ${streamKey}`,
+    `[SRS] on_unpublish — app: ${publishApp}, stream=${streamLogId(streamKey)}`,
   );
 
   if (isAbrRenditionStreamKey(streamKey)) {
@@ -11921,7 +11947,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
   // Internal receiver targets are outputs, not source channels. Their FFmpeg
   // lifecycle/status is owned by streamTargetManager.
   if (publishApp === "internal-target") {
-    console.log(`[SRS] INTERNAL TARGET OFFLINE — ${streamKey}`);
+    console.log(`[SRS] INTERNAL TARGET OFFLINE — ${streamLogId(streamKey)}`);
     return res.json({ code: 0 });
   }
 
@@ -11987,7 +12013,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     );
 
     console.log(
-      `[SRS-HA-CLASSIFY] stream=${streamKey} ` +
+      `[SRS-HA-CLASSIFY] stream=${streamLogId(streamKey)} ` +
         `channel=${channel?.id ?? "null"} ` +
         `channelIsLive=${Boolean(channel?.is_live)} ` +
         `haEnabled=${Boolean(handoff.enabled)} ` +
@@ -12003,7 +12029,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
 
     if (preserveForHandoff && channel?.id) {
       console.log(
-        `[SRS-HA] Preserving logical live/DVR session for ${streamKey}; ` +
+        `[SRS-HA] Preserving logical live/DVR session for ${streamLogId(streamKey)}; ` +
           `${
             stabilizing
               ? "HA stabilization guard is active."
@@ -12050,7 +12076,9 @@ app.post("/api/srs/on_play", async (req, res) => {
   const ip = req.body?.ip || req.ip || "";
 
   // Optional: log viewer for analytics
-  console.log(`[SRS] on_play — stream: ${streamKey}, client: ${clientId}`);
+  console.log(
+    `[SRS] on_play — stream=${streamLogId(streamKey)}, client=${clientId}`,
+  );
 
   res.json({ code: 0 }); // Always allow (HLS token auth can add restriction here later)
 });
@@ -12061,7 +12089,7 @@ app.post("/api/srs/on_play", async (req, res) => {
 // ══════════════════════════════════════════
 app.post("/api/srs/on_stop", async (req, res) => {
   const streamKey = req.body?.stream || req.body?.name || "";
-  console.log(`[SRS] on_stop — stream: ${streamKey}`);
+  console.log(`[SRS] on_stop — stream=${streamLogId(streamKey)}`);
   res.json({ code: 0 });
 });
 
