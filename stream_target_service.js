@@ -640,6 +640,7 @@ function createStreamTargetManager({
   const processStates = new Map();
   let recoverySweepTimer = null;
   let recoverySweepRunning = false;
+  let reconcileRetryTimer = null;
 
   async function isSrsStreamLive(streamKey) {
     try {
@@ -1286,6 +1287,10 @@ function createStreamTargetManager({
       deliveryVerified: runtime.delivery_verified === true,
       deliveryVerifiedAt: runtime.delivery_verified_at || null,
       healthy: runtime.healthy === true,
+      targetId:
+        Number(runtime.target_id || runtime.job?.target_id || 0) || null,
+      channelId:
+        Number(runtime.channel_id || runtime.job?.channel_id || 0) || null,
       error: runtime.error || runtime.last_error || runtime.job?.error || null,
     };
   }
@@ -2739,11 +2744,223 @@ function createStreamTargetManager({
     initialSweep.unref?.();
   }
 
-  async function reconcileDatabaseState() {
-    // PIDs from a prior Node process cannot be trusted as ownership state.
-    // Preserve recovery intent for targets that were active when the backend
-    // disappeared: auto_reconnect means an infrastructure interruption should
-    // become RECONNECTING, not an operator-style STOPPED state.
+  function scheduleReconcileRetry() {
+    if (reconcileRetryTimer) return;
+    reconcileRetryTimer = setTimeout(() => {
+      reconcileRetryTimer = null;
+      reconcileDatabaseState().catch((error) => {
+        console.error(
+          "[STREAM-TARGET-ADOPTION] Deferred reconciliation failed:",
+          error.message,
+        );
+        scheduleReconcileRetry();
+      });
+    }, 5000);
+    reconcileRetryTimer.unref?.();
+  }
+
+  async function adoptRemoteTarget(target) {
+    if (!hasRemoteStreamTargetExecutor())
+      return { adopted: false, definitive: true };
+
+    const destinationId = Number(target.id);
+    const channelId = Number(target.channel_id);
+    if (!Number.isInteger(destinationId) || destinationId <= 0) {
+      return { adopted: false, definitive: true };
+    }
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      return { adopted: false, definitive: true };
+    }
+
+    let response;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        response = await streamTargetExecutor.status({
+          targetId: destinationId,
+          channelId,
+        });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) await sleep(500);
+      }
+    }
+
+    if (lastError) {
+      console.warn(
+        `[STREAM-TARGET-ADOPTION] Status unavailable for #${destinationId}; preserving DB ownership and retrying reconciliation: ${lastError.message}`,
+      );
+      return { adopted: false, definitive: false };
+    }
+
+    const runtime = normalizeRemoteRuntime(response);
+
+    // The Agent endpoint is target-specific and the server-side executor validates
+    // the target/channel mapping before contacting it. If the Agent also returns
+    // identity fields, require an exact match as an additional ownership guard.
+    if (runtime.targetId != null && runtime.targetId !== destinationId) {
+      console.warn(
+        `[STREAM-TARGET-ADOPTION] Refusing #${destinationId}: Agent reported target #${runtime.targetId}.`,
+      );
+      return { adopted: false, definitive: true };
+    }
+    if (runtime.channelId != null && runtime.channelId !== channelId) {
+      console.warn(
+        `[STREAM-TARGET-ADOPTION] Refusing #${destinationId}: Agent reported a different channel.`,
+      );
+      return { adopted: false, definitive: true };
+    }
+
+    if (!runtime.found || !runtime.active || !runtime.processAlive) {
+      return { adopted: false, definitive: true };
+    }
+
+    const targetType = normalizeTargetType(
+      target.target_type || target.platform,
+    );
+    const protocol = normalizeProtocol(target.protocol, targetType);
+    const preferredSource = getHandoffSafePreferredSource(
+      target.channel_stream_key,
+      target.source_mode || STREAM_TARGET_SOURCE_MODE,
+      protocol,
+    );
+
+    const state = {
+      destinationId,
+      remote: true,
+      remoteActive: true,
+      proc: null,
+      pid: runtime.pid,
+      channelId,
+      channelStreamKey: target.channel_stream_key,
+      destinationUrl: target.active_destination_url || null,
+      targetType,
+      protocol,
+      sourceMode: preferredSource.mode,
+      sourceUrl: null,
+      currentBitrateKbps: runtime.bitrateKbps,
+      droppedFrames: runtime.droppedFrames,
+      reconnectCount: safeNumber(target.reconnect_count),
+      retryAttempt: 0,
+      nextRetryAt: null,
+      maxReconnectAttempts: STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
+      sourceHlsFault: false,
+      intentionalStop: false,
+      failureCode: null,
+      failureCategory: null,
+      failureScope: null,
+      failureRetryable: true,
+      lastFailureAt: null,
+      preflight: null,
+      outputBytes: runtime.outputBytes,
+      outputTimeMs: runtime.outputTimeMs,
+      outputFrames: runtime.outputFrames,
+      stderr: "",
+      deliveryVerified: runtime.deliveryVerified,
+      deliveryVerifiedAt: runtime.deliveryVerifiedAt
+        ? new Date(runtime.deliveryVerifiedAt).getTime()
+        : null,
+      deliveryVerifyTimer: null,
+      metricsTimer: null,
+      reconnectTimer: null,
+      remoteStatusTimer: null,
+      recoveryInProgress: false,
+      startedAt: target.started_at
+        ? new Date(target.started_at).getTime()
+        : Date.now(),
+      status: runtime.deliveryVerified ? "streaming" : "connecting",
+    };
+
+    processStates.set(destinationId, state);
+
+    await pool.query(
+      `UPDATE social_destinations
+       SET is_running=true,
+           ffmpeg_pid=$1,
+           status=$2,
+           current_bitrate_kbps=$3,
+           dropped_frames=$4,
+           last_error=NULL,
+           last_connected_at=COALESCE(last_connected_at, NOW()),
+           updated_at=NOW()
+       WHERE id=$5 AND channel_id=$6`,
+      [
+        runtime.pid,
+        state.status,
+        runtime.bitrateKbps,
+        runtime.droppedFrames,
+        destinationId,
+        channelId,
+      ],
+    );
+
+    // A surviving but not-yet-verified worker still gets a bounded delivery
+    // verification window after control-plane adoption. This prevents an
+    // indefinitely stuck CONNECTING state after a backend restart.
+    if (!runtime.deliveryVerified) {
+      state.deliveryVerifyTimer = setTimeout(async () => {
+        if (
+          state.intentionalStop ||
+          !state.remoteActive ||
+          state.deliveryVerified
+        ) {
+          return;
+        }
+
+        state.lastError =
+          "Destination delivery could not be verified after backend restart.";
+        state.failureCode = "delivery_not_verified_after_adoption";
+        state.failureCategory = "delivery";
+        state.failureScope = "destination";
+        state.failureRetryable = true;
+        state.lastFailureAt = Date.now();
+
+        try {
+          await streamTargetExecutor.stop({
+            targetId: destinationId,
+            channelId,
+          });
+        } catch (error) {
+          console.warn(
+            `[STREAM-TARGET-ADOPTION] Stop after verification timeout failed for #${destinationId}:`,
+            error?.message || error,
+          );
+        }
+
+        await markRemoteTargetLost(
+          target,
+          { id: channelId, stream_key: target.channel_stream_key },
+          state,
+          { error: state.lastError },
+        ).catch((error) => {
+          console.error(
+            `[STREAM-TARGET-ADOPTION] Timeout reconciliation failed for #${destinationId}:`,
+            error.message,
+          );
+        });
+      }, STREAM_TARGET_DELIVERY_VERIFY_TIMEOUT_MS);
+      state.deliveryVerifyTimer.unref?.();
+    }
+
+    scheduleRemoteStatusPoll(
+      target,
+      {
+        id: channelId,
+        name: target.channel_name,
+        stream_key: target.channel_stream_key,
+      },
+      state,
+    );
+
+    console.log(
+      `[STREAM-TARGET-ADOPTION] Adopted surviving Media Node worker for target #${destinationId} (${state.status}).`,
+    );
+    return { adopted: true, definitive: true };
+  }
+
+  async function resetUnownedTargetAfterRestart(target) {
     await pool.query(
       `UPDATE social_destinations
        SET is_running = false,
@@ -2766,10 +2983,55 @@ function createStreamTargetManager({
              ELSE last_error
            END,
            updated_at = NOW()
-       WHERE is_running = true
-          OR ffmpeg_pid IS NOT NULL
-          OR status IN ('connecting', 'reconnecting')`,
+       WHERE id=$1`,
+      [Number(target.id)],
     );
+  }
+
+  async function reconcileDatabaseState() {
+    const candidates = await pool.query(
+      `SELECT sd.*, c.stream_key AS channel_stream_key,
+              c.name AS channel_name, c.organization_id
+       FROM social_destinations sd
+       JOIN channels c ON c.id = sd.channel_id
+       WHERE sd.is_running = true
+          OR sd.ffmpeg_pid IS NOT NULL
+          OR sd.status IN ('connecting', 'reconnecting')
+       ORDER BY sd.id ASC`,
+    );
+
+    // With Media Node execution enabled, the Agent owns persistent target
+    // workers. Ask the authoritative Agent before clearing DB ownership. This
+    // is the key backend-restart adoption path and prevents duplicate FFmpeg
+    // publishers / duplicate platform sessions.
+    if (hasRemoteStreamTargetExecutor()) {
+      let deferred = false;
+
+      for (const target of candidates.rows) {
+        const result = await adoptRemoteTarget(target);
+        if (result.adopted) continue;
+
+        if (!result.definitive) {
+          // A temporary Agent/control-plane failure is not proof that the worker
+          // died. Preserve the row and retry reconciliation instead of spawning
+          // a potentially duplicate publisher.
+          deferred = true;
+          continue;
+        }
+
+        await resetUnownedTargetAfterRestart(target);
+      }
+
+      if (deferred) scheduleReconcileRetry();
+      ensureRecoverySweep();
+      return;
+    }
+
+    // Local execution cannot adopt child processes across a Node.js restart;
+    // retain the existing reconciliation semantics for that mode.
+    for (const target of candidates.rows) {
+      await resetUnownedTargetAfterRestart(target);
+    }
 
     ensureRecoverySweep();
   }
