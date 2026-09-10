@@ -8341,7 +8341,7 @@ const getPublicWatchStatus = async (streamKey) => {
       }
     } catch (readinessError) {
       console.debug(
-        `[WATCH-STATUS] ABR readiness check failed for ${streamKey}:`,
+        `[WATCH-STATUS] ABR readiness check failed for ${streamLogId(streamKey)}:`,
         readinessError.message,
       );
     }
@@ -10277,7 +10277,7 @@ const cleanupUnrecordedFilesForChannel = async (streamKey) => {
     }
   } catch (err) {
     console.error(
-      `[RECORDING-GATE] Per-channel cleanup failed for ${streamKey}:`,
+      `[RECORDING-GATE] Per-channel cleanup failed for ${streamLogId(streamKey)}:`,
       err.message,
     );
   }
@@ -11661,7 +11661,7 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
 
         if (elapsedMs < STREAM_TARGET_HANDOFF_MAX_MS) {
           console.error(
-            `[STREAM-TARGET-HANDOFF] Recovery check failed for ${streamKey}; ` +
+            `[STREAM-TARGET-HANDOFF] Recovery check failed for ${streamLogId(streamKey)}; ` +
               `retrying without ending targets:`,
             err.message,
           );
@@ -11681,7 +11681,7 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
           stopTargets: true,
         }).catch((finalizeErr) =>
           console.error(
-            `[STREAM-TARGET-HANDOFF] Deferred real-end finalization failed for ${streamKey}:`,
+            `[STREAM-TARGET-HANDOFF] Deferred real-end finalization failed for ${streamLogId(streamKey)}:`,
             finalizeErr.message,
           ),
         );
