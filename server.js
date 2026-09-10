@@ -190,6 +190,13 @@ const streamLogId = (streamKey) => {
   return `[key:${crypto.createHash("sha256").update(value).digest("hex").slice(0, 10)}]`;
 };
 
+const redactStreamKeyFromText = (value, streamKey) => {
+  const text = String(value ?? "");
+  const key = String(streamKey || "");
+  if (!key) return text;
+  return text.split(key).join(streamLogId(key));
+};
+
 const isAllowedInternalTargetDestination = (destinationUrl, protocol) => {
   try {
     const parsed = new URL(String(destinationUrl || "").trim());
@@ -8137,7 +8144,7 @@ const getPublicWatchStatus = async (streamKey) => {
     }
   } catch (srsErr) {
     console.debug(
-      `[WATCH-STATUS] Unable to verify SRS state for ${streamKey}:`,
+      `[WATCH-STATUS] Unable to verify SRS state for ${streamLogId(streamKey)}:`,
       srsErr.message,
     );
   }
@@ -8165,7 +8172,7 @@ const getPublicWatchStatus = async (streamKey) => {
         )
         .catch((error) =>
           console.debug(
-            `[WATCH-STATUS] Failed to repair live DB state for ${streamKey}:`,
+            `[WATCH-STATUS] Failed to repair live DB state for ${streamLogId(streamKey)}:`,
             error.message,
           ),
         );
@@ -8192,7 +8199,7 @@ const getPublicWatchStatus = async (streamKey) => {
             isStreamHandoffStabilizing(streamKey));
       } catch (handoffError) {
         console.debug(
-          `[WATCH-STATUS] Could not inspect Pull Source HA state for ${streamKey}:`,
+          `[WATCH-STATUS] Could not inspect Pull Source HA state for ${streamLogId(streamKey)}:`,
           handoffError.message,
         );
       }
@@ -8217,7 +8224,7 @@ const getPublicWatchStatus = async (streamKey) => {
       };
 
       console.debug(
-        `[WATCH-STATUS] Preserving live state for ${streamKey}; Pull Source HA recovery is active.`,
+        `[WATCH-STATUS] Preserving live state for ${streamLogId(streamKey)}; Pull Source HA recovery is active.`,
       );
     } else if (channelState?.is_live) {
       // SRS is reachable, the canonical publisher is genuinely absent, and no
@@ -8231,7 +8238,7 @@ const getPublicWatchStatus = async (streamKey) => {
         )
         .catch((error) =>
           console.debug(
-            `[WATCH-STATUS] Failed to clear stale DB state for ${streamKey}:`,
+            `[WATCH-STATUS] Failed to clear stale DB state for ${streamLogId(streamKey)}:`,
             error.message,
           ),
         );
@@ -9166,7 +9173,10 @@ const createFfmpegLogFile = (label, streamKey) => {
   try {
     fs.mkdirSync(FFMPEG_CRASH_LOG_DIR, { recursive: true });
     const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const safeStreamKey = String(streamKey).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const safeStreamKey = streamLogId(streamKey).replace(
+      /[^a-zA-Z0-9_-]/g,
+      "_",
+    );
     const filePath = path.join(
       FFMPEG_CRASH_LOG_DIR,
       `${safeLabel}-${safeStreamKey}-${Date.now()}.log`,
@@ -9174,7 +9184,7 @@ const createFfmpegLogFile = (label, streamKey) => {
     return { filePath, stream: fs.createWriteStream(filePath, { flags: "a" }) };
   } catch (err) {
     console.error(
-      `[FFMPEG-LOG] Unable to create log file for ${label}/${streamKey}:`,
+      `[FFMPEG-LOG] Unable to create log file for ${label}/${streamLogId(streamKey)}:`,
       err.message,
     );
     return { filePath: null, stream: null };
@@ -9333,7 +9343,7 @@ async function watchRenditionStartupOrKill(
     );
     if (activeNow) {
       console.log(
-        `[Transcode] ${label} confirmed publishing for ${streamKey}; watchdog standing down.`,
+        `[Transcode] ${label} confirmed publishing for ${streamLogId(streamKey)}; watchdog standing down.`,
       );
       return;
     }
@@ -9344,14 +9354,14 @@ async function watchRenditionStartupOrKill(
   if (proc.exitCode !== null || proc.killed) return;
 
   console.warn(
-    `[Transcode] ${label} for ${streamKey} produced no publish within ${RENDITION_STARTUP_WATCHDOG_MS}ms of spawning (pid ${proc.pid}) — treating as hung and killing it so the reconciler can retry.`,
+    `[Transcode] ${label} for ${streamLogId(streamKey)} produced no publish within ${RENDITION_STARTUP_WATCHDOG_MS}ms of spawning (pid ${proc.pid}) — treating as hung and killing it so the reconciler can retry.`,
   );
   activeTranscodeProcesses.delete(retryKey);
   proc.kill("SIGTERM");
   const forceKillTimer = setTimeout(() => {
     if (proc.exitCode === null) {
       console.warn(
-        `[Transcode] Force-killing ${retryKey} after watchdog SIGTERM timeout.`,
+        `[Transcode] Force-killing ${streamLogId(streamKey)}/${label} after watchdog SIGTERM timeout.`,
       );
       proc.kill("SIGKILL");
     }
@@ -9372,7 +9382,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
   const startupGeneration = transcodeStartupLocks.get(retryKey);
   if (startupGeneration === generation) {
     console.debug(
-      `[Transcode] ${label} startup already in progress for ${streamKey}; skipping duplicate request.`,
+      `[Transcode] ${label} startup already in progress for ${streamLogId(streamKey)}; skipping duplicate request.`,
     );
     return;
   }
@@ -9384,7 +9394,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     !existingProcess.killed
   ) {
     console.debug(
-      `[Transcode] ${label} is already running for ${streamKey}; skipping duplicate startup.`,
+      `[Transcode] ${label} is already running for ${streamLogId(streamKey)}; skipping duplicate startup.`,
     );
     return;
   }
@@ -9395,7 +9405,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     // Abandon delayed work from an older OBS/broadcast session.
     if (bitrateCapGeneration.get(streamKey) !== generation) {
       console.log(
-        `[Transcode] Skipping superseded ${label} session for ${streamKey} (a newer broadcast session has since started).`,
+        `[Transcode] Skipping superseded ${label} session for ${streamLogId(streamKey)} (a newer broadcast session has since started).`,
       );
       return;
     }
@@ -9407,7 +9417,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         // try again while the raw publisher remains live, so do not place a
         // transient condition in the Super Admin Recent Errors panel.
         console.warn(
-          `[Transcode] ${label} startup deferred for ${streamKey}: raw SRS source is not ready yet — ${readiness.reason}`,
+          `[Transcode] ${label} startup deferred for ${streamLogId(streamKey)}: raw SRS source is not ready yet — ${readiness.reason}`,
         );
       }
       return;
@@ -9422,14 +9432,14 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       !processAfterReadiness.killed
     ) {
       console.debug(
-        `[Transcode] ${label} became active for ${streamKey} while readiness was being checked; skipping duplicate spawn.`,
+        `[Transcode] ${label} became active for ${streamLogId(streamKey)} while readiness was being checked; skipping duplicate spawn.`,
       );
       return;
     }
 
     if (isServerLoadTooHighForNewTranscode()) {
       console.warn(
-        `[Transcode] Server load too high — deferring ${label} for ${streamKey}.`,
+        `[Transcode] Server load too high — deferring ${label} for ${streamLogId(streamKey)}.`,
       );
       return;
     }
@@ -9438,7 +9448,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     // waitForSrsRawStreamReady() succeeds but before FFmpeg is spawned.
     const sourceStillLive = await getSrsRawStream(streamKey).catch((err) => {
       console.warn(
-        `[Transcode] Final SRS source check failed for ${label}/${streamKey}:`,
+        `[Transcode] Final SRS source check failed for ${label}/${streamLogId(streamKey)}:`,
         err.message,
       );
       return null;
@@ -9449,7 +9459,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       bitrateCapGeneration.get(streamKey) !== generation
     ) {
       console.warn(
-        `[Transcode] Aborting ${label} startup for ${streamKey}: source disappeared or broadcast was superseded before FFmpeg spawn.`,
+        `[Transcode] Aborting ${label} startup for ${streamLogId(streamKey)}: source disappeared or broadcast was superseded before FFmpeg spawn.`,
       );
       return;
     }
@@ -9471,7 +9481,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       !processBeforeSpawn.killed
     ) {
       console.debug(
-        `[Transcode] ${label} is already active for ${streamKey}; cancelling duplicate FFmpeg spawn.`,
+        `[Transcode] ${label} is already active for ${streamLogId(streamKey)}; cancelling duplicate FFmpeg spawn.`,
       );
       return;
     }
@@ -9483,8 +9493,8 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         : "";
 
     console.log(
-      `[Transcode] Spawning ${label} for ${streamKey} with media input ` +
-        `${JSON.stringify(configuredInput)}.`,
+      `[Transcode] Spawning ${label} for ${streamLogId(streamKey)} with media input ` +
+        `${JSON.stringify(redactStreamKeyFromText(configuredInput, streamKey))}.`,
     );
 
     const proc = spawn("ffmpeg", args, {
@@ -9508,7 +9518,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       generation,
     ).catch((err) =>
       console.error(
-        `[Transcode] Startup watchdog failed for ${retryKey}:`,
+        `[Transcode] Startup watchdog failed for ${streamLogId(streamKey)}/${label}:`,
         err.message,
       ),
     );
@@ -9524,23 +9534,24 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     let stderrTail = "";
     proc.stderr.on("data", (chunk) => {
       const chunkText = chunk.toString();
+      const safeChunkText = redactStreamKeyFromText(chunkText, streamKey);
       if (ffmpegLogStream && !ffmpegLogStream.destroyed) {
-        ffmpegLogStream.write(chunkText);
+        ffmpegLogStream.write(safeChunkText);
       }
-      stderrTail += chunkText;
+      stderrTail += safeChunkText;
       if (stderrTail.length > 50000) stderrTail = stderrTail.slice(-50000);
     });
 
     proc.stderr.on("error", (err) => {
       console.error(
-        `[FFMPEG-LOG] stderr read failed for ${label}/${streamKey}:`,
+        `[FFMPEG-LOG] stderr read failed for ${label}/${streamLogId(streamKey)}:`,
         err.message,
       );
     });
 
     proc.on("error", (err) => {
       console.error(
-        `[Transcode] ${label} failed to spawn for ${streamKey}:`,
+        `[Transcode] ${label} failed to spawn for ${streamLogId(streamKey)}:`,
         err.message,
       );
     });
@@ -9572,13 +9583,13 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         !replacementProcess.killed
       ) {
         console.debug(
-          `[Transcode] ${label} replacement is already running for ${streamKey}; suppressing stale retry.`,
+          `[Transcode] ${label} replacement is already running for ${streamLogId(streamKey)}; suppressing stale retry.`,
         );
         return;
       }
 
       console.warn(
-        `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamKey} — evaluating retry` +
+        `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamLogId(streamKey)} — evaluating retry` +
           (ffmpegLogPath ? ` (full stderr written to ${ffmpegLogPath})` : "") +
           `\n--- ffmpeg stderr (last ~1500 chars) ---\n${stderrTail.slice(-1500)}`,
       );
@@ -9593,7 +9604,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         if (!readinessForRetry.ready) {
           if (!readinessForRetry.superseded) {
             console.warn(
-              `[Transcode] Not retrying ${label} for ${streamKey}: raw source unavailable in SRS — ${readinessForRetry.reason}`,
+              `[Transcode] Not retrying ${label} for ${streamLogId(streamKey)}: raw source unavailable in SRS — ${readinessForRetry.reason}`,
             );
           }
           return;
@@ -9606,7 +9617,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
           !processBeforeRetry.killed
         ) {
           console.debug(
-            `[Transcode] ${label} recovered through another path for ${streamKey}; retry cancelled.`,
+            `[Transcode] ${label} recovered through another path for ${streamLogId(streamKey)}; retry cancelled.`,
           );
           return;
         }
@@ -9616,10 +9627,10 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
 
         if (attempts > MAX_TRANSCODE_RETRIES) {
           console.error(
-            `[Transcode] Giving up on ${label} for ${streamKey} after ${attempts} failed attempts — the ABR reconciler will continue periodic recovery checks.`,
+            `[Transcode] Giving up on ${label} for ${streamLogId(streamKey)} after ${attempts} failed attempts — the ABR reconciler will continue periodic recovery checks.`,
           );
           notifySlack(`ffmpeg gave up on ABR transcode (${label})`, {
-            streamKey,
+            stream_id: streamLogId(streamKey),
             label,
             attempts,
             timestamp: new Date().toISOString(),
@@ -9628,7 +9639,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         }
 
         console.warn(
-          `[Transcode] ${label} ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_TRANSCODE_RETRIES}) for ${streamKey}`,
+          `[Transcode] ${label} ended unexpectedly while source is still live — retrying (attempt ${attempts}/${MAX_TRANSCODE_RETRIES}) for ${streamLogId(streamKey)}`,
         );
 
         const retryTimer = setTimeout(
@@ -9638,7 +9649,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         retryTimer.unref?.();
       } catch (err) {
         console.error(
-          `[Transcode] Failed readiness check for ${streamKey} before retrying ${label}:`,
+          `[Transcode] Failed readiness check for ${streamLogId(streamKey)} before retrying ${label}:`,
           err.message,
         );
       }
@@ -11506,7 +11517,7 @@ async function finalizeCanonicalStreamEnd(
 
     if (proc && proc.exitCode === null) {
       console.log(
-        `[Transcode] Stopping ${key} because raw source ${streamKey} ended (${reason}).`,
+        `[Transcode] Stopping ${streamLogId(streamKey)}/${key.slice(String(streamKey).length + 1)} because raw source ${streamLogId(streamKey)} ended (${reason}).`,
       );
 
       proc.kill("SIGTERM");
@@ -11514,7 +11525,7 @@ async function finalizeCanonicalStreamEnd(
       const forceKillTimer = setTimeout(() => {
         if (proc.exitCode === null) {
           console.warn(
-            `[Transcode] Force-killing ${key} after graceful shutdown timeout.`,
+            `[Transcode] Force-killing ${streamLogId(streamKey)}/${key.slice(String(streamKey).length + 1)} after graceful shutdown timeout.`,
           );
           proc.kill("SIGKILL");
         }
@@ -11599,7 +11610,7 @@ function clearDeferredStreamTargetStop(streamKey, reason = "source recovered") {
   markStreamHandoffStabilizing(streamKey);
 
   console.log(
-    `[STREAM-TARGET-HANDOFF] Preserving targets for ${streamKey}: ${reason}. ` +
+    `[STREAM-TARGET-HANDOFF] Preserving targets for ${streamLogId(streamKey)}: ${reason}. ` +
       `Keeping HA stabilization guard for ${Math.round(
         STREAM_TARGET_HANDOFF_STABILITY_MS / 1000,
       )}s.`,
@@ -11638,7 +11649,7 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
           elapsedMs < STREAM_TARGET_HANDOFF_MAX_MS
         ) {
           console.log(
-            `[STREAM-TARGET-HANDOFF] ${streamKey} still recovering ` +
+            `[STREAM-TARGET-HANDOFF] ${streamLogId(streamKey)} still recovering ` +
               `(${Math.round(elapsedMs / 1000)}s); keeping downstream targets alive.`,
           );
           scheduleCheck(STREAM_TARGET_HANDOFF_RECHECK_MS);
@@ -11648,7 +11659,7 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
         streamTargetHandoffStops.delete(streamKey);
 
         console.log(
-          `[STREAM-TARGET-HANDOFF] Recovery window ended for ${streamKey}; ` +
+          `[STREAM-TARGET-HANDOFF] Recovery window ended for ${streamLogId(streamKey)}; ` +
             `finalizing the channel as a real source end.`,
         );
 
@@ -11671,7 +11682,7 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
 
         streamTargetHandoffStops.delete(streamKey);
         console.error(
-          `[STREAM-TARGET-HANDOFF] Recovery check timed out for ${streamKey}; ` +
+          `[STREAM-TARGET-HANDOFF] Recovery check timed out for ${streamLogId(streamKey)}; ` +
             `falling back to normal target stop:`,
           err.message,
         );
@@ -16603,14 +16614,14 @@ app.post(
 
       proc.stderr.on("data", (data) => {
         console.log(
-          `[MANUAL-RECORDING ${channel.stream_key}]`,
+          `[MANUAL-RECORDING ${streamLogId(channel.stream_key)}]`,
           data.toString().slice(0, 300),
         );
       });
 
       proc.on("exit", (code) => {
         console.log(
-          `[MANUAL-RECORDING ${channel.stream_key}] exited with code ${code}`,
+          `[MANUAL-RECORDING ${streamLogId(channel.stream_key)}] exited with code ${code}`,
         );
         manualRecordingProcesses.delete(channel.id);
       });
@@ -16730,7 +16741,7 @@ app.post(
           }
 
           console.log(
-            `[MANUAL-RECORDING] Registered clip for ${channel.stream_key}: ${filename}`,
+            `[MANUAL-RECORDING] Registered clip for ${streamLogId(channel.stream_key)}: ${filename}`,
           );
         } catch (err) {
           console.error(
@@ -16751,7 +16762,7 @@ app.post(
       const forceKillTimer = setTimeout(() => {
         if (proc.exitCode === null) {
           console.warn(
-            `[MANUAL-RECORDING ${channel.stream_key}] Force-killing after graceful shutdown timeout.`,
+            `[MANUAL-RECORDING ${streamLogId(channel.stream_key)}] Force-killing after graceful shutdown timeout.`,
           );
           proc.kill("SIGKILL");
         }

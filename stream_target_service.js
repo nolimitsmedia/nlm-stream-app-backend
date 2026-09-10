@@ -3,6 +3,12 @@
 
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+
+const streamLogId = (streamKey) => {
+  const value = String(streamKey || "");
+  if (!value) return "[none]";
+  return `[key:${crypto.createHash("sha256").update(value).digest("hex").slice(0, 10)}]`;
+};
 const net = require("net");
 const tls = require("tls");
 const dns = require("dns").promises;
@@ -2648,7 +2654,7 @@ function createStreamTargetManager({
         };
 
         console.warn(
-          `[STREAM-TARGET-RECOVERY] Recovering #${destinationId} (${target.name || target.target_type || target.platform}) because source ${target.channel_stream_key} is live but no target worker exists.`,
+          `[STREAM-TARGET-RECOVERY] Recovering #${destinationId} (${target.name || target.target_type || target.platform}) because source ${streamLogId(target.channel_stream_key)} is live but no target worker exists.`,
         );
 
         try {
