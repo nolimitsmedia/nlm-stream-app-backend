@@ -3065,6 +3065,76 @@ function createStreamTargetManager({
     ensureRecoverySweep();
   }
 
+  // Phase 5A.5a — Unified Stream Target health model.
+  //
+  // Computed from existing runtime state only. This does not introduce a new
+  // source of truth or change worker/reconnect behavior. Stale/dead-worker
+  // detection is handled separately in Phase 5A.5b.
+  function buildTargetHealth(state, workerRunning) {
+    const runtimeStatus = String(state?.status || "").toLowerCase();
+    const deliveryVerified = Boolean(state?.deliveryVerified);
+    const retrying =
+      runtimeStatus === "reconnecting" ||
+      Boolean(state?.nextRetryAt && state.nextRetryAt > Date.now());
+
+    const failureCode = state?.failureCode || null;
+    const failureRetryable =
+      state?.failureRetryable == null ? true : Boolean(state.failureRetryable);
+
+    let status = "unknown";
+    let reason = "runtime_state_unknown";
+
+    if (state?.intentionalStop || runtimeStatus === "stopped") {
+      status = "stopped";
+      reason = "stopped";
+    } else if (workerRunning && deliveryVerified) {
+      if (state?.sourceHlsFault) {
+        status = "degraded";
+        reason = failureCode || "source_fault";
+      } else {
+        status = "healthy";
+        reason = "delivery_verified";
+      }
+    } else if (retrying) {
+      status = "recovering";
+      reason = failureCode || "automatic_reconnect";
+    } else if (workerRunning || runtimeStatus === "connecting") {
+      status = "starting";
+      reason = failureCode || "delivery_pending";
+    } else if (
+      runtimeStatus === "failed" ||
+      runtimeStatus === "disconnected" ||
+      failureCode
+    ) {
+      status = "failed";
+      reason = failureCode || runtimeStatus || "worker_not_running";
+    } else if (!workerRunning) {
+      status = "stopped";
+      reason = runtimeStatus || "worker_not_running";
+    }
+
+    return {
+      status,
+      reason,
+      worker_alive: Boolean(workerRunning),
+      delivery_verified: deliveryVerified,
+      retrying,
+      degraded: status === "degraded",
+      execution: state?.remote ? "media_node" : "local",
+      failure_code: failureCode,
+      failure_category: state?.failureCategory || null,
+      failure_scope: state?.failureScope || null,
+      failure_retryable: failureRetryable,
+      last_failure_at: state?.lastFailureAt
+        ? new Date(state.lastFailureAt).toISOString()
+        : null,
+      next_retry_at:
+        state?.nextRetryAt && state.nextRetryAt > Date.now()
+          ? new Date(state.nextRetryAt).toISOString()
+          : null,
+    };
+  }
+
   function getRuntimeState(destinationId) {
     const state = processStates.get(Number(destinationId));
     if (!state) return null;
@@ -3075,6 +3145,7 @@ function createStreamTargetManager({
       workerRunning && startedAtMs > 0
         ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
         : 0;
+    const health = buildTargetHealth(state, workerRunning);
 
     return {
       pid: state.proc?.pid || state.pid || null,
@@ -3127,6 +3198,7 @@ function createStreamTargetManager({
         ? new Date(state.lastFailureAt).toISOString()
         : null,
       preflight: state.preflight || null,
+      health,
     };
   }
 
