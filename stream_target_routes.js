@@ -536,6 +536,78 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     deleteHandler,
   );
 
+  // Phase 5A.5d — operator-safe runtime diagnostics.
+  //
+  // Exposes only non-secret target metadata plus normalized runtime state.
+  // Secret destination credentials and encryption metadata are never returned.
+  async function diagnosticsHandler(req, res) {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+
+      if (!channel)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+
+      const target = await loadTarget(req.params.id, channel.id);
+      if (!target)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Stream target not found" });
+
+      const runtime = manager.getRuntimeState(target.id);
+      const sanitized = sanitizeTarget(target, runtime);
+
+      res.json({
+        ok: true,
+        target: {
+          id: target.id,
+          channel_id: target.channel_id,
+          name: target.name,
+          target_type: target.target_type || target.platform || null,
+          protocol: target.protocol || null,
+          automation_mode: target.automation_mode || "manual",
+          enabled: Boolean(target.enabled),
+          auto_start: Boolean(target.auto_start),
+          auto_reconnect: Boolean(target.auto_reconnect),
+          status: sanitized.status || target.status || "stopped",
+          destination_url_configured: Boolean(
+            sanitized.destination_url_configured,
+          ),
+          stream_key_configured: Boolean(sanitized.stream_key_configured),
+          active_destination_url_configured: Boolean(
+            sanitized.active_destination_url_configured,
+          ),
+        },
+        runtime_available: Boolean(runtime),
+        runtime: runtime || null,
+        observed_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Stream Target Diagnostics Error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to fetch stream target diagnostics",
+      });
+    }
+  }
+
+  app.get(
+    "/api/channels/:channelId/stream-targets/:id/diagnostics",
+    ...manageMw,
+    diagnosticsHandler,
+  );
+
+  // Compatibility alias for existing SocialDestinations naming.
+  app.get(
+    "/api/channels/:channelId/social-destinations/:id/diagnostics",
+    ...manageMw,
+    diagnosticsHandler,
+  );
+
   async function preflightHandler(req, res) {
     try {
       const channel = await getOwnedChannel(
