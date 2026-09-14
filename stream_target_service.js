@@ -85,6 +85,14 @@ const STREAM_TARGET_RECOVERY_STALE_MS = Math.max(
   Number(process.env.STREAM_TARGET_RECOVERY_STALE_MS || 15000),
 );
 
+// Phase 5A.5b — stale/dead worker detection.
+// A verified worker must continue advancing output media. Keep the threshold
+// comfortably above normal FFmpeg progress and Media Node polling cadence.
+const STREAM_TARGET_WORKER_STALE_MS = Math.max(
+  15000,
+  Number(process.env.STREAM_TARGET_WORKER_STALE_MS || 30000),
+);
+
 const STREAM_TARGET_PREFLIGHT_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.STREAM_TARGET_PREFLIGHT_TIMEOUT_MS || 5000),
@@ -1188,6 +1196,56 @@ function createStreamTargetManager({
     }
   }
 
+  function noteOutputProgress(state, next = {}) {
+    const previous = state.progressSnapshot || {
+      outputBytes: safeNumber(state.outputBytes),
+      outputTimeMs: safeNumber(state.outputTimeMs),
+      outputFrames: safeNumber(state.outputFrames),
+    };
+
+    const current = {
+      outputBytes: safeNumber(next.outputBytes, state.outputBytes || 0),
+      outputTimeMs: safeNumber(next.outputTimeMs, state.outputTimeMs || 0),
+      outputFrames: safeNumber(next.outputFrames, state.outputFrames || 0),
+    };
+
+    const advanced =
+      current.outputBytes > previous.outputBytes ||
+      current.outputTimeMs > previous.outputTimeMs ||
+      current.outputFrames > previous.outputFrames;
+
+    state.progressSnapshot = current;
+    if (advanced || !state.lastProgressAt) {
+      state.lastProgressAt = Date.now();
+    }
+
+    return advanced;
+  }
+
+  function isVerifiedWorkerStale(state, now = Date.now()) {
+    if (!state?.deliveryVerified || state.intentionalStop) return false;
+
+    const lastProgressAt = Number(
+      state.lastProgressAt || state.deliveryVerifiedAt || 0,
+    );
+
+    return Boolean(
+      lastProgressAt > 0 &&
+      now - lastProgressAt >= STREAM_TARGET_WORKER_STALE_MS,
+    );
+  }
+
+  function markWorkerStaleState(state, message) {
+    state.status = "reconnecting";
+    state.lastError = message;
+    state.failureCode = "worker_stale";
+    state.failureCategory = "worker";
+    state.failureScope = "worker";
+    state.failureRetryable = true;
+    state.lastFailureAt = Date.now();
+    state.staleDetectedAt = Date.now();
+  }
+
   function parseProgressLine(state, line) {
     const idx = line.indexOf("=");
     if (idx <= 0) return;
@@ -1219,7 +1277,7 @@ function createStreamTargetManager({
       key === "progress" &&
       (value === "continue" || value === "end")
     ) {
-      state.lastProgressAt = Date.now();
+      noteOutputProgress(state);
 
       // A progress heartbeat by itself is not proof that the destination is
       // receiving media. Require output bytes + media time + frame/bitrate.
@@ -1333,7 +1391,9 @@ function createStreamTargetManager({
 
     state.status = canReconnect ? "reconnecting" : "disconnected";
     state.lastError = remoteError;
-    state.failureCode = "remote_worker_stopped";
+    if (state.failureCode !== "worker_stale") {
+      state.failureCode = "remote_worker_stopped";
+    }
     state.failureCategory = "worker";
     state.failureScope = "worker";
     state.failureRetryable = true;
@@ -1367,6 +1427,12 @@ function createStreamTargetManager({
         });
         const runtime = normalizeRemoteRuntime(response);
 
+        noteOutputProgress(state, {
+          outputBytes: runtime.outputBytes,
+          outputTimeMs: runtime.outputTimeMs,
+          outputFrames: runtime.outputFrames,
+        });
+
         state.pid = runtime.pid;
         state.currentBitrateKbps = runtime.bitrateKbps;
         state.outputBytes = runtime.outputBytes;
@@ -1386,6 +1452,34 @@ function createStreamTargetManager({
           : runtime.processAlive
             ? "connecting"
             : runtime.status || "disconnected";
+
+        if (runtime.processAlive && isVerifiedWorkerStale(state)) {
+          markWorkerStaleState(
+            state,
+            `Media Node Stream Target worker stopped advancing output for at least ${STREAM_TARGET_WORKER_STALE_MS}ms.`,
+          );
+
+          console.warn(
+            `[STREAM-TARGET #${Number(target.id)}] stale Media Node worker detected; handing recovery to existing reconnect authority.`,
+          );
+
+          try {
+            await streamTargetExecutor.stop({
+              targetId: Number(target.id),
+              channelId: Number(channel.id),
+            });
+          } catch (error) {
+            console.warn(
+              `[STREAM-TARGET #${Number(target.id)}] stale Media Node worker stop failed:`,
+              error?.message || error,
+            );
+          }
+
+          await markRemoteTargetLost(target, channel, state, {
+            error: state.lastError,
+          });
+          return;
+        }
 
         if (runtime.processAlive) {
           await pool.query(
@@ -1513,6 +1607,13 @@ function createStreamTargetManager({
       state.deliveryVerifiedAt = runtime.deliveryVerifiedAt
         ? new Date(runtime.deliveryVerifiedAt).getTime()
         : null;
+      state.lastProgressAt = state.deliveryVerifiedAt || Date.now();
+      state.progressSnapshot = {
+        outputBytes: safeNumber(runtime.outputBytes),
+        outputTimeMs: safeNumber(runtime.outputTimeMs),
+        outputFrames: safeNumber(runtime.outputFrames),
+      };
+      state.staleDetectedAt = null;
       state.status = runtime.deliveryVerified ? "streaming" : "connecting";
 
       await pool.query(
@@ -1689,6 +1790,13 @@ function createStreamTargetManager({
     state.proc = proc;
     state.pid = proc.pid;
     state.status = "connecting";
+    state.lastProgressAt = Date.now();
+    state.progressSnapshot = {
+      outputBytes: 0,
+      outputTimeMs: 0,
+      outputFrames: 0,
+    };
+    state.staleDetectedAt = null;
     processStates.set(destinationId, state);
 
     let progressBuffer = "";
@@ -1736,10 +1844,30 @@ function createStreamTargetManager({
       );
     });
 
-    state.metricsTimer = setInterval(
-      () => persistMetrics(destinationId, state),
-      5000,
-    );
+    state.metricsTimer = setInterval(() => {
+      persistMetrics(destinationId, state);
+
+      if (
+        state.proc === proc &&
+        !state.intentionalStop &&
+        isVerifiedWorkerStale(state)
+      ) {
+        markWorkerStaleState(
+          state,
+          `Stream Target FFmpeg worker stopped advancing output for at least ${STREAM_TARGET_WORKER_STALE_MS}ms.`,
+        );
+
+        console.warn(
+          `[STREAM-TARGET #${destinationId}] stale local worker detected; handing recovery to existing exit/reconnect authority.`,
+        );
+
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // Existing proc.on("exit") reconnect authority handles reconciliation.
+        }
+      }
+    }, 5000);
     state.metricsTimer.unref?.();
 
     await pool.query(
@@ -2891,6 +3019,15 @@ function createStreamTargetManager({
       deliveryVerifiedAt: runtime.deliveryVerifiedAt
         ? new Date(runtime.deliveryVerifiedAt).getTime()
         : null,
+      lastProgressAt: runtime.deliveryVerifiedAt
+        ? new Date(runtime.deliveryVerifiedAt).getTime()
+        : Date.now(),
+      progressSnapshot: {
+        outputBytes: safeNumber(runtime.outputBytes),
+        outputTimeMs: safeNumber(runtime.outputTimeMs),
+        outputFrames: safeNumber(runtime.outputFrames),
+      },
+      staleDetectedAt: null,
       deliveryVerifyTimer: null,
       metricsTimer: null,
       reconnectTimer: null,
@@ -3078,6 +3215,9 @@ function createStreamTargetManager({
       Boolean(state?.nextRetryAt && state.nextRetryAt > Date.now());
 
     const failureCode = state?.failureCode || null;
+    const stale = Boolean(
+      state?.staleDetectedAt || (workerRunning && isVerifiedWorkerStale(state)),
+    );
     const failureRetryable =
       state?.failureRetryable == null ? true : Boolean(state.failureRetryable);
 
@@ -3087,6 +3227,9 @@ function createStreamTargetManager({
     if (state?.intentionalStop || runtimeStatus === "stopped") {
       status = "stopped";
       reason = "stopped";
+    } else if (stale) {
+      status = "recovering";
+      reason = failureCode || "worker_stale";
     } else if (workerRunning && deliveryVerified) {
       if (state?.sourceHlsFault) {
         status = "degraded";
@@ -3118,6 +3261,11 @@ function createStreamTargetManager({
       reason,
       worker_alive: Boolean(workerRunning),
       delivery_verified: deliveryVerified,
+      stale,
+      stale_after_ms: STREAM_TARGET_WORKER_STALE_MS,
+      last_progress_at: state?.lastProgressAt
+        ? new Date(state.lastProgressAt).toISOString()
+        : null,
       retrying,
       degraded: status === "degraded",
       execution: state?.remote ? "media_node" : "local",
