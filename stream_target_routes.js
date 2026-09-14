@@ -608,6 +608,85 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     diagnosticsHandler,
   );
 
+  // Phase 5A.5e — bounded, operator-safe Stream Target health history.
+  async function healthHistoryHandler(req, res) {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+
+      if (!channel)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+
+      const target = await loadTarget(req.params.id, channel.id);
+      if (!target)
+        return res
+          .status(404)
+          .json({ ok: false, message: "Stream target not found" });
+
+      const requestedLimit = Number(req.query?.limit || 100);
+      const limit = Math.max(
+        1,
+        Math.min(200, Number.isFinite(requestedLimit) ? requestedLimit : 100),
+      );
+      const attentionOnly =
+        String(req.query?.attention || "").toLowerCase() === "true" ||
+        String(req.query?.attention || "") === "1";
+
+      const result = await pool.query(
+        `SELECT id, target_id, channel_id, organization_id,
+                event_type, health_status, severity, requires_attention,
+                failure_code, failure_category, failure_scope,
+                failure_retryable, message, execution, reconnect_count,
+                delivery_verified, current_bitrate_kbps, created_at
+         FROM stream_target_health_history
+         WHERE target_id = $1
+           AND channel_id = $2
+           AND organization_id = $3
+           AND ($4::boolean = false OR requires_attention = true)
+         ORDER BY created_at DESC, id DESC
+         LIMIT $5`,
+        [target.id, channel.id, req.organization.id, attentionOnly, limit],
+      );
+
+      res.json({
+        ok: true,
+        target: {
+          id: target.id,
+          channel_id: target.channel_id,
+          name: target.name,
+          target_type: target.target_type || target.platform || null,
+          protocol: target.protocol || null,
+        },
+        count: result.rows.length,
+        limit,
+        attention_only: attentionOnly,
+        events: result.rows,
+      });
+    } catch (error) {
+      console.error("Stream Target Health History Error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to fetch stream target health history",
+      });
+    }
+  }
+
+  app.get(
+    "/api/channels/:channelId/stream-targets/:id/health-history",
+    ...manageMw,
+    healthHistoryHandler,
+  );
+
+  app.get(
+    "/api/channels/:channelId/social-destinations/:id/health-history",
+    ...manageMw,
+    healthHistoryHandler,
+  );
+
   async function preflightHandler(req, res) {
     try {
       const channel = await getOwnedChannel(

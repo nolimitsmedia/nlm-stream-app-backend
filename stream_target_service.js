@@ -743,6 +743,117 @@ function createStreamTargetManager({
   let recoverySweepRunning = false;
   let reconcileRetryTimer = null;
 
+  // Phase 5A.5e — durable Stream Target health transition history.
+  // Writes are best-effort and must never break worker control flow.
+  function sanitizeHealthHistoryMessage(message, state = null) {
+    let text = String(message || "")
+      .trim()
+      .slice(0, 1200);
+    if (!text) return null;
+
+    const streamKey = String(state?.channelStreamKey || "");
+    if (streamKey) text = text.split(streamKey).join(streamLogId(streamKey));
+
+    const destinationUrl = String(state?.destinationUrl || "");
+    if (destinationUrl) {
+      text = text.split(destinationUrl).join(redactTargetUrl(destinationUrl));
+    }
+
+    text = text.replace(
+      /\b(?:rtmps?|srt):\/\/[^\s"'<>]+/gi,
+      (value) => redactTargetUrl(value) || "[redacted-destination]",
+    );
+
+    return text;
+  }
+
+  async function recordTargetHealthEvent(
+    targetId,
+    {
+      eventType,
+      healthStatus = "unknown",
+      severity = "info",
+      requiresAttention = false,
+      failureCode = null,
+      failureCategory = null,
+      failureScope = null,
+      failureRetryable = null,
+      message = null,
+    } = {},
+    state = null,
+  ) {
+    const destinationId = Number(targetId);
+    if (!Number.isInteger(destinationId) || destinationId <= 0 || !eventType) {
+      return;
+    }
+
+    try {
+      const reconnectCount = safeNumber(state?.reconnectCount);
+      const deliveryVerified = Boolean(state?.deliveryVerified);
+      const bitrateKbps = Math.max(0, safeNumber(state?.currentBitrateKbps));
+      const execution = state?.remote ? "media_node" : "local";
+      const safeMessage = sanitizeHealthHistoryMessage(message, state);
+
+      const last = await pool.query(
+        `SELECT event_type, health_status, failure_code, reconnect_count,
+                delivery_verified, requires_attention
+         FROM stream_target_health_history
+         WHERE target_id = $1
+         ORDER BY id DESC
+         LIMIT 1`,
+        [destinationId],
+      );
+
+      const previous = last.rows[0] || null;
+      const duplicateTransition =
+        previous &&
+        String(previous.event_type || "") === String(eventType) &&
+        String(previous.health_status || "") === String(healthStatus) &&
+        String(previous.failure_code || "") === String(failureCode || "") &&
+        safeNumber(previous.reconnect_count) === reconnectCount &&
+        Boolean(previous.delivery_verified) === deliveryVerified &&
+        Boolean(previous.requires_attention) === Boolean(requiresAttention);
+
+      if (duplicateTransition) return;
+
+      await pool.query(
+        `INSERT INTO stream_target_health_history (
+           organization_id, channel_id, target_id,
+           event_type, health_status, severity, requires_attention,
+           failure_code, failure_category, failure_scope, failure_retryable,
+           message, execution, reconnect_count, delivery_verified,
+           current_bitrate_kbps
+         )
+         SELECT c.organization_id, sd.channel_id, sd.id,
+                $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+         FROM social_destinations sd
+         JOIN channels c ON c.id = sd.channel_id
+         WHERE sd.id = $1`,
+        [
+          destinationId,
+          String(eventType).slice(0, 60),
+          String(healthStatus || "unknown").slice(0, 30),
+          String(severity || "info").slice(0, 20),
+          Boolean(requiresAttention),
+          failureCode ? String(failureCode).slice(0, 100) : null,
+          failureCategory ? String(failureCategory).slice(0, 60) : null,
+          failureScope ? String(failureScope).slice(0, 60) : null,
+          failureRetryable == null ? null : Boolean(failureRetryable),
+          safeMessage,
+          execution,
+          reconnectCount,
+          deliveryVerified,
+          bitrateKbps,
+        ],
+      );
+    } catch (error) {
+      console.warn(
+        `[STREAM-TARGET-HISTORY #${destinationId}] event write skipped:`,
+        error?.message || error,
+      );
+    }
+  }
+
   async function isSrsStreamLive(streamKey) {
     try {
       const res = await fetch(
@@ -1271,6 +1382,17 @@ function createStreamTargetManager({
     state.lastFailureAt = null;
     state.status = "streaming";
 
+    void recordTargetHealthEvent(
+      state.destinationId,
+      {
+        eventType: "delivery_verified",
+        healthStatus: "healthy",
+        severity: "info",
+        message: "Destination delivery verified.",
+      },
+      state,
+    );
+
     if (state.deliveryVerifyTimer) {
       clearTimeout(state.deliveryVerifyTimer);
       state.deliveryVerifyTimer = null;
@@ -1325,6 +1447,22 @@ function createStreamTargetManager({
     state.failureRetryable = true;
     state.lastFailureAt = Date.now();
     state.staleDetectedAt = Date.now();
+
+    void recordTargetHealthEvent(
+      state.destinationId,
+      {
+        eventType: "worker_stale",
+        healthStatus: "recovering",
+        severity: "warning",
+        failureCode: state.failureCode,
+        failureCategory: state.failureCategory,
+        failureScope: state.failureScope,
+        failureRetryable: state.failureRetryable,
+        message:
+          message || "Stream Target worker stopped advancing output media.",
+      },
+      state,
+    );
   }
 
   function parseProgressLine(state, line) {
@@ -1488,6 +1626,26 @@ function createStreamTargetManager({
            last_disconnected_at=now(), last_error=$2, updated_at=now()
        WHERE id=$3`,
       [state.status, remoteError, Number(target.id)],
+    );
+
+    await recordTargetHealthEvent(
+      target.id,
+      {
+        eventType:
+          state.failureCode === "worker_stale" ? "worker_stale" : "worker_lost",
+        healthStatus: canReconnect ? "recovering" : "failed",
+        severity: canReconnect ? "warning" : "critical",
+        requiresAttention: !canReconnect,
+        failureCode: state.failureCode,
+        failureCategory: state.failureCategory,
+        failureScope: state.failureScope,
+        failureRetryable: state.failureRetryable,
+        message:
+          state.failureCode === "worker_stale"
+            ? "Stale Media Node target worker was stopped for recovery."
+            : "Media Node target worker stopped unexpectedly.",
+      },
+      state,
     );
 
     if (!canReconnect) processStates.set(Number(target.id), state);
@@ -1732,6 +1890,22 @@ function createStreamTargetManager({
         state.failureRetryable = true;
         state.lastFailureAt = Date.now();
 
+        await recordTargetHealthEvent(
+          destinationId,
+          {
+            eventType: "delivery_not_verified",
+            healthStatus: "recovering",
+            severity: "warning",
+            failureCode: state.failureCode,
+            failureCategory: state.failureCategory,
+            failureScope: state.failureScope,
+            failureRetryable: state.failureRetryable,
+            message:
+              "Media Node target worker produced no confirmed output media.",
+          },
+          state,
+        );
+
         try {
           await streamTargetExecutor.stop({
             targetId: destinationId,
@@ -1756,6 +1930,20 @@ function createStreamTargetManager({
       state.deliveryVerifyTimer.unref?.();
 
       scheduleRemoteStatusPoll(target, channel, state);
+
+      await recordTargetHealthEvent(
+        destinationId,
+        {
+          eventType: reconnect ? "reconnect_started" : "target_started",
+          healthStatus: "starting",
+          severity: "info",
+          message: reconnect
+            ? "Stream Target reconnect worker started on the assigned Media Node."
+            : "Stream Target worker started on the assigned Media Node.",
+        },
+        state,
+      );
+
       return {
         ok: true,
         message: reconnect ? "Target reconnected" : "Stream target started",
@@ -1779,6 +1967,23 @@ function createStreamTargetManager({
          WHERE id=$3`,
         [state.status, state.lastError, destinationId],
       );
+
+      await recordTargetHealthEvent(
+        destinationId,
+        {
+          eventType: reconnect ? "reconnect_failed" : "target_start_failed",
+          healthStatus: reconnect ? "recovering" : "failed",
+          severity: reconnect ? "warning" : "critical",
+          requiresAttention: !reconnect,
+          failureCode: state.failureCode,
+          failureCategory: state.failureCategory,
+          failureScope: state.failureScope,
+          failureRetryable: state.failureRetryable,
+          message: state.lastError,
+        },
+        state,
+      );
+
       return {
         ok: false,
         message: state.lastError,
@@ -1973,6 +2178,20 @@ function createStreamTargetManager({
         destinationId,
       ],
     );
+
+    await recordTargetHealthEvent(
+      destinationId,
+      {
+        eventType: reconnect ? "reconnect_started" : "target_started",
+        healthStatus: "starting",
+        severity: "info",
+        message: reconnect
+          ? "Stream Target reconnect worker started."
+          : "Stream Target worker started.",
+      },
+      state,
+    );
+
     // Remain in CONNECTING until actual output delivery is verified.
     // A live FFmpeg PID or progress heartbeat alone is insufficient.
     state.deliveryVerifyTimer = setTimeout(() => {
@@ -1992,6 +2211,21 @@ function createStreamTargetManager({
       state.failureScope = "destination";
       state.failureRetryable = true;
       state.lastFailureAt = Date.now();
+
+      void recordTargetHealthEvent(
+        destinationId,
+        {
+          eventType: "delivery_not_verified",
+          healthStatus: "recovering",
+          severity: "warning",
+          failureCode: state.failureCode,
+          failureCategory: state.failureCategory,
+          failureScope: state.failureScope,
+          failureRetryable: state.failureRetryable,
+          message: "Local target worker produced no confirmed output media.",
+        },
+        state,
+      );
 
       // Let the existing exit/reconnect path perform bounded backoff and
       // persistence. Killing only this worker prevents false STREAMING state.
@@ -2108,6 +2342,29 @@ function createStreamTargetManager({
             [terminalStatus, terminalError, destinationId],
           );
 
+          await recordTargetHealthEvent(
+            destinationId,
+            {
+              eventType: attemptsExhausted
+                ? "reconnect_exhausted"
+                : terminalStatus === "failed"
+                  ? "target_failed"
+                  : "worker_disconnected",
+              healthStatus: terminalStatus === "failed" ? "failed" : "stopped",
+              severity: terminalStatus === "failed" ? "critical" : "warning",
+              requiresAttention: terminalStatus === "failed",
+              failureCode: state.failureCode,
+              failureCategory: state.failureCategory,
+              failureScope: state.failureScope,
+              failureRetryable: state.failureRetryable,
+              message:
+                terminalStatus === "failed"
+                  ? "Stream Target requires operator attention after recovery stopped."
+                  : "Stream Target worker disconnected.",
+            },
+            state,
+          );
+
           processStates.set(destinationId, state);
           return;
         }
@@ -2137,6 +2394,21 @@ function createStreamTargetManager({
               : lastError,
             destinationId,
           ],
+        );
+
+        await recordTargetHealthEvent(
+          destinationId,
+          {
+            eventType: "reconnect_scheduled",
+            healthStatus: "recovering",
+            severity: "warning",
+            failureCode: state.failureCode,
+            failureCategory: state.failureCategory,
+            failureScope: state.failureScope,
+            failureRetryable: state.failureRetryable,
+            message: "Automatic Stream Target reconnect scheduled.",
+          },
+          state,
         );
 
         const scheduleNextAttempt = (delayOverride = delay) => {
@@ -2729,6 +3001,23 @@ function createStreamTargetManager({
        WHERE id = $1`,
       [destinationId, endPlatform],
     );
+
+    await recordTargetHealthEvent(
+      destinationId,
+      {
+        eventType: "target_stopped",
+        healthStatus: "stopped",
+        severity: "info",
+        message: "Stream Target stopped by operator or channel lifecycle.",
+      },
+      state || {
+        destinationId,
+        reconnectCount: safeNumber(target.reconnect_count),
+        deliveryVerified: false,
+        currentBitrateKbps: 0,
+      },
+    );
+
     return { ok: true, message: "Stream target stopped" };
   }
 
@@ -3231,6 +3520,18 @@ function createStreamTargetManager({
       ],
     );
 
+    await recordTargetHealthEvent(
+      destinationId,
+      {
+        eventType: "worker_adopted",
+        healthStatus: runtime.deliveryVerified ? "healthy" : "starting",
+        severity: "info",
+        message:
+          "Surviving Media Node target worker adopted after backend restart.",
+      },
+      state,
+    );
+
     // A surviving but not-yet-verified worker still gets a bounded delivery
     // verification window after control-plane adoption. This prevents an
     // indefinitely stuck CONNECTING state after a backend restart.
@@ -3251,6 +3552,22 @@ function createStreamTargetManager({
         state.failureScope = "destination";
         state.failureRetryable = true;
         state.lastFailureAt = Date.now();
+
+        await recordTargetHealthEvent(
+          destinationId,
+          {
+            eventType: "delivery_not_verified_after_adoption",
+            healthStatus: "recovering",
+            severity: "warning",
+            failureCode: state.failureCode,
+            failureCategory: state.failureCategory,
+            failureScope: state.failureScope,
+            failureRetryable: state.failureRetryable,
+            message:
+              "Adopted Media Node worker did not verify destination delivery.",
+          },
+          state,
+        );
 
         try {
           await streamTargetExecutor.stop({

@@ -276,6 +276,47 @@ async function ensureStreamTargetColumns(pool) {
   // credentials in-place and keep the deterministic HMAC lookup index current.
   await encryptExistingTargetCredentials(pool);
 
+  // Phase 5A.5e — durable Stream Target operational health history.
+  // This table records transitions only; current runtime state remains authoritative.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stream_target_health_history (
+      id BIGSERIAL PRIMARY KEY,
+      organization_id INTEGER NOT NULL,
+      channel_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL
+        REFERENCES social_destinations(id) ON DELETE CASCADE,
+      event_type VARCHAR(60) NOT NULL,
+      health_status VARCHAR(30) NOT NULL,
+      severity VARCHAR(20) NOT NULL DEFAULT 'info',
+      requires_attention BOOLEAN NOT NULL DEFAULT FALSE,
+      failure_code VARCHAR(100),
+      failure_category VARCHAR(60),
+      failure_scope VARCHAR(60),
+      failure_retryable BOOLEAN,
+      message TEXT,
+      execution VARCHAR(20),
+      reconnect_count INTEGER NOT NULL DEFAULT 0,
+      delivery_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      current_bitrate_kbps INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_target_health_target_created
+    ON stream_target_health_history (target_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_target_health_org_created
+    ON stream_target_health_history (organization_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_target_health_attention
+    ON stream_target_health_history (organization_id, requires_attention, created_at DESC)
+  `);
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_stream_targets_channel_enabled
     ON social_destinations (channel_id, enabled)
