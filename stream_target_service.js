@@ -548,6 +548,87 @@ function classifyTargetFailure(
   return result;
 }
 
+// Phase 5A.5c — normalized, operator-safe Stream Target failure details.
+function getFailureOperatorAction({
+  code = "",
+  category = "",
+  scope = "",
+  retryable = true,
+} = {}) {
+  const normalizedCode = String(code || "").toLowerCase();
+  const normalizedCategory = String(category || "").toLowerCase();
+  const normalizedScope = String(scope || "").toLowerCase();
+
+  if (normalizedCode === "target_disabled")
+    return "Enable this Stream Target before starting it.";
+  if (normalizedCode === "target_already_running")
+    return "Stop the existing target worker before starting another session.";
+  if (normalizedCode === "source_not_live")
+    return "Start the channel source stream, then retry the target.";
+  if (normalizedCode === "source_not_ready" || normalizedCategory === "source")
+    return "Verify the channel source is live and producing stable media. Automatic recovery will retry when enabled.";
+  if (normalizedCode === "oauth_account_missing")
+    return "Connect the required platform account to this target, then retry.";
+  if (normalizedCode === "oauth_reconnect_required")
+    return "Reconnect the platform account and confirm its permissions before retrying.";
+  if (normalizedCategory === "oauth")
+    return retryable
+      ? "Verify the connected platform account and retry the broadcast."
+      : "Reconnect or repair the connected platform account before retrying.";
+  if (normalizedCategory === "authentication")
+    return "Verify the destination credentials or stream key before retrying.";
+  if (normalizedCategory === "configuration")
+    return "Review this Stream Target configuration and correct the invalid setting before retrying.";
+  if (normalizedCategory === "dns")
+    return "Verify the destination hostname and DNS resolution.";
+  if (normalizedCategory === "tls")
+    return "Verify the destination TLS certificate, hostname, and secure endpoint settings.";
+  if (normalizedCategory === "network")
+    return "Check network reachability to the destination. Automatic reconnect will retry when enabled.";
+  if (normalizedCategory === "delivery")
+    return "Verify the destination is accepting media and that the source is producing audio/video.";
+  if (normalizedCategory === "recovery")
+    return "Automatic recovery is retrying. Inspect source and destination health if the condition persists.";
+  if (normalizedScope === "worker" || normalizedCategory === "worker")
+    return "Check the Stream Target FFmpeg/Media Node worker. Automatic recovery will retry when enabled.";
+  if (normalizedScope === "destination" || normalizedCategory === "destination")
+    return "Verify the destination is available and correctly configured before retrying.";
+
+  return retryable
+    ? "Automatic recovery may retry this failure. Review the target if the condition persists."
+    : "Operator review is required before retrying this target.";
+}
+
+function buildStructuredFailure({
+  code = "stream_target_failure",
+  category = "unknown",
+  scope = "worker",
+  retryable = true,
+  message = "Stream Target operation failed",
+  occurredAt = null,
+  stage = null,
+} = {}) {
+  const normalized = {
+    code: String(code || "stream_target_failure"),
+    category: String(category || "unknown"),
+    scope: String(scope || "worker"),
+    retryable: retryable !== false,
+    message: String(message || "Stream Target operation failed").slice(0, 1200),
+    operator_action: getFailureOperatorAction({
+      code,
+      category,
+      scope,
+      retryable,
+    }),
+    occurred_at: occurredAt
+      ? new Date(occurredAt).toISOString()
+      : new Date().toISOString(),
+  };
+
+  if (stage) normalized.stage = String(stage);
+  return normalized;
+}
+
 function calculateReconnectDelay(attempt) {
   const safeAttempt = Math.max(1, Number(attempt || 1));
   const exponential = Math.min(
@@ -1701,12 +1782,15 @@ function createStreamTargetManager({
       return {
         ok: false,
         message: state.lastError,
-        failure: {
+        failure: buildStructuredFailure({
           code: state.failureCode,
           category: "worker",
+          scope: "worker",
           retryable: true,
+          message: state.lastError,
+          occurredAt: state.lastFailureAt,
           stage: "media_node_start",
-        },
+        }),
       };
     }
   }
@@ -2280,18 +2364,54 @@ function createStreamTargetManager({
 
   async function startTarget(target, channel, organizationId, options = {}) {
     target = decryptTargetCredentials(target);
-    if (!target.enabled)
-      return { ok: false, message: "This stream target is disabled" };
-    const existingRuntimeState = processStates.get(Number(target.id));
-    if (existingRuntimeState?.proc || existingRuntimeState?.remoteActive)
-      return { ok: false, message: "Target is already streaming" };
-
-    const live = await isSrsStreamLive(channel.stream_key);
-    if (!live)
+    if (!target.enabled) {
+      const message = "This stream target is disabled";
       return {
         ok: false,
-        message: "Main stream is not live yet. Start streaming first.",
+        message,
+        failure: buildStructuredFailure({
+          code: "target_disabled",
+          category: "configuration",
+          scope: "target",
+          retryable: false,
+          message,
+          stage: "start",
+        }),
       };
+    }
+    const existingRuntimeState = processStates.get(Number(target.id));
+    if (existingRuntimeState?.proc || existingRuntimeState?.remoteActive) {
+      const message = "Target is already streaming";
+      return {
+        ok: false,
+        message,
+        failure: buildStructuredFailure({
+          code: "target_already_running",
+          category: "worker",
+          scope: "worker",
+          retryable: false,
+          message,
+          stage: "start",
+        }),
+      };
+    }
+
+    const live = await isSrsStreamLive(channel.stream_key);
+    if (!live) {
+      const message = "Main stream is not live yet. Start streaming first.";
+      return {
+        ok: false,
+        message,
+        failure: buildStructuredFailure({
+          code: "source_not_live",
+          category: "source",
+          scope: "source",
+          retryable: true,
+          message,
+          stage: "source_check",
+        }),
+      };
+    }
 
     await pool.query(
       `UPDATE social_destinations
@@ -2330,25 +2450,57 @@ function createStreamTargetManager({
         [target.id],
       );
 
+      const message = `Source is live but target media is not ready yet: ${readiness.message}`;
       return {
         ok: false,
-        message: `Source is live but target media is not ready yet: ${readiness.message}`,
+        message,
+        failure: buildStructuredFailure({
+          code: "source_not_ready",
+          category: "source",
+          scope: "source",
+          retryable: true,
+          message,
+          stage: "source_readiness",
+        }),
       };
     }
 
     const validationError = validateManualTarget(target);
-    if (validationError) return { ok: false, message: validationError };
+    if (validationError) {
+      return {
+        ok: false,
+        message: validationError,
+        failure: buildStructuredFailure({
+          code: "target_invalid",
+          category: "configuration",
+          scope: "target",
+          retryable: false,
+          message: validationError,
+          stage: "validation",
+        }),
+      };
+    }
 
     let destinationUrl = target.active_destination_url || null;
     let platformBroadcastId = target.platform_broadcast_id || null;
     let platformStreamId = target.platform_stream_id || null;
 
     if (target.automation_mode === "oauth") {
-      if (!target.oauth_account_id)
+      if (!target.oauth_account_id) {
+        const message = "Connect an account to this target first";
         return {
           ok: false,
-          message: "Connect an account to this target first",
+          message,
+          failure: buildStructuredFailure({
+            code: "oauth_account_missing",
+            category: "oauth",
+            scope: "destination",
+            retryable: false,
+            message,
+            stage: "platform_account",
+          }),
         };
+      }
       const shouldReuseRuntimeUrl = Boolean(
         destinationUrl &&
         (options.reuseRuntimeUrl ||
@@ -2381,14 +2533,16 @@ function createStreamTargetManager({
           return {
             ok: false,
             message,
-            failure: {
+            failure: buildStructuredFailure({
               code: /reconnected|reconnect/i.test(message)
                 ? "oauth_reconnect_required"
                 : "oauth_broadcast_create_failed",
               category: "oauth",
+              scope: "destination",
               retryable: !/needs to be reconnected/i.test(message),
+              message,
               stage: "platform_broadcast",
-            },
+            }),
           };
         }
       }
@@ -2396,8 +2550,21 @@ function createStreamTargetManager({
       destinationUrl = buildManualDestinationUrl(target);
     }
 
-    if (!destinationUrl)
-      return { ok: false, message: "Target destination URL is not configured" };
+    if (!destinationUrl) {
+      const message = "Target destination URL is not configured";
+      return {
+        ok: false,
+        message,
+        failure: buildStructuredFailure({
+          code: "destination_not_configured",
+          category: "configuration",
+          scope: "destination",
+          retryable: false,
+          message,
+          stage: "destination_configuration",
+        }),
+      };
+    }
 
     if (STREAM_TARGET_PREFLIGHT_ENABLED && target.automation_mode !== "oauth") {
       const type = normalizeTargetType(target.target_type || target.platform);
@@ -2440,12 +2607,14 @@ function createStreamTargetManager({
         return {
           ok: false,
           message: preflight.message || "Destination preflight failed",
-          failure: {
+          failure: buildStructuredFailure({
             code: preflight.code || "preflight_failed",
             category: preflight.category || "destination",
+            scope: "destination",
             retryable: preflight.retryable !== false,
+            message: preflight.message || "Destination preflight failed",
             stage: preflight.stage || "connect",
-          },
+          }),
           preflight,
         };
       }
@@ -3220,6 +3389,16 @@ function createStreamTargetManager({
     );
     const failureRetryable =
       state?.failureRetryable == null ? true : Boolean(state.failureRetryable);
+    const failure = failureCode
+      ? buildStructuredFailure({
+          code: failureCode,
+          category: state?.failureCategory || "unknown",
+          scope: state?.failureScope || "worker",
+          retryable: failureRetryable,
+          message: state?.lastError || failureCode,
+          occurredAt: state?.lastFailureAt || null,
+        })
+      : null;
 
     let status = "unknown";
     let reason = "runtime_state_unknown";
@@ -3273,6 +3452,7 @@ function createStreamTargetManager({
       failure_category: state?.failureCategory || null,
       failure_scope: state?.failureScope || null,
       failure_retryable: failureRetryable,
+      failure,
       last_failure_at: state?.lastFailureAt
         ? new Date(state.lastFailureAt).toISOString()
         : null,
@@ -3294,6 +3474,19 @@ function createStreamTargetManager({
         ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
         : 0;
     const health = buildTargetHealth(state, workerRunning);
+    const failure = state.failureCode
+      ? buildStructuredFailure({
+          code: state.failureCode,
+          category: state.failureCategory || "unknown",
+          scope: state.failureScope || "worker",
+          retryable:
+            state.failureRetryable == null
+              ? true
+              : Boolean(state.failureRetryable),
+          message: state.lastError || state.failureCode,
+          occurredAt: state.lastFailureAt || null,
+        })
+      : null;
 
     return {
       pid: state.proc?.pid || state.pid || null,
@@ -3342,6 +3535,7 @@ function createStreamTargetManager({
       failure_scope: state.failureScope || null,
       failure_retryable:
         state.failureRetryable == null ? true : Boolean(state.failureRetryable),
+      failure,
       last_failure_at: state.lastFailureAt
         ? new Date(state.lastFailureAt).toISOString()
         : null,
