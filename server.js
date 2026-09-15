@@ -9155,6 +9155,118 @@ const transcodeStartupLocks = new Map(); // key -> broadcast generation currentl
 const transcodeRetryCount = new Map(); // key: `${streamKey}:${label}`
 const MAX_TRANSCODE_RETRIES = 10;
 
+// ══════════════════════════════════════════
+// CMAF / fMP4 HLS PACKAGING — Phase 5B
+// ══════════════════════════════════════════
+//
+// Keep CMAF workers separate from ABR transcoders. ABR workers publish
+// renditions back into SRS, while CMAF workers stream-copy the canonical
+// H.264/AAC source into fragmented-MP4 HLS files on local storage.
+//
+// Phase 5B.6d foundation only: no broadcast lifecycle call starts this
+// worker yet, so deploying this revision alone does not alter live output.
+const activeCmafProcesses = new Map(); // streamKey -> ffmpeg child process
+const cmafStartupLocks = new Map(); // streamKey -> broadcast generation
+const cmafRetryCount = new Map(); // streamKey -> failed worker attempts
+const MAX_CMAF_RETRIES = 10;
+
+const CMAF_OUTPUT_ROOT = process.env.CMAF_OUTPUT_ROOT || "/var/nlm-srs/cmaf";
+
+function getCmafOutputDir(streamKey) {
+  const safeStreamKey = String(streamKey || "").replace(
+    /[^a-zA-Z0-9._-]/g,
+    "_",
+  );
+
+  if (!safeStreamKey) {
+    throw new Error("Cannot build CMAF output path for an empty stream key");
+  }
+
+  return path.join(CMAF_OUTPUT_ROOT, safeStreamKey);
+}
+
+function buildCmafFfmpegArgs(streamKey) {
+  const input = getInternalHlsSourceUrl(streamKey);
+  const outputDir = getCmafOutputDir(streamKey);
+
+  return {
+    input,
+    outputDir,
+    playlistPath: path.join(outputDir, "index.m3u8"),
+    args: [
+      "-y",
+      "-hide_banner",
+      "-nostats",
+      "-loglevel",
+      getFfmpegLogLevel(streamKey),
+      "-fflags",
+      "+genpts+discardcorrupt",
+      "-i",
+      input,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
+      "-c:v",
+      "copy",
+      "-tag:v",
+      "avc1",
+      "-c:a",
+      "copy",
+      "-tag:a",
+      "mp4a",
+      "-bsf:a",
+      "aac_adtstoasc",
+      "-f",
+      "hls",
+      "-hls_time",
+      "2",
+      "-hls_list_size",
+      "6",
+      "-hls_segment_type",
+      "fmp4",
+      "-hls_fmp4_init_filename",
+      "init.mp4",
+      "-hls_flags",
+      "delete_segments+append_list+independent_segments+program_date_time",
+      "-hls_segment_filename",
+      path.join(outputDir, "seg-%08d.m4s"),
+      path.join(outputDir, "index.m3u8"),
+    ],
+  };
+}
+
+function stopCmafPackager(streamKey, reason = "canonical source ended") {
+  cmafStartupLocks.delete(streamKey);
+  cmafRetryCount.delete(streamKey);
+
+  const proc = activeCmafProcesses.get(streamKey);
+  if (!proc) return false;
+
+  activeCmafProcesses.delete(streamKey);
+
+  if (proc.exitCode === null && !proc.killed) {
+    console.log(
+      `[CMAF] Stopping packager for ${streamLogId(streamKey)} (${reason}).`,
+    );
+
+    proc.kill("SIGTERM");
+
+    const forceKillTimer = setTimeout(() => {
+      if (proc.exitCode === null) {
+        console.warn(
+          `[CMAF] Force-killing packager for ${streamLogId(streamKey)} after graceful shutdown timeout.`,
+        );
+        proc.kill("SIGKILL");
+      }
+    }, 5000);
+
+    forceKillTimer.unref?.();
+  }
+
+  return true;
+}
+
 // NOTE: bitrateCapGeneration, bitrateCapEncoderGeneration, and
 // isServerLoadTooHighForNewTranscode are declared further down this file
 // but are only ever referenced here from inside function bodies invoked at
