@@ -3187,7 +3187,7 @@ function createStreamTargetManager({
              OR (
                sd.status = 'failed'
                AND COALESCE(sd.last_error, '') ~*
-                 '(connection (was interrupted|timed out)|refused the connection|connection refused|broken pipe|network is unreachable|temporarily unavailable|source media is not ready|delivery could not be verified|reconnect worker failed|automatic reconnect stopped after)'
+                 '(connection (was interrupted|timed out)|refused the connection|connection refused|broken pipe|network is unreachable|temporarily unavailable|source media is not ready|delivery could not be verified|reconnect worker failed)'
              )
            )
            AND (sd.is_running = false OR sd.ffmpeg_pid IS NULL)
@@ -3207,6 +3207,12 @@ function createStreamTargetManager({
         if (existing?.proc && !existing.proc.killed) continue;
         if (existing?.remoteActive) continue;
         if (existing?.recoveryInProgress) continue;
+        if (
+          existing?.nextRetryAt &&
+          Number(existing.nextRetryAt) > Date.now()
+        ) {
+          continue;
+        }
 
         const sourceLive = await isSrsStreamLive(target.channel_stream_key);
         if (!sourceLive) continue;
@@ -3245,10 +3251,9 @@ function createStreamTargetManager({
         state.status = "reconnecting";
         state.recoveryInProgress = true;
         state.nextRetryAt = null;
-        // The watchdog starts a fresh bounded retry cycle. Without resetting
-        // this in-memory counter, a target that previously exhausted its fast
-        // retry budget can immediately fall back to FAILED on the next exit.
-        state.retryAttempt = 0;
+        // Preserve the workerless recovery attempt counter across watchdog
+        // sweeps. Manual starts and verified delivery reset retryAttempt.
+        state.retryAttempt = safeNumber(state.retryAttempt);
         state.failureRetryable = true;
         processStates.set(destinationId, state);
 
@@ -3285,7 +3290,6 @@ function createStreamTargetManager({
             );
 
             if (retryable) {
-              state.status = "reconnecting";
               state.lastError =
                 recoveryResult?.message ||
                 "Automatic recovery is waiting to retry the target.";
@@ -3294,25 +3298,111 @@ function createStreamTargetManager({
               state.failureCategory =
                 recoveryResult?.failure?.category || "recovery";
               state.failureScope =
-                recoveryResult?.failure?.stage === "platform_broadcast"
+                recoveryResult?.failure?.scope ||
+                (recoveryResult?.failure?.stage === "platform_broadcast"
                   ? "destination"
-                  : "worker";
+                  : "worker");
               state.failureRetryable = true;
               state.lastFailureAt = Date.now();
 
-              await pool
-                .query(
-                  `UPDATE social_destinations
-                   SET status='reconnecting',
-                       is_running=false,
-                       ffmpeg_pid=NULL,
-                       current_bitrate_kbps=0,
-                       last_error=$1,
-                       updated_at=NOW()
-                   WHERE id=$2`,
-                  [state.lastError, destinationId],
+              state.reconnectCount =
+                Math.max(
+                  safeNumber(state.reconnectCount),
+                  safeNumber(target.reconnect_count),
+                ) + 1;
+              state.retryAttempt = safeNumber(state.retryAttempt) + 1;
+
+              await recordTargetHealthEvent(
+                destinationId,
+                {
+                  eventType: "reconnect_failed",
+                  healthStatus: "recovering",
+                  severity: "warning",
+                  failureCode: state.failureCode,
+                  failureCategory: state.failureCategory,
+                  failureScope: state.failureScope,
+                  failureRetryable: true,
+                  message: state.lastError,
+                },
+                state,
+              );
+
+              if (
+                state.retryAttempt >=
+                safeNumber(
+                  state.maxReconnectAttempts,
+                  STREAM_TARGET_MAX_RECONNECT_ATTEMPTS,
                 )
-                .catch(() => {});
+              ) {
+                state.status = "failed";
+                state.nextRetryAt = null;
+                state.lastError = `Automatic Stream Target reconnect exhausted after ${state.retryAttempt} attempts.`;
+
+                await pool
+                  .query(
+                    `UPDATE social_destinations
+                     SET status='failed',
+                         is_running=false,
+                         ffmpeg_pid=NULL,
+                         reconnect_count=$1,
+                         current_bitrate_kbps=0,
+                         last_error=$2,
+                         updated_at=NOW()
+                     WHERE id=$3`,
+                    [state.reconnectCount, state.lastError, destinationId],
+                  )
+                  .catch(() => {});
+
+                await recordTargetHealthEvent(
+                  destinationId,
+                  {
+                    eventType: "reconnect_exhausted",
+                    healthStatus: "failed",
+                    severity: "critical",
+                    requiresAttention: true,
+                    failureCode: state.failureCode,
+                    failureCategory: state.failureCategory,
+                    failureScope: state.failureScope,
+                    failureRetryable: true,
+                    message: state.lastError,
+                  },
+                  state,
+                );
+              } else {
+                state.status = "reconnecting";
+                const delay = calculateReconnectDelay(state.retryAttempt);
+                state.nextRetryAt = Date.now() + delay;
+
+                await pool
+                  .query(
+                    `UPDATE social_destinations
+                     SET status='reconnecting',
+                         is_running=false,
+                         ffmpeg_pid=NULL,
+                         reconnect_count=$1,
+                         current_bitrate_kbps=0,
+                         last_error=$2,
+                         updated_at=NOW()
+                     WHERE id=$3`,
+                    [state.reconnectCount, state.lastError, destinationId],
+                  )
+                  .catch(() => {});
+
+                await recordTargetHealthEvent(
+                  destinationId,
+                  {
+                    eventType: "reconnect_scheduled",
+                    healthStatus: "recovering",
+                    severity: "warning",
+                    failureCode: state.failureCode,
+                    failureCategory: state.failureCategory,
+                    failureScope: state.failureScope,
+                    failureRetryable: true,
+                    message: "Automatic Stream Target reconnect scheduled.",
+                  },
+                  state,
+                );
+              }
             }
           }
         } catch (error) {
