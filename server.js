@@ -9236,16 +9236,295 @@ function buildCmafFfmpegArgs(streamKey) {
   };
 }
 
+const CMAF_STARTUP_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.CMAF_STARTUP_TIMEOUT_MS || 20000),
+);
+const CMAF_PROGRESS_TIMEOUT_MS = Math.max(
+  10000,
+  Number(process.env.CMAF_PROGRESS_TIMEOUT_MS || 30000),
+);
+const CMAF_WATCHDOG_INTERVAL_MS = Math.max(
+  2000,
+  Number(process.env.CMAF_WATCHDOG_INTERVAL_MS || 5000),
+);
+const CMAF_RETRY_BASE_MS = Math.max(
+  1000,
+  Number(process.env.CMAF_RETRY_BASE_MS || 3000),
+);
+
+const cmafRetryTimers = new Map(); // streamKey -> pending retry timer
+const cmafIntentionalStops = new Set(); // streamKey -> suppress restart after explicit stop
+
+function clearCmafRetryTimer(streamKey) {
+  const timer = cmafRetryTimers.get(streamKey);
+  if (timer) clearTimeout(timer);
+  cmafRetryTimers.delete(streamKey);
+}
+
+function clearCmafOutputFiles(outputDir) {
+  try {
+    fs.mkdirSync(outputDir, { recursive: true });
+    for (const name of fs.readdirSync(outputDir)) {
+      if (
+        name === "index.m3u8" ||
+        name === "init.mp4" ||
+        /^seg-\d+\.m4s$/i.test(name) ||
+        name.endsWith(".tmp")
+      ) {
+        try {
+          fs.unlinkSync(path.join(outputDir, name));
+        } catch {
+          // Best-effort cleanup. FFmpeg startup will report any real write issue.
+        }
+      }
+    }
+  } catch (err) {
+    throw new Error(`Unable to prepare CMAF output directory: ${err.message}`);
+  }
+}
+
+function getCmafReadinessSnapshot(outputDir) {
+  const playlistPath = path.join(outputDir, "index.m3u8");
+  const initPath = path.join(outputDir, "init.mp4");
+
+  let playlistBytes = 0;
+  let initBytes = 0;
+  let newestSegmentMtimeMs = 0;
+  let segmentCount = 0;
+
+  try {
+    playlistBytes = fs.statSync(playlistPath).size;
+  } catch {}
+
+  try {
+    initBytes = fs.statSync(initPath).size;
+  } catch {}
+
+  try {
+    for (const name of fs.readdirSync(outputDir)) {
+      if (!/^seg-\d+\.m4s$/i.test(name)) continue;
+      const stat = fs.statSync(path.join(outputDir, name));
+      if (!stat.isFile() || stat.size <= 0) continue;
+      segmentCount += 1;
+      newestSegmentMtimeMs = Math.max(newestSegmentMtimeMs, stat.mtimeMs || 0);
+    }
+  } catch {}
+
+  return {
+    ready: playlistBytes > 0 && initBytes > 0 && segmentCount > 0,
+    playlistBytes,
+    initBytes,
+    segmentCount,
+    newestSegmentMtimeMs,
+  };
+}
+
+function scheduleCmafRetry(streamKey, generation, reason) {
+  if (bitrateCapGeneration.get(streamKey) !== generation) return false;
+  if (cmafRetryTimers.has(streamKey)) return false;
+
+  const attempt = (cmafRetryCount.get(streamKey) || 0) + 1;
+  cmafRetryCount.set(streamKey, attempt);
+
+  if (attempt > MAX_CMAF_RETRIES) {
+    console.error(
+      `[CMAF] Giving up for ${streamLogId(streamKey)} after ${MAX_CMAF_RETRIES} retries (${reason}).`,
+    );
+    return false;
+  }
+
+  const delayMs = Math.min(
+    30000,
+    CMAF_RETRY_BASE_MS * Math.pow(2, attempt - 1),
+  );
+  console.warn(
+    `[CMAF] Scheduling retry ${attempt}/${MAX_CMAF_RETRIES} for ${streamLogId(streamKey)} in ${Math.round(delayMs / 1000)}s (${reason}).`,
+  );
+
+  const timer = setTimeout(() => {
+    cmafRetryTimers.delete(streamKey);
+    if (bitrateCapGeneration.get(streamKey) !== generation) return;
+    startCmafPackager(streamKey, generation).catch((err) => {
+      console.error(
+        `[CMAF] Retry startup failed for ${streamLogId(streamKey)}: ${redactStreamKeyFromText(err.message, streamKey)}`,
+      );
+    });
+  }, delayMs);
+
+  timer.unref?.();
+  cmafRetryTimers.set(streamKey, timer);
+  return true;
+}
+
+async function startCmafPackager(streamKey, generation) {
+  if (!streamKey) throw new Error("CMAF packager requires a stream key");
+  if (bitrateCapGeneration.get(streamKey) !== generation) return false;
+
+  const existing = activeCmafProcesses.get(streamKey);
+  if (existing?.proc?.exitCode === null) return true;
+
+  if (cmafStartupLocks.get(streamKey) === generation) return false;
+  cmafStartupLocks.set(streamKey, generation);
+  cmafIntentionalStops.delete(streamKey);
+  clearCmafRetryTimer(streamKey);
+
+  let proc = null;
+  let watchdog = null;
+  let startupTimer = null;
+  let stderrTail = "";
+
+  try {
+    const spec = buildCmafFfmpegArgs(streamKey);
+    clearCmafOutputFiles(spec.outputDir);
+
+    if (bitrateCapGeneration.get(streamKey) !== generation) return false;
+
+    console.log(`[CMAF] Starting packager for ${streamLogId(streamKey)}.`);
+    proc = spawn("ffmpeg", spec.args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    const state = {
+      proc,
+      generation,
+      outputDir: spec.outputDir,
+      playlistPath: spec.playlistPath,
+      startedAt: Date.now(),
+      readyAt: null,
+      lastProgressAt: Date.now(),
+      lastSegmentMtimeMs: 0,
+      watchdog: null,
+    };
+    activeCmafProcesses.set(streamKey, state);
+
+    proc.stderr?.on("data", (chunk) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-12000);
+    });
+
+    const terminateForHealthFailure = (reason) => {
+      const current = activeCmafProcesses.get(streamKey);
+      if (!current || current.proc !== proc || proc.exitCode !== null) return;
+      console.warn(
+        `[CMAF] ${streamLogId(streamKey)} ${reason}; restarting worker.`,
+      );
+      proc.kill("SIGTERM");
+    };
+
+    startupTimer = setTimeout(() => {
+      const current = activeCmafProcesses.get(streamKey);
+      if (!current || current.proc !== proc || current.readyAt) return;
+      terminateForHealthFailure("did not become ready before startup timeout");
+    }, CMAF_STARTUP_TIMEOUT_MS);
+    startupTimer.unref?.();
+
+    watchdog = setInterval(() => {
+      const current = activeCmafProcesses.get(streamKey);
+      if (!current || current.proc !== proc || proc.exitCode !== null) return;
+      if (bitrateCapGeneration.get(streamKey) !== generation) {
+        proc.kill("SIGTERM");
+        return;
+      }
+
+      const snapshot = getCmafReadinessSnapshot(spec.outputDir);
+      if (snapshot.newestSegmentMtimeMs > current.lastSegmentMtimeMs) {
+        current.lastSegmentMtimeMs = snapshot.newestSegmentMtimeMs;
+        current.lastProgressAt = Date.now();
+      }
+
+      if (snapshot.ready && !current.readyAt) {
+        current.readyAt = Date.now();
+        current.lastProgressAt = Date.now();
+        cmafRetryCount.set(streamKey, 0);
+        if (startupTimer) clearTimeout(startupTimer);
+        startupTimer = null;
+        console.log(
+          `[CMAF] Ready for ${streamLogId(streamKey)} (${snapshot.segmentCount} segment(s)).`,
+        );
+      }
+
+      if (
+        current.readyAt &&
+        Date.now() - current.lastProgressAt > CMAF_PROGRESS_TIMEOUT_MS
+      ) {
+        terminateForHealthFailure("stopped producing segment progress");
+      }
+    }, CMAF_WATCHDOG_INTERVAL_MS);
+    watchdog.unref?.();
+    state.watchdog = watchdog;
+
+    proc.once("error", (err) => {
+      stderrTail = `${stderrTail}\n${err.message}`.slice(-12000);
+    });
+
+    proc.once("exit", (code, signal) => {
+      if (startupTimer) clearTimeout(startupTimer);
+      if (watchdog) clearInterval(watchdog);
+
+      const current = activeCmafProcesses.get(streamKey);
+      if (current?.proc === proc) activeCmafProcesses.delete(streamKey);
+      if (cmafStartupLocks.get(streamKey) === generation) {
+        cmafStartupLocks.delete(streamKey);
+      }
+
+      const sameGeneration = bitrateCapGeneration.get(streamKey) === generation;
+      const intentionalStop = cmafIntentionalStops.delete(streamKey);
+      const cleanTail = redactStreamKeyFromText(stderrTail, streamKey)
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(-1200);
+
+      if (intentionalStop) {
+        console.log(
+          `[CMAF] Packager stopped for ${streamLogId(streamKey)} without retry.`,
+        );
+        return;
+      }
+
+      if (!sameGeneration) {
+        console.log(
+          `[CMAF] Packager exited for superseded ${streamLogId(streamKey)} generation.`,
+        );
+        return;
+      }
+
+      console.warn(
+        `[CMAF] Packager exited for ${streamLogId(streamKey)} code=${code} signal=${signal || "none"}` +
+          (cleanTail ? ` stderr=${cleanTail}` : ""),
+      );
+      scheduleCmafRetry(streamKey, generation, "worker exited");
+    });
+
+    return true;
+  } catch (err) {
+    if (startupTimer) clearTimeout(startupTimer);
+    if (watchdog) clearInterval(watchdog);
+    if (cmafStartupLocks.get(streamKey) === generation) {
+      cmafStartupLocks.delete(streamKey);
+    }
+    if (proc && proc.exitCode === null) proc.kill("SIGTERM");
+    scheduleCmafRetry(streamKey, generation, "startup failed");
+    throw err;
+  }
+}
+
 function stopCmafPackager(streamKey, reason = "canonical source ended") {
   cmafStartupLocks.delete(streamKey);
   cmafRetryCount.delete(streamKey);
+  clearCmafRetryTimer(streamKey);
+  cmafIntentionalStops.add(streamKey);
 
-  const proc = activeCmafProcesses.get(streamKey);
-  if (!proc) return false;
+  const state = activeCmafProcesses.get(streamKey);
+  if (!state) {
+    cmafIntentionalStops.delete(streamKey);
+    return false;
+  }
 
   activeCmafProcesses.delete(streamKey);
+  if (state.watchdog) clearInterval(state.watchdog);
 
-  if (proc.exitCode === null && !proc.killed) {
+  const proc = state.proc;
+  if (proc && proc.exitCode === null && !proc.killed) {
     console.log(
       `[CMAF] Stopping packager for ${streamLogId(streamKey)} (${reason}).`,
     );
