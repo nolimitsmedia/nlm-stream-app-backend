@@ -2883,24 +2883,31 @@ function createStreamTargetManager({
           stage: preflight.stage || "connect",
         });
 
-        await recordTargetHealthEvent(
-          target.id,
-          {
-            eventType: "target_start_failed",
-            healthStatus: recoverablePreflightFailure ? "recovering" : "failed",
-            severity: recoverablePreflightFailure ? "warning" : "critical",
-            requiresAttention: !recoverablePreflightFailure,
-            failureCode: preflightFailure.code,
-            failureCategory: preflightFailure.category,
-            failureScope: preflightFailure.scope,
-            failureRetryable: preflightFailure.retryable,
-            message: preflightFailure.message,
-          },
-          processStates.get(Number(target.id)) || {
-            reconnectCount: safeNumber(target.reconnect_count),
-            deliveryVerified: false,
-          },
-        );
+        // Manual Start owns target_start_failed. Automatic recovery owns
+        // reconnect_failed / reconnect_scheduled / reconnect_exhausted,
+        // so do not duplicate the same preflight failure in health history.
+        if (!options.reconnect) {
+          await recordTargetHealthEvent(
+            target.id,
+            {
+              eventType: "target_start_failed",
+              healthStatus: recoverablePreflightFailure
+                ? "recovering"
+                : "failed",
+              severity: recoverablePreflightFailure ? "warning" : "critical",
+              requiresAttention: !recoverablePreflightFailure,
+              failureCode: preflightFailure.code,
+              failureCategory: preflightFailure.category,
+              failureScope: preflightFailure.scope,
+              failureRetryable: preflightFailure.retryable,
+              message: preflightFailure.message,
+            },
+            processStates.get(Number(target.id)) || {
+              reconnectCount: safeNumber(target.reconnect_count),
+              deliveryVerified: false,
+            },
+          );
+        }
 
         return {
           ok: false,
