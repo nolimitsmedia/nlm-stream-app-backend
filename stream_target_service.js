@@ -2856,9 +2856,7 @@ function createStreamTargetManager({
         // RECONNECTING. Persisting it as FAILED makes the recovery watchdog
         // ignore the target forever even after the destination comes back.
         const recoverablePreflightFailure = Boolean(
-          options.reconnect &&
-          target.auto_reconnect &&
-          preflight.retryable !== false,
+          target.auto_reconnect && preflight.retryable !== false,
         );
         const preflightStatus = recoverablePreflightFailure
           ? "reconnecting"
@@ -2876,17 +2874,38 @@ function createStreamTargetManager({
           ],
         );
 
+        const preflightFailure = buildStructuredFailure({
+          code: preflight.code || "preflight_failed",
+          category: preflight.category || "destination",
+          scope: "destination",
+          retryable: preflight.retryable !== false,
+          message: preflight.message || "Destination preflight failed",
+          stage: preflight.stage || "connect",
+        });
+
+        await recordTargetHealthEvent(
+          target.id,
+          {
+            eventType: "target_start_failed",
+            healthStatus: recoverablePreflightFailure ? "recovering" : "failed",
+            severity: recoverablePreflightFailure ? "warning" : "critical",
+            requiresAttention: !recoverablePreflightFailure,
+            failureCode: preflightFailure.code,
+            failureCategory: preflightFailure.category,
+            failureScope: preflightFailure.scope,
+            failureRetryable: preflightFailure.retryable,
+            message: preflightFailure.message,
+          },
+          processStates.get(Number(target.id)) || {
+            reconnectCount: safeNumber(target.reconnect_count),
+            deliveryVerified: false,
+          },
+        );
+
         return {
           ok: false,
           message: preflight.message || "Destination preflight failed",
-          failure: buildStructuredFailure({
-            code: preflight.code || "preflight_failed",
-            category: preflight.category || "destination",
-            scope: "destination",
-            retryable: preflight.retryable !== false,
-            message: preflight.message || "Destination preflight failed",
-            stage: preflight.stage || "connect",
-          }),
+          failure: preflightFailure,
           preflight,
         };
       }
