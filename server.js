@@ -9107,6 +9107,7 @@ async function getOrgStreamingPlan(organizationId) {
       SELECT
         COALESCE(s.plan_key, o.subscription_plan, 'starter') AS plan_key,
         COALESCE(o.transcoding_override, p.transcoding_enabled) AS transcoding_enabled,
+        p.reduced_latency_enabled,
         p.max_channels,
         p.max_channels AS max_concurrent_streams
       FROM organizations o
@@ -9119,6 +9120,7 @@ async function getOrgStreamingPlan(organizationId) {
     return (
       result.rows[0] || {
         transcoding_enabled: false,
+        reduced_latency_enabled: false,
         max_concurrent_streams: 1,
       }
     );
@@ -9127,7 +9129,11 @@ async function getOrgStreamingPlan(organizationId) {
       `[PLAN] Failed to look up streaming plan for org ${organizationId}, defaulting to most restrictive limits:`,
       err.message,
     );
-    return { transcoding_enabled: false, max_concurrent_streams: 1 };
+    return {
+      transcoding_enabled: false,
+      reduced_latency_enabled: false,
+      max_concurrent_streams: 1,
+    };
   }
 }
 
@@ -12293,19 +12299,20 @@ app.post("/api/srs/on_publish", async (req, res) => {
         ),
       );
 
-    // Phase 5B.6f — start the parallel CMAF/fMP4 packager from the canonical
-    // raw-stream lifecycle. The worker has its own readiness/progress watchdog,
-    // bounded retry budget, and generation protection from Phase 5B.6e.
-    // This does not replace the existing SRS TS-HLS/DVR/ABR path.
-    const cmafStartupTimer = setTimeout(() => {
-      startCmafPackager(streamKey, generation).catch((err) =>
-        console.error(
-          `[CMAF] Auto-start failed for ${streamLogId(streamKey)}:`,
-          err.message,
-        ),
-      );
-    }, 3000);
-    cmafStartupTimer.unref?.();
+    // Phase 5B.6g — reduced-latency CMAF/fMP4 is plan-entitled.
+    // The normal TS-HLS/DVR/ABR broadcast remains available regardless of
+    // this optional reduced-latency entitlement.
+    if (Boolean(plan.reduced_latency_enabled)) {
+      const cmafStartupTimer = setTimeout(() => {
+        startCmafPackager(streamKey, generation).catch((err) =>
+          console.error(
+            `[CMAF] Auto-start failed for ${streamLogId(streamKey)}:`,
+            err.message,
+          ),
+        );
+      }, 3000);
+      cmafStartupTimer.unref?.();
+    }
 
     // 4b. STREAM TARGET AUTO-START — Phase 2 generic target orchestration.
     // Targets explicitly configured with enabled + auto_start are started
