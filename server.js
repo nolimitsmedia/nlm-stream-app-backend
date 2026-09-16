@@ -9258,6 +9258,10 @@ const CMAF_RETRY_BASE_MS = Math.max(
   1000,
   Number(process.env.CMAF_RETRY_BASE_MS || 3000),
 );
+const CMAF_AUTO_START_DELAY_MS = Math.max(
+  3000,
+  Number(process.env.CMAF_AUTO_START_DELAY_MS || 8000),
+);
 
 const cmafRetryTimers = new Map(); // streamKey -> pending retry timer
 const cmafIntentionalStops = new Set(); // streamKey -> suppress restart after explicit stop
@@ -9295,12 +9299,27 @@ function getCmafReadinessSnapshot(outputDir) {
   const initPath = path.join(outputDir, "init.mp4");
 
   let playlistBytes = 0;
+  let playlistMtimeMs = 0;
+  let mediaSequence = null;
   let initBytes = 0;
   let newestSegmentMtimeMs = 0;
+  let lastSegmentName = "";
+  let lastSegmentNumber = -1;
   let segmentCount = 0;
 
   try {
-    playlistBytes = fs.statSync(playlistPath).size;
+    const playlistStat = fs.statSync(playlistPath);
+    playlistBytes = playlistStat.size;
+    playlistMtimeMs = playlistStat.mtimeMs || 0;
+
+    const playlistText = fs.readFileSync(playlistPath, "utf8");
+    const mediaSequenceMatch = playlistText.match(
+      /^#EXT-X-MEDIA-SEQUENCE:(\d+)\s*$/m,
+    );
+    if (mediaSequenceMatch) {
+      const parsed = Number(mediaSequenceMatch[1]);
+      if (Number.isSafeInteger(parsed) && parsed >= 0) mediaSequence = parsed;
+    }
   } catch {}
 
   try {
@@ -9309,20 +9328,35 @@ function getCmafReadinessSnapshot(outputDir) {
 
   try {
     for (const name of fs.readdirSync(outputDir)) {
-      if (!/^seg-\d+\.m4s$/i.test(name)) continue;
+      const match = name.match(/^seg-(\d+)\.m4s$/i);
+      if (!match) continue;
       const stat = fs.statSync(path.join(outputDir, name));
       if (!stat.isFile() || stat.size <= 0) continue;
+
       segmentCount += 1;
       newestSegmentMtimeMs = Math.max(newestSegmentMtimeMs, stat.mtimeMs || 0);
+
+      const segmentNumber = Number(match[1]);
+      if (
+        Number.isSafeInteger(segmentNumber) &&
+        segmentNumber > lastSegmentNumber
+      ) {
+        lastSegmentNumber = segmentNumber;
+        lastSegmentName = name;
+      }
     }
   } catch {}
 
   return {
     ready: playlistBytes > 0 && initBytes > 0 && segmentCount > 0,
     playlistBytes,
+    playlistMtimeMs,
+    mediaSequence,
     initBytes,
     segmentCount,
     newestSegmentMtimeMs,
+    lastSegmentName,
+    lastSegmentNumber,
   };
 }
 
@@ -9400,6 +9434,10 @@ async function startCmafPackager(streamKey, generation) {
       readyAt: null,
       lastProgressAt: Date.now(),
       lastSegmentMtimeMs: 0,
+      lastSegmentName: "",
+      lastSegmentNumber: -1,
+      lastMediaSequence: null,
+      lastPlaylistMtimeMs: 0,
       watchdog: null,
     };
     activeCmafProcesses.set(streamKey, state);
@@ -9433,19 +9471,72 @@ async function startCmafPackager(streamKey, generation) {
       }
 
       const snapshot = getCmafReadinessSnapshot(spec.outputDir);
-      if (snapshot.newestSegmentMtimeMs > current.lastSegmentMtimeMs) {
-        current.lastSegmentMtimeMs = snapshot.newestSegmentMtimeMs;
-        current.lastProgressAt = Date.now();
-      }
 
       if (snapshot.ready && !current.readyAt) {
+        // Phase 5B.6i — establish the first ready presentation as the progress
+        // baseline. Future watchdog passes must observe actual media movement,
+        // rather than treating the files that made the worker ready as new
+        // post-readiness progress.
         current.readyAt = Date.now();
         current.lastProgressAt = Date.now();
+        current.lastSegmentMtimeMs = snapshot.newestSegmentMtimeMs;
+        current.lastSegmentName = snapshot.lastSegmentName;
+        current.lastSegmentNumber = snapshot.lastSegmentNumber;
+        current.lastMediaSequence = snapshot.mediaSequence;
+        current.lastPlaylistMtimeMs = snapshot.playlistMtimeMs;
         cmafRetryCount.set(streamKey, 0);
         if (startupTimer) clearTimeout(startupTimer);
         startupTimer = null;
         console.log(
           `[CMAF] Ready for ${streamLogId(streamKey)} (${snapshot.segmentCount} segment(s)).`,
+        );
+      } else if (snapshot.ready && current.readyAt) {
+        // A playlist rewrite by itself is not proof that media advanced. Count
+        // progress only when segment identity/number/mtime or media sequence
+        // moves forward. Keeping several independent signals avoids false stall
+        // restarts when filesystem timestamp behavior alone is ambiguous.
+        const segmentNumberAdvanced =
+          snapshot.lastSegmentNumber > current.lastSegmentNumber;
+        const segmentNameAdvanced =
+          Boolean(snapshot.lastSegmentName) &&
+          snapshot.lastSegmentName !== current.lastSegmentName &&
+          snapshot.lastSegmentNumber >= current.lastSegmentNumber;
+        const segmentMtimeAdvanced =
+          snapshot.newestSegmentMtimeMs > current.lastSegmentMtimeMs;
+        const mediaSequenceAdvanced =
+          snapshot.mediaSequence !== null &&
+          (current.lastMediaSequence === null ||
+            snapshot.mediaSequence > current.lastMediaSequence);
+
+        if (
+          segmentNumberAdvanced ||
+          segmentNameAdvanced ||
+          segmentMtimeAdvanced ||
+          mediaSequenceAdvanced
+        ) {
+          current.lastProgressAt = Date.now();
+          current.lastSegmentMtimeMs = Math.max(
+            current.lastSegmentMtimeMs,
+            snapshot.newestSegmentMtimeMs,
+          );
+          if (snapshot.lastSegmentNumber >= current.lastSegmentNumber) {
+            current.lastSegmentNumber = snapshot.lastSegmentNumber;
+            current.lastSegmentName = snapshot.lastSegmentName;
+          }
+          if (
+            snapshot.mediaSequence !== null &&
+            (current.lastMediaSequence === null ||
+              snapshot.mediaSequence > current.lastMediaSequence)
+          ) {
+            current.lastMediaSequence = snapshot.mediaSequence;
+          }
+        }
+
+        // Retain playlist mtime for diagnostics/baseline visibility, but never
+        // use it alone to keep a stalled worker healthy.
+        current.lastPlaylistMtimeMs = Math.max(
+          current.lastPlaylistMtimeMs,
+          snapshot.playlistMtimeMs,
         );
       }
 
@@ -12329,7 +12420,7 @@ app.post("/api/srs/on_publish", async (req, res) => {
             err.message,
           ),
         );
-      }, 3000);
+      }, CMAF_AUTO_START_DELAY_MS);
       cmafStartupTimer.unref?.();
     }
 
