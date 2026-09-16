@@ -12265,13 +12265,32 @@ app.post("/api/srs/on_publish", async (req, res) => {
       [streamKey],
     );
 
-    // New broadcast session — bump the shared generation so any OLD retry
-    // chain still in-flight for this stream_key (bitrate cap OR ABR
-    // transcode, e.g. from a brief encoder reconnect blip) recognizes it's
-    // been superseded and abandons itself, instead of racing this new
-    // attempt to publish to the same output names.
-    const generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
-    bitrateCapGeneration.set(streamKey, generation);
+    // Phase 5B.6h — preserve the shared broadcast generation when the
+    // canonical raw publisher returns during a confirmed Pull Source HA
+    // handoff. The handoff path intentionally preserves the logical broadcast,
+    // DVR/session state, ABR workers, and CMAF worker; advancing the generation
+    // here would supersede those surviving workers and can race the delayed
+    // replacement startup. A genuinely new broadcast still advances the
+    // generation exactly as before.
+    let generation;
+    if (recoveredFromSourceHandoff) {
+      generation = bitrateCapGeneration.get(streamKey);
+
+      // Defensive fallback for a recovered session whose in-memory generation
+      // was lost (for example after backend process recovery). Keep the value
+      // valid without pretending this HA return is a brand-new broadcast.
+      if (!generation) {
+        generation = 1;
+        bitrateCapGeneration.set(streamKey, generation);
+      }
+
+      console.log(
+        `[SRS-HA] Reusing broadcast generation ${generation} for recovered ${streamLogId(streamKey)}.`,
+      );
+    } else {
+      generation = (bitrateCapGeneration.get(streamKey) || 0) + 1;
+      bitrateCapGeneration.set(streamKey, generation);
+    }
     // Fresh broadcast session — clear retry budgets for every rendition
     // label that might be in flight for this stream_key (labels are now
     // plan-driven, not a fixed "720p"/"480p" pair, so this clears by
