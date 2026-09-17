@@ -8355,6 +8355,50 @@ const getPublicWatchStatus = async (streamKey) => {
     playbackReady = abrReady;
   }
 
+  // Phase 5B.8b — advertise reduced-latency CMAF only when the current
+  // broadcast has a live, current-generation worker that has completed
+  // startup and still has a usable fMP4 presentation on disk. The CMAF
+  // watchdog remains the authority for progress/stall detection; this public
+  // status check deliberately does not duplicate its timeout policy.
+  let cmafReady = false;
+  let cmafAuthQs = "";
+
+  if (activeStream && reducedLatencyEnabled) {
+    try {
+      const cmafState = activeCmafProcesses.get(streamKey);
+      const currentGeneration = bitrateCapGeneration.get(streamKey);
+
+      const workerReady = Boolean(
+        cmafState &&
+        cmafState.proc?.exitCode === null &&
+        cmafState.readyAt &&
+        cmafState.generation === currentGeneration,
+      );
+
+      if (workerReady) {
+        const cmafSnapshot = getCmafReadinessSnapshot(
+          getCmafOutputDir(streamKey),
+        );
+        cmafReady = Boolean(cmafSnapshot.ready);
+      }
+
+      if (cmafReady) {
+        const cmafUrlPath = `/api/cmaf/${streamKey}/index.m3u8`;
+        cmafAuthQs = appendBunnyToken(cmafUrlPath);
+      }
+    } catch (cmafStatusError) {
+      // CMAF is an optional preferred playback path. Any readiness inspection
+      // failure must fail closed to the existing TS-HLS/ABR path rather than
+      // making the public Watch status endpoint fail.
+      cmafReady = false;
+      cmafAuthQs = "";
+      console.debug(
+        `[WATCH-STATUS] CMAF readiness check failed for ${streamLogId(streamKey)}:`,
+        cmafStatusError.message,
+      );
+    }
+  }
+
   return {
     organization_id: organizationId,
     organization: brandingData.organization,
@@ -8369,6 +8413,8 @@ const getPublicWatchStatus = async (streamKey) => {
     hlsBaseUrl,
     rtcBaseUrl,
     hlsAuthQs,
+    cmafReady,
+    cmafAuthQs,
     reducedLatencyEnabled,
     transcodingEnabled,
     rewindEnabled,
