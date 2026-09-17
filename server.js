@@ -11391,6 +11391,171 @@ app.post("/api/player/error-report", (req, res) => {
   }
 });
 
+// Phase 5B.7b — protected CMAF/fMP4 delivery surface.
+//
+// This is deliberately parallel to the existing /api/hls compatibility/DVR
+// path. It exposes only the three file shapes produced by the CMAF packager,
+// fails closed when the organization is not entitled to reduced latency, and
+// rewrites the local playlist into Bunny-signed public URLs. A per-broadcast
+// session tag prevents a reused segment/init filename from resolving to bytes
+// cached for an earlier broadcast.
+async function getCmafDeliveryContext(streamKey) {
+  const cleanStreamKey = String(streamKey || "")
+    .trim()
+    .slice(0, 255);
+  if (!cleanStreamKey) return null;
+
+  const channelResult = await queryWithRetry(
+    `SELECT id, organization_id, is_live, live_started_at
+     FROM channels
+     WHERE stream_key = $1
+     LIMIT 1`,
+    [cleanStreamKey],
+  );
+  const channel = channelResult.rows[0];
+  if (!channel?.organization_id) return null;
+
+  const plan = await getOrgStreamingPlan(channel.organization_id);
+  return {
+    channel,
+    entitled: Boolean(plan?.reduced_latency_enabled),
+    outputDir: getCmafOutputDir(cleanStreamKey),
+  };
+}
+
+function setCmafManifestHeaders(res) {
+  res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("CDN-Cache-Control", "no-store");
+  res.setHeader("Surrogate-Control", "no-store");
+}
+
+function setCmafMediaHeaders(res) {
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Cache-Control",
+    `public, max-age=${SEGMENT_EDGE_CACHE_SECONDS}`,
+  );
+}
+
+function buildSignedCmafMediaUrl(streamKey, filename, sessionToken) {
+  const mediaPath = `/api/cmaf/${encodeURIComponent(streamKey)}/${encodeURIComponent(filename)}`;
+  const sessionQs = `?_s=${encodeURIComponent(String(sessionToken || 0))}`;
+  return `${mediaPath}${appendBunnyToken(mediaPath, sessionQs)}`;
+}
+
+function rewriteCmafManifestForDelivery(text, streamKey, sessionToken) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+
+      if (trimmed.startsWith("#EXT-X-MAP:")) {
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        if (!uriMatch) return line;
+        const filename = uriMatch[1].split("?")[0].split("/").pop();
+        if (filename !== "init.mp4") return line;
+        return line.replace(
+          uriMatch[1],
+          buildSignedCmafMediaUrl(streamKey, "init.mp4", sessionToken),
+        );
+      }
+
+      if (!trimmed || trimmed.startsWith("#")) return line;
+
+      const filename = trimmed.split("?")[0].split("/").pop();
+      if (!/^seg-\d+\.m4s$/i.test(filename)) return line;
+      return buildSignedCmafMediaUrl(streamKey, filename, sessionToken);
+    })
+    .join("\n");
+}
+
+app.get("/api/cmaf/:streamKey/index.m3u8", async (req, res) => {
+  const { streamKey } = req.params;
+
+  try {
+    const context = await getCmafDeliveryContext(streamKey);
+    if (!context) return res.status(404).send("CMAF stream not found");
+    if (!context.entitled) {
+      return res.status(403).send("Reduced-latency playback is not enabled");
+    }
+    if (!context.channel.is_live) {
+      return res.status(404).send("CMAF stream is not live");
+    }
+
+    const snapshot = getCmafReadinessSnapshot(context.outputDir);
+    if (!snapshot.ready) {
+      res.setHeader("Retry-After", "2");
+      return res.status(503).send("CMAF playlist is not ready yet");
+    }
+
+    const playlistPath = path.join(context.outputDir, "index.m3u8");
+    const text = await fs.promises.readFile(playlistPath, "utf8");
+    const sessionToken = context.channel.live_started_at
+      ? new Date(context.channel.live_started_at).getTime()
+      : 0;
+
+    setCmafManifestHeaders(res);
+    return res.send(
+      rewriteCmafManifestForDelivery(text, streamKey, sessionToken),
+    );
+  } catch (err) {
+    console.error(
+      `[CMAF-DELIVERY] Manifest failed for ${streamLogId(streamKey)}:`,
+      err.message,
+    );
+    return res.status(503).send("CMAF playlist temporarily unavailable");
+  }
+});
+
+app.get("/api/cmaf/:streamKey/:filename", async (req, res) => {
+  const { streamKey, filename } = req.params;
+
+  // This endpoint is intentionally not a generic static-file server. Only the
+  // exact immutable objects emitted by buildCmafFfmpegArgs() are reachable.
+  if (filename !== "init.mp4" && !/^seg-\d+\.m4s$/i.test(filename)) {
+    return res.status(400).send("Invalid CMAF media filename");
+  }
+
+  try {
+    const context = await getCmafDeliveryContext(streamKey);
+    if (!context) return res.status(404).send("CMAF stream not found");
+    if (!context.entitled) {
+      return res.status(403).send("Reduced-latency playback is not enabled");
+    }
+
+    const filePath = path.join(context.outputDir, filename);
+    const resolvedRoot = path.resolve(context.outputDir) + path.sep;
+    const resolvedFile = path.resolve(filePath);
+    if (!resolvedFile.startsWith(resolvedRoot)) {
+      return res.status(400).send("Invalid CMAF media path");
+    }
+
+    let stat;
+    try {
+      stat = await fs.promises.stat(resolvedFile);
+    } catch (err) {
+      if (err?.code === "ENOENT")
+        return res.status(404).send("CMAF media unavailable");
+      throw err;
+    }
+    if (!stat.isFile() || stat.size <= 0) {
+      return res.status(404).send("CMAF media unavailable");
+    }
+
+    setCmafMediaHeaders(res);
+    return res.sendFile(resolvedFile);
+  } catch (err) {
+    console.error(
+      `[CMAF-DELIVERY] Media failed for ${streamLogId(streamKey)}:`,
+      err.message,
+    );
+    return res.status(503).send("CMAF media temporarily unavailable");
+  }
+});
+
 app.get("/api/hls/session/:streamKey", async (req, res) => {
   try {
     const { streamKey } = req.params;
