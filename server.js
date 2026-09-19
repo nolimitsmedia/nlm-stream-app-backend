@@ -10289,9 +10289,20 @@ async function getRenditionPlanForOrg(organizationId) {
         label: "top",
         bitrateKbps: capKbps || 3500,
         resolution: "1920x1080",
+        transcodingProfileId: DEFAULT_TRANSCODING_PROFILE_ID,
       },
-      { label: "720p", bitrateKbps: 2500, resolution: "1280x720" },
-      { label: "480p", bitrateKbps: 1200, resolution: "854x480" },
+      {
+        label: "720p",
+        bitrateKbps: 2500,
+        resolution: "1280x720",
+        transcodingProfileId: DEFAULT_TRANSCODING_PROFILE_ID,
+      },
+      {
+        label: "480p",
+        bitrateKbps: 1200,
+        resolution: "854x480",
+        transcodingProfileId: DEFAULT_TRANSCODING_PROFILE_ID,
+      },
     ];
   }
 
@@ -10303,6 +10314,7 @@ async function getRenditionPlanForOrg(organizationId) {
         label: "top",
         bitrateKbps: capKbps,
         resolution: pickResolutionForBitrate(capKbps),
+        transcodingProfileId: DEFAULT_TRANSCODING_PROFILE_ID,
       },
     ];
   }
@@ -10328,12 +10340,48 @@ function getFfmpegLogLevel(streamKey) {
     : "repeat+level+verbose";
 }
 
+// Phase 5C.6 — reusable transcoding profile foundation.
+// Existing ABR labels and lifecycle stay unchanged. Node 01 has only the
+// verified CPU/libx264 profile registered; future hardware profiles must be
+// explicitly added only after the media node proves that encoder is usable.
+const TRANSCODING_PROFILES = Object.freeze({
+  "cpu-h264-balanced": Object.freeze({
+    id: "cpu-h264-balanced",
+    family: "h264",
+    encoder: "libx264",
+    preset: "veryfast",
+    fps: 30,
+    gopSeconds: 2,
+    audioCodec: "aac",
+    audioBitrateHigh: "128k",
+    audioBitrateLow: "96k",
+    bufferMultiplier: 2,
+  }),
+});
+
+const DEFAULT_TRANSCODING_PROFILE_ID = "cpu-h264-balanced";
+
+function getTranscodingProfile(profileId = DEFAULT_TRANSCODING_PROFILE_ID) {
+  const requestedId = String(profileId || "").trim();
+  return (
+    TRANSCODING_PROFILES[requestedId] ||
+    TRANSCODING_PROFILES[DEFAULT_TRANSCODING_PROFILE_ID]
+  );
+}
+
 function buildRenditionFfmpegArgs(
   streamKey,
   input,
   output,
-  { bitrateKbps, resolution },
+  { bitrateKbps, resolution, transcodingProfileId },
 ) {
+  const profile = getTranscodingProfile(transcodingProfileId);
+  const safeBitrateKbps = Math.max(1, Math.round(Number(bitrateKbps) || 1));
+  const bufferKbps = Math.max(
+    safeBitrateKbps,
+    Math.round(safeBitrateKbps * profile.bufferMultiplier),
+  );
+
   return [
     "-y",
     "-hide_banner",
@@ -10348,39 +10396,30 @@ function buildRenditionFfmpegArgs(
     "-map",
     "0:a:0?",
     "-c:v",
-    "libx264",
+    profile.encoder,
     "-preset",
-    "veryfast",
+    profile.preset,
     ...keyframeAlignmentFlags,
     "-b:v",
-    `${bitrateKbps}k`,
-    // -maxrate/-bufsize make this a genuine HARD ceiling, not just a
-    // target — this is what the old bitrate-cap process did that the
-    // original 720p/480p renditions didn't; applying it uniformly here
-    // means every rung's advertised bitrate is now actually enforced.
+    `${safeBitrateKbps}k`,
     "-maxrate",
-    `${bitrateKbps}k`,
+    `${safeBitrateKbps}k`,
     "-bufsize",
-    `${bitrateKbps * 2}k`,
+    `${bufferKbps}k`,
     "-s",
     resolution,
     "-c:a",
-    "aac",
+    profile.audioCodec,
     "-b:a",
-    bitrateKbps >= 2000 ? "128k" : "96k",
-
-    // Smooth minor source-clock drift instead of carrying timestamp gaps
-    // into the republished RTMP rendition.
+    safeBitrateKbps >= 2000
+      ? profile.audioBitrateHigh
+      : profile.audioBitrateLow,
     "-af",
     "aresample=async=1:first_pts=0",
-
-    // Keep the output timeline constant at the supported 30 fps profile.
-    // This gives SRS predictable frame timing and segment boundaries.
     "-fps_mode",
     "cfr",
     "-r",
-    "30",
-
+    String(profile.fps),
     "-f",
     "flv",
     output,
