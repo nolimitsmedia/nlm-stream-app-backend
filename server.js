@@ -9036,10 +9036,19 @@ app.get(
 
           const dvrEnabled = Boolean(monitorPlan?.rewind_enabled);
           const readyRenditions = renditions.filter((item) => item.live);
+          const operational = buildUnifiedOperationalHealth({
+            streamKey: stream.name,
+            generation: bitrateCapGeneration.get(stream.name) || 0,
+            uptimeSeconds,
+            sourceLive: Boolean(stream.publish?.active),
+            hls,
+            renditions,
+          });
 
           const monitor = {
             status: monitorStatus,
             score: analysisHealth?.score ?? null,
+            operational,
             source: {
               live: Boolean(stream.publish?.active),
               bitrate_kbps: Number(stream.kbps?.recv_30s || 0),
@@ -9206,6 +9215,237 @@ const activeTranscodeProcesses = new Map(); // key: `${streamKey}:${label}`
 const transcodeStartupLocks = new Map(); // key -> broadcast generation currently starting
 const transcodeRetryCount = new Map(); // key: `${streamKey}:${label}`
 const MAX_TRANSCODE_RETRIES = 10;
+
+// Phase 5D.2d — observational ABR lifecycle state. This map never starts,
+// stops, or retries FFmpeg; the existing ABR controller remains authoritative.
+// It only remembers enough per-broadcast history for Live Monitor to distinguish
+// first startup from recovery after a rendition was previously healthy.
+const abrRenditionLifecycle = new Map(); // key: `${streamKey}:${label}`
+
+function getAbrRenditionLifecycle(streamKey, label, generation, create = true) {
+  const key = `${streamKey}:${label}`;
+  let state = abrRenditionLifecycle.get(key);
+
+  if (!state || state.generation !== generation) {
+    if (!create) return null;
+    state = {
+      generation,
+      started_at: null,
+      ready_at: null,
+      last_ready_at: null,
+      recovery_started_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      retry_exhausted_at: null,
+    };
+    abrRenditionLifecycle.set(key, state);
+  }
+
+  return state;
+}
+
+function markAbrRenditionStarted(streamKey, label, generation) {
+  const state = getAbrRenditionLifecycle(streamKey, label, generation);
+  const now = new Date().toISOString();
+  if (!state.started_at) state.started_at = now;
+  if (state.ready_at && !state.recovery_started_at) {
+    state.recovery_started_at = now;
+  }
+  return state;
+}
+
+function markAbrRenditionReady(streamKey, label, generation) {
+  const state = getAbrRenditionLifecycle(streamKey, label, generation);
+  const now = new Date().toISOString();
+  if (!state.started_at) state.started_at = now;
+  if (!state.ready_at) state.ready_at = now;
+  state.last_ready_at = now;
+  state.recovery_started_at = null;
+  state.last_failure_at = null;
+  state.last_failure_code = null;
+  state.retry_exhausted_at = null;
+  return state;
+}
+
+function markAbrRenditionRecovery(streamKey, label, generation, code = null) {
+  const state = getAbrRenditionLifecycle(streamKey, label, generation);
+  const now = new Date().toISOString();
+  if (state.ready_at && !state.recovery_started_at) {
+    state.recovery_started_at = now;
+  }
+  if (code) {
+    state.last_failure_at = now;
+    state.last_failure_code = code;
+  }
+  return state;
+}
+
+function markAbrRenditionRetryExhausted(streamKey, label, generation) {
+  const state = markAbrRenditionRecovery(
+    streamKey,
+    label,
+    generation,
+    "retry_exhausted",
+  );
+  state.retry_exhausted_at = new Date().toISOString();
+  return state;
+}
+
+function clearAbrRenditionLifecycle(streamKey) {
+  for (const key of abrRenditionLifecycle.keys()) {
+    if (key.startsWith(`${streamKey}:`)) abrRenditionLifecycle.delete(key);
+  }
+}
+
+function buildUnifiedOperationalHealth({
+  streamKey,
+  generation,
+  uptimeSeconds,
+  sourceLive,
+  hls,
+  renditions,
+}) {
+  const nowMs = Date.now();
+  const startupGraceSeconds = 35;
+  const startupGraceRemainingSeconds = Math.max(
+    0,
+    startupGraceSeconds - Number(uptimeSeconds || 0),
+  );
+
+  if (!sourceLive) {
+    return {
+      state: "stopped",
+      severity: "info",
+      attention_required: false,
+      reason_code: "source_offline",
+      reason: "The source publisher is offline.",
+      since: null,
+      startup_grace_remaining_seconds: 0,
+      recovery_active: false,
+    };
+  }
+
+  const lifecycle = renditions.map((rendition) => {
+    const state = getAbrRenditionLifecycle(
+      streamKey,
+      rendition.label,
+      generation,
+    );
+    if (rendition.live) {
+      markAbrRenditionReady(streamKey, rendition.label, generation);
+    } else if (state.ready_at) {
+      markAbrRenditionRecovery(streamKey, rendition.label, generation);
+    }
+    return { rendition, state };
+  });
+
+  const missing = lifecycle.filter(({ rendition }) => !rendition.live);
+  const readyCount = renditions.length - missing.length;
+  const recovering = missing.filter(({ state }) => Boolean(state.ready_at));
+  const exhausted = missing.filter(({ state }) =>
+    Boolean(state.retry_exhausted_at),
+  );
+  const hlsUnavailable = hls?.reachable === false || hls?.fresh === false;
+
+  if (
+    startupGraceRemainingSeconds > 0 &&
+    ((renditions.length > 0 && missing.length > 0) || hlsUnavailable)
+  ) {
+    return {
+      state: "starting",
+      severity: "info",
+      attention_required: false,
+      reason_code: "renditions_initializing",
+      reason: "The source is live and ABR renditions are still initializing.",
+      since: null,
+      startup_grace_remaining_seconds: startupGraceRemainingSeconds,
+      recovery_active: false,
+    };
+  }
+
+  if (exhausted.length > 0 && readyCount === 0 && hlsUnavailable) {
+    const since =
+      exhausted
+        .map(({ state }) => state.retry_exhausted_at)
+        .filter(Boolean)
+        .sort()[0] || null;
+    return {
+      state: "failed",
+      severity: "critical",
+      attention_required: true,
+      reason_code: "abr_recovery_exhausted",
+      reason: "ABR recovery exhausted while delivery is unavailable.",
+      since,
+      startup_grace_remaining_seconds: 0,
+      recovery_active: false,
+    };
+  }
+
+  if (recovering.length > 0) {
+    const since =
+      recovering
+        .map(({ state }) => state.recovery_started_at || state.last_failure_at)
+        .filter(Boolean)
+        .sort()[0] || new Date(nowMs).toISOString();
+    const recoveryAgeSeconds = Math.max(
+      0,
+      Math.floor((nowMs - new Date(since).getTime()) / 1000),
+    );
+
+    if (recoveryAgeSeconds < startupGraceSeconds) {
+      return {
+        state: "recovering",
+        severity: "warning",
+        attention_required: false,
+        reason_code: "abr_recovery_active",
+        reason: "A previously ready ABR rendition is being recovered.",
+        since,
+        startup_grace_remaining_seconds: 0,
+        recovery_active: true,
+      };
+    }
+
+    return {
+      state: "degraded",
+      severity: "warning",
+      attention_required: true,
+      reason_code: "abr_recovery_persistent",
+      reason:
+        "ABR recovery has remained incomplete beyond the normal recovery window.",
+      since,
+      startup_grace_remaining_seconds: 0,
+      recovery_active: true,
+    };
+  }
+
+  if (missing.length > 0 || hlsUnavailable) {
+    return {
+      state: "degraded",
+      severity: "warning",
+      attention_required: true,
+      reason_code:
+        missing.length > 0 ? "abr_rendition_unavailable" : "delivery_degraded",
+      reason:
+        missing.length > 0
+          ? "The source is live but one or more planned ABR renditions are unavailable."
+          : "The source is live but HLS delivery is unavailable or stale.",
+      since: null,
+      startup_grace_remaining_seconds: 0,
+      recovery_active: false,
+    };
+  }
+
+  return {
+    state: "healthy",
+    severity: "info",
+    attention_required: false,
+    reason_code: "operational",
+    reason: "Source, ABR, and delivery are operational.",
+    since: null,
+    startup_grace_remaining_seconds: startupGraceRemainingSeconds,
+    recovery_active: false,
+  };
+}
 
 // ══════════════════════════════════════════
 // CMAF / fMP4 HLS PACKAGING — Phase 5B
@@ -9876,6 +10116,7 @@ async function watchRenditionStartupOrKill(
       () => null,
     );
     if (activeNow) {
+      markAbrRenditionReady(streamKey, label, generation);
       console.log(
         `[Transcode] ${label} confirmed publishing for ${streamLogId(streamKey)}; watchdog standing down.`,
       );
@@ -9887,6 +10128,12 @@ async function watchRenditionStartupOrKill(
   if (bitrateCapGeneration.get(streamKey) !== generation) return;
   if (proc.exitCode !== null || proc.killed) return;
 
+  markAbrRenditionRecovery(
+    streamKey,
+    label,
+    generation,
+    "startup_watchdog_timeout",
+  );
   console.warn(
     `[Transcode] ${label} for ${streamLogId(streamKey)} produced no publish within ${RENDITION_STARTUP_WATCHDOG_MS}ms of spawning (pid ${proc.pid}) — treating as hung and killing it so the reconciler can retry.`,
   );
@@ -10035,6 +10282,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
       stdio: ["ignore", "ignore", "pipe"],
     });
     activeTranscodeProcesses.set(retryKey, proc);
+    markAbrRenditionStarted(streamKey, label, generation);
 
     // The startup lock is no longer needed after the process has been recorded.
     if (transcodeStartupLocks.get(retryKey) === generation) {
@@ -10084,6 +10332,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
     });
 
     proc.on("error", (err) => {
+      markAbrRenditionRecovery(streamKey, label, generation, "spawn_error");
       console.error(
         `[Transcode] ${label} failed to spawn for ${streamLogId(streamKey)}:`,
         err.message,
@@ -10122,6 +10371,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         return;
       }
 
+      markAbrRenditionRecovery(streamKey, label, generation, "unexpected_exit");
       console.warn(
         `[Transcode] ${label} exited with code ${code}${signal ? ` (signal ${signal})` : ""} for ${streamLogId(streamKey)} — evaluating retry` +
           (ffmpegLogPath ? ` (full stderr written to ${ffmpegLogPath})` : "") +
@@ -10160,6 +10410,7 @@ const spawnFfmpegVariant = async (label, streamKey, args, generation) => {
         transcodeRetryCount.set(retryKey, attempts);
 
         if (attempts > MAX_TRANSCODE_RETRIES) {
+          markAbrRenditionRetryExhausted(streamKey, label, generation);
           console.error(
             `[Transcode] Giving up on ${label} for ${streamLogId(streamKey)} after ${attempts} failed attempts — the ABR reconciler will continue periodic recovery checks.`,
           );
@@ -10526,6 +10777,9 @@ async function reconcileAbrTranscoders() {
 
         // A reconciler-driven restart begins a fresh retry budget for this
         // missing rendition instead of inheriting a previously exhausted one.
+        // Unified health remembers whether this rendition was previously ready,
+        // so this can be classified as recovery instead of first startup.
+        markAbrRenditionRecovery(streamKey, rendition.label, generation);
         transcodeRetryCount.delete(retryKey);
 
         const input = getInternalHlsSourceUrl(streamKey);
@@ -12252,6 +12506,8 @@ async function finalizeCanonicalStreamEnd(
       transcodeStartupLocks.delete(key);
     }
   }
+
+  clearAbrRenditionLifecycle(streamKey);
 
   // Stop renditions only for a real end. During HA they are allowed to ride out
   // the brief source gap or exit naturally and be recovered when the canonical
