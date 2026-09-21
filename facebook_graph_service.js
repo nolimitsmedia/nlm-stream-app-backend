@@ -20,26 +20,34 @@ const FACEBOOK_REDIRECT_URI =
   process.env.FACEBOOK_REDIRECT_URI ||
   `${process.env.API_PUBLIC_URL || ""}/api/oauth/facebook/callback`;
 
-const FACEBOOK_SCOPES = [
-  "pages_show_list",
-  "pages_read_engagement",
-  "pages_manage_posts",
-  "publish_video",
-].join(",");
+const FACEBOOK_CONFIG_ID = process.env.FACEBOOK_CONFIG_ID || "";
 
 function isConfigured() {
-  return Boolean(FACEBOOK_APP_ID && FACEBOOK_APP_SECRET);
+  return Boolean(
+    FACEBOOK_APP_ID &&
+    FACEBOOK_APP_SECRET &&
+    FACEBOOK_REDIRECT_URI &&
+    FACEBOOK_CONFIG_ID,
+  );
 }
 
 // Step 1: build the URL the browser popup is sent to.
+// Facebook Login for Business uses a saved configuration to define the
+// permissions requested during login. Meta recommends config_id instead of
+// passing the permission list through scope for a User access token config.
 function getAuthUrl(state) {
+  if (!FACEBOOK_CONFIG_ID) {
+    throw new Error("Facebook Login for Business configuration is missing");
+  }
+
   const params = new URLSearchParams({
     client_id: FACEBOOK_APP_ID,
     redirect_uri: FACEBOOK_REDIRECT_URI,
     state,
-    scope: FACEBOOK_SCOPES,
+    config_id: FACEBOOK_CONFIG_ID,
     response_type: "code",
   });
+
   return `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
 }
 
