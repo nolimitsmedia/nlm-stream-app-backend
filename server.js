@@ -9672,9 +9672,7 @@ async function recordStreamHealthEvent({
       previous &&
       String(previous.monitor_status || "unknown") ===
         normalized.monitorStatus &&
-      clampHealthScore(previous.monitor_score) === normalized.monitorScore &&
       String(previous.media_status || "unknown") === normalized.mediaStatus &&
-      clampHealthScore(previous.media_score) === normalized.mediaScore &&
       Boolean(previous.media_pending) === normalized.mediaPending &&
       String(previous.operational_state || "unknown") ===
         normalized.operationalState &&
@@ -9683,7 +9681,6 @@ async function recordStreamHealthEvent({
       Boolean(previous.attention_required) === normalized.attentionRequired &&
       String(previous.reason_code || "") ===
         String(normalized.reasonCode || "") &&
-      Number(previous.issue_count || 0) === normalized.issueCount &&
       Number(previous.critical_count || 0) === normalized.criticalCount &&
       Number(previous.warning_count || 0) === normalized.warningCount;
 
