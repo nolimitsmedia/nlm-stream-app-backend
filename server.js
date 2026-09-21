@@ -9045,9 +9045,35 @@ app.get(
             renditions,
           });
 
+          const mediaWarnings = Array.isArray(mediaAnalysis?.warnings)
+            ? mediaAnalysis.warnings
+            : [];
+          const mediaWarningCountBySeverity = mediaWarnings.reduce(
+            (counts, warning) => {
+              const severity = String(
+                warning?.severity || "warning",
+              ).toLowerCase();
+              if (severity === "critical") counts.critical += 1;
+              else if (severity === "warning") counts.warning += 1;
+              return counts;
+            },
+            { critical: 0, warning: 0 },
+          );
+
           const monitor = {
             status: monitorStatus,
             score: analysisHealth?.score ?? null,
+            media: {
+              status: analysisHealth?.status || "unknown",
+              score: analysisHealth?.score ?? null,
+              pending: Boolean(mediaAnalysis?.pending),
+              analyzed_at: mediaAnalysis?.analyzed_at || null,
+              analyzer_source: mediaAnalysis?.analyzer_source || "pending",
+              probe_ok: Boolean(mediaAnalysis?.probe_ok),
+              warning_count: mediaWarnings.length,
+              critical_count: mediaWarningCountBySeverity.critical,
+              warning_count_by_severity: mediaWarningCountBySeverity,
+            },
             operational,
             source: {
               live: Boolean(stream.publish?.active),
