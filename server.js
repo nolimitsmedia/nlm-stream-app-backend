@@ -10792,7 +10792,7 @@ async function reconcileAbrTranscoders() {
         );
 
         console.warn(
-          `[ABR-RECOVERY] Raw source ${streamKey} is live but ${rendition.label} is missing — starting recovery.`,
+          `[ABR-RECOVERY] Raw source ${streamLogId(streamKey)} is live but ${rendition.label} is missing — starting recovery.`,
         );
         spawnFfmpegVariant(rendition.label, streamKey, args, generation);
       }
