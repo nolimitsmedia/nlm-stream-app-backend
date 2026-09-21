@@ -18,6 +18,7 @@ const whmcs = require("./whmcs_client");
 const bunny = require("./bunny_client");
 const embedRoutes = require("./embed_routes"); // Phase 1 — embedded player (Copy Embed Code)
 const {
+  analyzeLiveStream,
   getCachedStreamAnalysis,
   scheduleLiveStreamAnalysis,
 } = require("./stream_health_service");
@@ -5835,6 +5836,56 @@ app.patch(
 // above — that one only ever answers "right now"; this is what lets the
 // dashboard show a trend line instead of a single current-moment gauge.
 // ══════════════════════════════════════════
+// Phase 5D.5 — durable stream-level health transition history.
+// Current runtime/analyzer state remains authoritative; this table stores only
+// meaningful transitions so historical incident review does not depend on the
+// Live Monitor page being open. Raw stream keys and URLs are never persisted.
+async function ensureStreamHealthHistoryTable(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stream_health_history (
+      id BIGSERIAL PRIMARY KEY,
+      organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+      broadcast_started_at TIMESTAMPTZ NOT NULL,
+      broadcast_generation INTEGER NOT NULL DEFAULT 0,
+      event_type VARCHAR(60) NOT NULL,
+      monitor_status VARCHAR(30) NOT NULL DEFAULT 'unknown',
+      monitor_score INTEGER,
+      media_status VARCHAR(30) NOT NULL DEFAULT 'unknown',
+      media_score INTEGER,
+      media_pending BOOLEAN NOT NULL DEFAULT FALSE,
+      operational_state VARCHAR(30) NOT NULL DEFAULT 'unknown',
+      operational_severity VARCHAR(20) NOT NULL DEFAULT 'info',
+      attention_required BOOLEAN NOT NULL DEFAULT FALSE,
+      reason_code VARCHAR(100),
+      issue_count INTEGER NOT NULL DEFAULT 0,
+      critical_count INTEGER NOT NULL DEFAULT 0,
+      warning_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_health_channel_created
+    ON stream_health_history (channel_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_health_org_created
+    ON stream_health_history (organization_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_health_broadcast
+    ON stream_health_history (channel_id, broadcast_started_at, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_stream_health_attention
+    ON stream_health_history (organization_id, attention_required, created_at DESC)
+  `);
+}
+
 async function ensureServerMetricsHistoryTable(pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS server_metrics_history (
@@ -8717,6 +8768,68 @@ app.delete(
 |--------------------------------------------------------------------------
 */
 
+// Phase 5D.5 — tenant-scoped durable stream health history.
+// This is historical evidence only; /api/srs/streams remains authoritative for
+// the current live state.
+app.get(
+  "/api/channels/:channelId/stream-health-history",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const channel = await getOwnedChannel(
+        req.params.channelId,
+        req.organization.id,
+      );
+
+      if (!channel) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Channel not found" });
+      }
+
+      const requestedLimit = Number(req.query?.limit || 100);
+      const limit = Math.max(
+        1,
+        Math.min(200, Number.isFinite(requestedLimit) ? requestedLimit : 100),
+      );
+      const attentionOnly =
+        String(req.query?.attention || "").toLowerCase() === "true" ||
+        String(req.query?.attention || "") === "1";
+
+      const result = await queryWithRetry(
+        `SELECT id, organization_id, channel_id, broadcast_started_at,
+                broadcast_generation, event_type, monitor_status, monitor_score,
+                media_status, media_score, media_pending, operational_state,
+                operational_severity, attention_required, reason_code,
+                issue_count, critical_count, warning_count, created_at
+         FROM stream_health_history
+         WHERE channel_id = $1
+           AND organization_id = $2
+           AND ($3::boolean = false OR attention_required = true)
+         ORDER BY created_at DESC, id DESC
+         LIMIT $4`,
+        [channel.id, req.organization.id, attentionOnly, limit],
+      );
+
+      return res.json({
+        ok: true,
+        channel: { id: channel.id, name: channel.name },
+        count: result.rows.length,
+        limit,
+        attention_only: attentionOnly,
+        events: result.rows,
+      });
+    } catch (error) {
+      console.error("Stream Health History Error:", error);
+      return res.status(500).json({
+        ok: false,
+        message: "Failed to fetch stream health history",
+      });
+    }
+  },
+);
+
 app.get(
   "/api/srs/streams",
   authenticateAdmin,
@@ -9471,6 +9584,384 @@ function buildUnifiedOperationalHealth({
     startup_grace_remaining_seconds: startupGraceRemainingSeconds,
     recovery_active: false,
   };
+}
+
+// Phase 5D.5 — background stream-health history sampler.
+// Runs independently of dashboard polling, uses the existing analyzer and
+// operational-health builder, and writes transition-only durable history.
+const STREAM_HEALTH_HISTORY_INTERVAL_MS = Math.max(
+  30000,
+  Number(process.env.STREAM_HEALTH_HISTORY_INTERVAL_MS || 30000),
+);
+let streamHealthHistorySweepInFlight = false;
+
+const clampHealthScore = (value) => {
+  if (value == null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.min(100, Math.round(parsed)));
+};
+
+async function recordStreamHealthEvent({
+  channel,
+  broadcastStartedAt,
+  broadcastGeneration = 0,
+  eventType,
+  monitorStatus = "unknown",
+  monitorScore = null,
+  mediaStatus = "unknown",
+  mediaScore = null,
+  mediaPending = false,
+  operationalState = "unknown",
+  operationalSeverity = "info",
+  attentionRequired = false,
+  reasonCode = null,
+  issueCount = 0,
+  criticalCount = 0,
+  warningCount = 0,
+}) {
+  const channelId = Number(channel?.id);
+  const organizationId = Number(channel?.organization_id);
+  const startedAt = broadcastStartedAt ? new Date(broadcastStartedAt) : null;
+
+  if (
+    !Number.isInteger(channelId) ||
+    channelId <= 0 ||
+    !Number.isInteger(organizationId) ||
+    organizationId <= 0 ||
+    !startedAt ||
+    Number.isNaN(startedAt.getTime()) ||
+    !eventType
+  ) {
+    return false;
+  }
+
+  try {
+    const normalized = {
+      eventType: String(eventType).slice(0, 60),
+      monitorStatus: String(monitorStatus || "unknown").slice(0, 30),
+      monitorScore: clampHealthScore(monitorScore),
+      mediaStatus: String(mediaStatus || "unknown").slice(0, 30),
+      mediaScore: clampHealthScore(mediaScore),
+      mediaPending: Boolean(mediaPending),
+      operationalState: String(operationalState || "unknown").slice(0, 30),
+      operationalSeverity: String(operationalSeverity || "info").slice(0, 20),
+      attentionRequired: Boolean(attentionRequired),
+      reasonCode: reasonCode ? String(reasonCode).slice(0, 100) : null,
+      issueCount: Math.max(0, Number(issueCount || 0)),
+      criticalCount: Math.max(0, Number(criticalCount || 0)),
+      warningCount: Math.max(0, Number(warningCount || 0)),
+    };
+
+    const last = await queryWithRetry(
+      `SELECT monitor_status, monitor_score, media_status, media_score,
+              media_pending, operational_state, operational_severity,
+              attention_required, reason_code, issue_count, critical_count,
+              warning_count
+       FROM stream_health_history
+       WHERE channel_id = $1
+         AND organization_id = $2
+         AND broadcast_started_at = $3
+       ORDER BY id DESC
+       LIMIT 1`,
+      [channelId, organizationId, startedAt.toISOString()],
+    );
+
+    const previous = last.rows[0] || null;
+    const duplicateTransition =
+      previous &&
+      String(previous.monitor_status || "unknown") ===
+        normalized.monitorStatus &&
+      clampHealthScore(previous.monitor_score) === normalized.monitorScore &&
+      String(previous.media_status || "unknown") === normalized.mediaStatus &&
+      clampHealthScore(previous.media_score) === normalized.mediaScore &&
+      Boolean(previous.media_pending) === normalized.mediaPending &&
+      String(previous.operational_state || "unknown") ===
+        normalized.operationalState &&
+      String(previous.operational_severity || "info") ===
+        normalized.operationalSeverity &&
+      Boolean(previous.attention_required) === normalized.attentionRequired &&
+      String(previous.reason_code || "") ===
+        String(normalized.reasonCode || "") &&
+      Number(previous.issue_count || 0) === normalized.issueCount &&
+      Number(previous.critical_count || 0) === normalized.criticalCount &&
+      Number(previous.warning_count || 0) === normalized.warningCount;
+
+    if (duplicateTransition) return false;
+
+    await pool.query(
+      `INSERT INTO stream_health_history (
+         organization_id, channel_id, broadcast_started_at,
+         broadcast_generation, event_type, monitor_status, monitor_score,
+         media_status, media_score, media_pending, operational_state,
+         operational_severity, attention_required, reason_code, issue_count,
+         critical_count, warning_count
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+       )`,
+      [
+        organizationId,
+        channelId,
+        startedAt.toISOString(),
+        Number.isFinite(Number(broadcastGeneration))
+          ? Number(broadcastGeneration)
+          : 0,
+        normalized.eventType,
+        normalized.monitorStatus,
+        normalized.monitorScore,
+        normalized.mediaStatus,
+        normalized.mediaScore,
+        normalized.mediaPending,
+        normalized.operationalState,
+        normalized.operationalSeverity,
+        normalized.attentionRequired,
+        normalized.reasonCode,
+        normalized.issueCount,
+        normalized.criticalCount,
+        normalized.warningCount,
+      ],
+    );
+
+    return true;
+  } catch (error) {
+    console.warn(
+      `[STREAM-HEALTH-HISTORY channel=${channelId}] event write skipped:`,
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
+async function sampleStreamHealthHistory() {
+  if (streamHealthHistorySweepInFlight) return;
+  streamHealthHistorySweepInFlight = true;
+
+  try {
+    const [channelsResult, srsResponse] = await Promise.all([
+      queryWithRetry(
+        `SELECT id, organization_id, name, stream_key, is_live, live_started_at
+         FROM channels
+         WHERE organization_id IS NOT NULL`,
+      ),
+      fetch(`${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`, {
+        signal: AbortSignal.timeout(5000),
+        cache: "no-store",
+      }),
+    ]);
+
+    if (!srsResponse.ok) {
+      throw new Error(`SRS API responded with ${srsResponse.status}`);
+    }
+
+    const srsData = await srsResponse.json();
+    const allSrsStreams = Array.isArray(srsData.streams) ? srsData.streams : [];
+    const srsByName = new Map(
+      allSrsStreams.map((item) => [String(item.name), item]),
+    );
+    const channelByStreamKey = new Map(
+      channelsResult.rows.map((channel) => [
+        String(channel.stream_key),
+        channel,
+      ]),
+    );
+
+    const activePrimaryStreams = allSrsStreams.filter((stream) => {
+      const channel = channelByStreamKey.get(String(stream.name));
+      return (
+        channel &&
+        stream.publish?.active &&
+        String(stream.app || "live") === "live"
+      );
+    });
+    const activeChannelIds = new Set();
+
+    for (const stream of activePrimaryStreams) {
+      const channel = channelByStreamKey.get(String(stream.name));
+      if (!channel) continue;
+      activeChannelIds.add(Number(channel.id));
+
+      // A live_started_at value is the durable broadcast identity. If the SRS
+      // publisher appeared before the normal publish hook repaired the DB row,
+      // skip this sweep rather than inventing a second identity.
+      if (!channel.live_started_at) continue;
+
+      const uptimeSeconds = Math.max(
+        0,
+        Math.floor(
+          (Date.now() - new Date(channel.live_started_at).getTime()) / 1000,
+        ),
+      );
+      const analyzerStream = { ...stream, uptime_seconds: uptimeSeconds };
+
+      let mediaAnalysis = null;
+      try {
+        mediaAnalysis = await analyzeLiveStream({
+          stream: analyzerStream,
+          internalHlsBaseUrl: SRS_INTERNAL_HLS_BASE_URL,
+        });
+      } catch (error) {
+        console.debug(
+          `[STREAM-HEALTH-HISTORY channel=${channel.id}] analyzer unavailable:`,
+          error.message,
+        );
+      }
+
+      let renditionPlan = [];
+      try {
+        renditionPlan = await getRenditionPlanForOrg(channel.organization_id);
+      } catch (error) {
+        console.debug(
+          `[STREAM-HEALTH-HISTORY channel=${channel.id}] rendition plan unavailable:`,
+          error.message,
+        );
+      }
+
+      const renditions = renditionPlan.map((planned) => {
+        const actual = srsByName.get(`${stream.name}_${planned.label}`) || null;
+        return {
+          label: planned.label,
+          live: Boolean(actual?.publish?.active),
+        };
+      });
+
+      const analysisHealth = mediaAnalysis?.health || null;
+      const hls = mediaAnalysis?.hls || {};
+      const monitorIssues = [];
+
+      if (uptimeSeconds >= 35 && hls.reachable === false) {
+        monitorIssues.push({ severity: "critical", code: "hls_unavailable" });
+      } else if (
+        uptimeSeconds >= 35 &&
+        hls.reachable === true &&
+        hls.fresh === false
+      ) {
+        monitorIssues.push({ severity: "warning", code: "hls_stale" });
+      }
+
+      for (const rendition of renditions) {
+        if (uptimeSeconds >= 35 && !rendition.live) {
+          monitorIssues.push({
+            severity: "warning",
+            code: `rendition_${rendition.label}_offline`,
+          });
+        }
+      }
+
+      let monitorStatus = analysisHealth?.status || "unknown";
+      if (monitorIssues.some((issue) => issue.severity === "critical")) {
+        monitorStatus = "critical";
+      } else if (
+        monitorIssues.some((issue) => issue.severity === "warning") &&
+        monitorStatus !== "critical"
+      ) {
+        monitorStatus = "warning";
+      } else if (
+        monitorStatus === "unknown" &&
+        uptimeSeconds >= 35 &&
+        Number(stream.kbps?.recv_30s || 0) > 0
+      ) {
+        monitorStatus = "healthy";
+      }
+
+      const operational = buildUnifiedOperationalHealth({
+        streamKey: stream.name,
+        generation: bitrateCapGeneration.get(stream.name) || 0,
+        uptimeSeconds,
+        sourceLive: true,
+        hls,
+        renditions,
+      });
+
+      const mediaWarnings = Array.isArray(mediaAnalysis?.warnings)
+        ? mediaAnalysis.warnings
+        : [];
+      const criticalCount = mediaWarnings.filter(
+        (warning) =>
+          String(warning?.severity || "").toLowerCase() === "critical",
+      ).length;
+      const warningCount = mediaWarnings.filter(
+        (warning) =>
+          String(warning?.severity || "warning").toLowerCase() === "warning",
+      ).length;
+
+      const existing = await queryWithRetry(
+        `SELECT id
+         FROM stream_health_history
+         WHERE channel_id = $1 AND broadcast_started_at = $2
+         LIMIT 1`,
+        [channel.id, new Date(channel.live_started_at).toISOString()],
+      );
+
+      await recordStreamHealthEvent({
+        channel,
+        broadcastStartedAt: channel.live_started_at,
+        broadcastGeneration: bitrateCapGeneration.get(stream.name) || 0,
+        eventType: existing.rows[0]
+          ? "health_transition"
+          : "broadcast_observed",
+        monitorStatus,
+        monitorScore: analysisHealth?.score ?? null,
+        mediaStatus: analysisHealth?.status || "unknown",
+        mediaScore: analysisHealth?.score ?? null,
+        mediaPending: Boolean(mediaAnalysis?.pending),
+        operationalState: operational.state,
+        operationalSeverity: operational.severity,
+        attentionRequired: operational.attention_required,
+        reasonCode: operational.reason_code,
+        issueCount: monitorIssues.length,
+        criticalCount,
+        warningCount,
+      });
+    }
+
+    // SRS is authoritative for whether a raw publisher is still live. Close
+    // the last observed broadcast when it disappears, even if a webhook has
+    // already nulled channels.live_started_at. The previous durable row keeps
+    // the broadcast identity available without storing the stream key.
+    const previousActive = await queryWithRetry(
+      `SELECT DISTINCT ON (channel_id)
+              id, organization_id, channel_id, broadcast_started_at,
+              broadcast_generation, operational_state
+       FROM stream_health_history
+       ORDER BY channel_id, id DESC`,
+    );
+
+    for (const previous of previousActive.rows) {
+      if (activeChannelIds.has(Number(previous.channel_id))) continue;
+      if (String(previous.operational_state || "") === "stopped") continue;
+
+      const channel = channelsResult.rows.find(
+        (item) => Number(item.id) === Number(previous.channel_id),
+      );
+      if (!channel) continue;
+
+      await recordStreamHealthEvent({
+        channel,
+        broadcastStartedAt: previous.broadcast_started_at,
+        broadcastGeneration: previous.broadcast_generation || 0,
+        eventType: "broadcast_stopped",
+        monitorStatus: "unknown",
+        monitorScore: null,
+        mediaStatus: "unknown",
+        mediaScore: null,
+        mediaPending: false,
+        operationalState: "stopped",
+        operationalSeverity: "info",
+        attentionRequired: false,
+        reasonCode: "source_offline",
+        issueCount: 0,
+        criticalCount: 0,
+        warningCount: 0,
+      });
+    }
+  } catch (error) {
+    console.warn(
+      "[STREAM-HEALTH-HISTORY] background sweep skipped:",
+      error?.message || error,
+    );
+  } finally {
+    streamHealthHistorySweepInFlight = false;
+  }
 }
 
 // ══════════════════════════════════════════
@@ -18465,6 +18956,7 @@ io.on("connection", (socket) => {
   await ensureRestartAuditTable();
   await ensureApiKeysTable();
   await ensureServerMetricsHistoryTable(pool);
+  await ensureStreamHealthHistoryTable(pool);
   await embedRoutes.ensureEmbedColumns(pool); // Phase 1 — embed_token/embed_settings columns
 })()
   .then(() => {
@@ -18522,6 +19014,20 @@ io.on("connection", (socket) => {
     // the server comes up, then on its own interval.
     runSystemHealthChecks();
     setInterval(runSystemHealthChecks, SYSTEM_HEALTH_CHECK_INTERVAL_MS);
+
+    // Phase 5D.5 stream-health history — independent of Live Monitor polling.
+    // Delay the first sweep slightly so startup reconciliation and SRS have
+    // time to settle, then sample on a non-overlapping background interval.
+    const initialStreamHealthHistoryTimer = setTimeout(
+      sampleStreamHealthHistory,
+      15000,
+    );
+    initialStreamHealthHistoryTimer.unref?.();
+    const streamHealthHistoryInterval = setInterval(
+      sampleStreamHealthHistory,
+      STREAM_HEALTH_HISTORY_INTERVAL_MS,
+    );
+    streamHealthHistoryInterval.unref?.();
 
     // Server metrics trend history — see collectServerMetricsSnapshot()
     // above. Runs once shortly after startup so the dashboard has at least
