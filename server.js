@@ -102,6 +102,9 @@ const {
   ensurePullSourceTables,
   decryptSourceUrl,
 } = require("./pull_source_schema");
+const {
+  ensureMediaNodeMigrationTables,
+} = require("./media_node_migration_schema");
 const registerPullSourceRoutes = require("./pull_source_routes");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
@@ -18947,6 +18950,7 @@ io.on("connection", (socket) => {
   await ensureSocialOAuthTables(pool);
   await ensureStreamTargetColumns(pool);
   await ensurePullSourceTables(pool);
+  await ensureMediaNodeMigrationTables(pool);
   await streamTargetManager.reconcileDatabaseState();
   await pullSourceManager.reconcileDatabaseState();
   await recoverActiveScheduledAutomation();
