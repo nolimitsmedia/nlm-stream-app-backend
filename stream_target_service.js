@@ -1552,6 +1552,20 @@ function createStreamTargetManager({
     );
   }
 
+  async function isAssignedMediaNodeSourceLive(channel) {
+    if (
+      hasRemoteStreamTargetExecutor() &&
+      typeof streamTargetExecutor.sourceStatus === "function"
+    ) {
+      const status = await streamTargetExecutor.sourceStatus({
+        channelId: Number(channel?.id),
+        streamKey: String(channel?.stream_key || ""),
+      });
+      return status?.live === true;
+    }
+    return isSrsStreamLive(channel?.stream_key);
+  }
+
   function normalizeRemoteRuntime(response) {
     const runtime = response?.runtime || response?.job || response || {};
     return {
@@ -2668,7 +2682,7 @@ function createStreamTargetManager({
       };
     }
 
-    const live = await isSrsStreamLive(channel.stream_key);
+    const live = await isAssignedMediaNodeSourceLive(channel);
     if (!live) {
       const message = "Main stream is not live yet. Start streaming first.";
       return {
@@ -2705,10 +2719,12 @@ function createStreamTargetManager({
       }
     }
 
-    const readiness = await waitForPreferredSource(
-      channel.stream_key,
-      STREAM_TARGET_HLS_READY_TIMEOUT_MS,
-    );
+    const readiness = hasRemoteStreamTargetExecutor()
+      ? { ok: true, mode: "media_node", sourceUrl: null }
+      : await waitForPreferredSource(
+          channel.stream_key,
+          STREAM_TARGET_HLS_READY_TIMEOUT_MS,
+        );
     if (!readiness.ok) {
       await pool.query(
         `UPDATE social_destinations

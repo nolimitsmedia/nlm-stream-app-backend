@@ -105,6 +105,9 @@ const {
 const {
   ensureMediaNodeMigrationTables,
 } = require("./media_node_migration_schema");
+const {
+  createMediaNodeMigrationManager,
+} = require("./media_node_migration_service");
 const registerPullSourceRoutes = require("./pull_source_routes");
 const facebookGraph = require("./facebook_graph_service");
 const youtubeApi = require("./youtube_api_service");
@@ -15493,6 +15496,46 @@ const mediaNodeStreamTargetExecutor = {
     return response.data?.runtime || {};
   },
 
+  async sourceStatus({ channelId, streamKey: _requestedStreamKey }) {
+    const cleanChannelId = Number(channelId);
+    if (!Number.isInteger(cleanChannelId) || cleanChannelId <= 0) {
+      throw new Error("Invalid Stream Target channel id");
+    }
+
+    const result = await queryWithRetry(
+      `SELECT media_node_id, stream_key FROM channels WHERE id=$1 LIMIT 1`,
+      [cleanChannelId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Channel not found");
+    const nodeId = Number(row.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) {
+      throw new Error("Channel has no assigned Media Node");
+    }
+
+    const canonicalStreamKey = String(row.stream_key || "").trim();
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: "/v1/streams",
+      method: "GET",
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+    const streams = Array.isArray(response.data?.streams)
+      ? response.data.streams
+      : [];
+    const stream = streams.find(
+      (item) =>
+        String(item?.app || "live") === "live" &&
+        String(item?.name || "") === canonicalStreamKey &&
+        item?.publish_active === true,
+    );
+    return { live: Boolean(stream), stream: stream || null, node_id: node.id };
+  },
+
   async stop({ targetId, channelId }) {
     const cleanTargetId = Number(targetId);
     const cleanChannelId = Number(channelId);
@@ -15833,6 +15876,89 @@ pullSourceManager.activateSource = async (source, channel, options = {}) => {
   clearPullSourceIntentionalStop(source?.channel_id || channel?.id);
   return originalPullSourceActivate(source, channel, options);
 };
+
+// Phase 5F.2 — controlled Media Node migration orchestration.
+const mediaNodeMigrationManager = createMediaNodeMigrationManager({
+  pool,
+  pullSourceManager,
+  streamTargetManager,
+  heartbeatIntervalMs: MEDIA_NODE_HEARTBEAT_INTERVAL_MS,
+});
+
+app.post(
+  "/api/admin/channels/:id/media-node/migrate",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const destinationMediaNodeId = Number(
+        req.body?.destination_media_node_id,
+      );
+      const result = await mediaNodeMigrationManager.migrateChannel({
+        channelId: Number(req.params.id),
+        destinationMediaNodeId,
+        requestedByAdminId: req.admin?.id || req.user?.id || null,
+        reason: req.body?.reason || null,
+        dryRun: req.body?.dry_run === true,
+      });
+      res.json(result);
+    } catch (error) {
+      const conflictCodes = new Set([
+        "migration_already_active",
+        "same_media_node",
+        "destination_disabled",
+        "destination_draining",
+        "destination_unhealthy",
+        "destination_at_capacity",
+        "ha_transition_busy",
+        "direct_ingest_migration_unsupported",
+        "source_ownership_changed",
+      ]);
+      const notFoundCodes = new Set([
+        "channel_not_found",
+        "destination_not_found",
+      ]);
+      const status = notFoundCodes.has(error?.code)
+        ? 404
+        : conflictCodes.has(error?.code)
+          ? 409
+          : /^invalid_/.test(String(error?.code || ""))
+            ? 400
+            : 500;
+      console.error(
+        "Media Node migration error:",
+        error?.code || error?.message,
+      );
+      res.status(status).json({
+        ok: false,
+        code: error?.code || "media_node_migration_failed",
+        message: error?.message || "Media Node migration failed",
+        migration: error?.migration || null,
+        rollback: error?.rollback || null,
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/channels/:id/media-node/migrations",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const migrations = await mediaNodeMigrationManager.listMigrations(
+        Number(req.params.id),
+        Number(req.query?.limit || 25),
+      );
+      res.json({ ok: true, migrations });
+    } catch (error) {
+      console.error("List Media Node migrations error:", error);
+      res
+        .status(500)
+        .json({ ok: false, message: "Failed to list Media Node migrations" });
+    }
+  },
+);
 
 // OAuth routes are mounted AFTER Stream Targets so disconnecting an OAuth
 // account can safely stop any active target/platform broadcast before the

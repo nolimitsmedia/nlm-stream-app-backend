@@ -1463,7 +1463,27 @@ function createPullSourceManager({ pool }) {
 
       const verifyStarted = Date.now();
       while (Date.now() - verifyStarted < DELIVERY_VERIFY_TIMEOUT_MS) {
-        if (await isSrsStreamLive(channel.stream_key)) {
+        let remoteDeliveryVerified = false;
+        try {
+          const runtime = await remoteExecutor.status(source, channel);
+          const canonical = runtime?.canonical_publish || {};
+          const job = runtime?.job || {};
+          remoteDeliveryVerified = Boolean(
+            runtime?.active === true &&
+            runtime?.process_alive === true &&
+            String(job.status || "").toLowerCase() === "running" &&
+            Number(job.source_id) === Number(source.id) &&
+            Number(job.channel_id) === Number(source.channel_id) &&
+            canonical.expected === true &&
+            canonical.publish_active === true,
+          );
+        } catch (error) {
+          console.warn(
+            `[PULL-SOURCE-REMOTE] Delivery verification poll failed for #${id}: ${error.message}`,
+          );
+        }
+
+        if (remoteDeliveryVerified) {
           state.status = "streaming";
           state.isRunning = true;
           await updateDb(id, {
