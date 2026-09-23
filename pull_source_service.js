@@ -564,6 +564,23 @@ function createPullSourceManager({ pool }) {
     return haTransitionChannels.has(Number(channelId));
   }
 
+  // Phase 5F.2: reserve the existing per-channel HA transition lock while a
+  // Media Node migration is in progress. This prevents automatic failover,
+  // failback, and no-active-source recovery from starting a competing Pull
+  // Source worker during source shutdown and ownership transfer.
+  function beginMediaNodeMigration(channelId) {
+    return beginHaTransition(channelId, "media_node_migration");
+  }
+
+  function endMediaNodeMigration(channelId) {
+    endHaTransition(channelId, "media_node_migration");
+  }
+
+  function isMediaNodeMigrationActive(channelId) {
+    const transition = haTransitionChannels.get(Number(channelId));
+    return transition?.type === "media_node_migration";
+  }
+
   const FAILED_FAILBACK_COOLDOWN_MS = 5 * 60 * 1000;
 
   async function shouldUseRemoteExecutor(source, channel, options = {}) {
@@ -2619,6 +2636,9 @@ function createPullSourceManager({ pool }) {
     stopSource,
     finalizeRemoteStop,
     rearmRemoteSrtPrimary,
+    beginMediaNodeMigration,
+    endMediaNodeMigration,
+    isMediaNodeMigrationActive,
     recordHealth,
     getRuntimeState: publicRuntimeState,
     isSrsStreamLive,
