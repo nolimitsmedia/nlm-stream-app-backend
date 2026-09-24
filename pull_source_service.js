@@ -1472,6 +1472,8 @@ function createPullSourceManager({ pool }) {
             runtime?.active === true &&
             runtime?.process_alive === true &&
             String(job.status || "").toLowerCase() === "running" &&
+            String(job.type || "").toLowerCase() === "pull_source_start" &&
+            job.persistent === true &&
             Number(job.source_id) === Number(source.id) &&
             Number(job.channel_id) === Number(source.channel_id) &&
             canonical.expected === true &&

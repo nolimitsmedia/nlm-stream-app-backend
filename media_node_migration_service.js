@@ -230,7 +230,7 @@ function createMediaNodeMigrationManager({
     };
   }
 
-  async function stopSourceWorkers(snapshot) {
+  async function stopSourceWorkers(snapshot, stopped) {
     for (const target of snapshot.targets) {
       const result = await streamTargetManager.stopTarget(target, {
         endPlatform: false,
@@ -241,6 +241,7 @@ function createMediaNodeMigrationManager({
           `Stream Target #${target.id} did not stop cleanly.`,
         );
       }
+      stopped.target_ids.push(Number(target.id));
     }
 
     if (snapshot.activeSource) {
@@ -254,6 +255,7 @@ function createMediaNodeMigrationManager({
           `Pull Source #${snapshot.activeSource.id} did not stop cleanly.`,
         );
       }
+      stopped.pull_source = true;
     }
   }
 
@@ -301,10 +303,47 @@ function createMediaNodeMigrationManager({
     return result.rows[0];
   }
 
-  async function recoverWorkloads(snapshot, channel, requestedBy) {
-    const recovered = { pull_source: false, target_ids: [] };
+  const targetVerifyTimeoutMs = Math.max(
+    5000,
+    Number(process.env.MEDIA_NODE_MIGRATION_TARGET_VERIFY_TIMEOUT_MS || 20000),
+  );
 
-    if (snapshot.activeSource) {
+  async function waitForTargetDelivery(targetId) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < targetVerifyTimeoutMs) {
+      const runtime = streamTargetManager.getRuntimeState?.(Number(targetId));
+      if (runtime?.delivery_verified === true && runtime?.is_running === true) {
+        return runtime;
+      }
+      if (runtime && runtime.worker_running === false) {
+        throw migrationError(
+          "stream_target_recovery_failed",
+          `Stream Target #${targetId} worker stopped before delivery was verified.`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw migrationError(
+      "stream_target_delivery_not_verified",
+      `Stream Target #${targetId} did not verify destination delivery within ${targetVerifyTimeoutMs}ms.`,
+    );
+  }
+
+  async function recoverWorkloads(
+    snapshot,
+    channel,
+    requestedBy,
+    recovered = { pull_source: false, target_ids: [] },
+    restoreOnly = null,
+  ) {
+    const restorePullSource = restoreOnly
+      ? Boolean(restoreOnly.pull_source)
+      : Boolean(snapshot.activeSource);
+    const restoreTargetIds = restoreOnly
+      ? new Set((restoreOnly.target_ids || []).map(Number))
+      : null;
+
+    if (snapshot.activeSource && restorePullSource) {
       const sourceResult = await pool.query(
         `SELECT * FROM channel_pull_sources
          WHERE id=$1 AND channel_id=$2 AND organization_id=$3 LIMIT 1`,
@@ -332,6 +371,9 @@ function createMediaNodeMigrationManager({
     }
 
     for (const original of snapshot.targets) {
+      if (restoreTargetIds && !restoreTargetIds.has(Number(original.id)))
+        continue;
+
       const targetResult = await pool.query(
         `SELECT * FROM social_destinations WHERE id=$1 AND channel_id=$2 LIMIT 1`,
         [original.id, channel.id],
@@ -360,7 +402,11 @@ function createMediaNodeMigrationManager({
             `Stream Target #${target.id} failed to recover on destination Media Node.`,
         );
       }
+
+      // Track immediately after start succeeds so a later verification failure
+      // still knows which destination worker must be stopped during rollback.
       recovered.target_ids.push(Number(target.id));
+      await waitForTargetDelivery(target.id);
     }
 
     return recovered;
@@ -460,7 +506,7 @@ function createMediaNodeMigrationManager({
 
     let holdAcquired = false;
     let ownershipCommitted = false;
-    let sourceShutdownStarted = false;
+    const stopped = { pull_source: false, target_ids: [] };
     let recovered = { pull_source: false, target_ids: [] };
     let rollback = null;
 
@@ -481,8 +527,7 @@ function createMediaNodeMigrationManager({
         metadata: { workload: snapshot.metadata },
       });
       await updateMigration(migration.id, "stopping_source");
-      sourceShutdownStarted = true;
-      await stopSourceWorkers(snapshot);
+      await stopSourceWorkers(snapshot, stopped);
 
       await updateMigration(migration.id, "ownership_committing");
       await commitOwnership({ channel, destinationMediaNodeId: destinationId });
@@ -492,12 +537,13 @@ function createMediaNodeMigrationManager({
       });
 
       const destinationChannel = await getChannel(cleanChannelId);
-      recovered = await recoverWorkloads(
+      await recoverWorkloads(
         snapshot,
         destinationChannel,
         requestedByAdminId
           ? `admin:${requestedByAdminId}`
           : "media-node-migration",
+        recovered,
       );
 
       const completed = await updateMigration(migration.id, "completed", {
@@ -535,7 +581,7 @@ function createMediaNodeMigrationManager({
             error: safeError(rollbackError),
           };
         }
-      } else if (sourceShutdownStarted) {
+      } else if (stopped.pull_source || stopped.target_ids.length > 0) {
         // Ownership never moved. Restore any source workers already stopped.
         try {
           const sourceChannel = await getChannel(cleanChannelId);
@@ -543,6 +589,8 @@ function createMediaNodeMigrationManager({
             snapshot,
             sourceChannel,
             "media-node-migration-abort-recovery",
+            { pull_source: false, target_ids: [] },
+            stopped,
           );
           rollback = {
             attempted: true,

@@ -3036,7 +3036,7 @@ function createStreamTargetManager({
            status = 'stopped',
            current_bitrate_kbps = 0,
            last_disconnected_at = now(),
-           active_destination_url = NULL,
+           active_destination_url = CASE WHEN $2::boolean THEN NULL ELSE active_destination_url END,
            platform_broadcast_id = CASE WHEN $2::boolean THEN NULL ELSE platform_broadcast_id END,
            platform_stream_id = CASE WHEN $2::boolean THEN NULL ELSE platform_stream_id END,
            updated_at = now()
