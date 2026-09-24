@@ -15960,6 +15960,60 @@ app.get(
   },
 );
 
+// Phase 5F.3 — cluster migration operations and drain/evacuation visibility.
+app.get(
+  "/api/admin/media-node-migrations",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const migrations = await mediaNodeMigrationManager.listClusterMigrations({
+        activeOnly:
+          String(req.query?.active_only || "").toLowerCase() === "true",
+        nodeId: Number(req.query?.node_id || 0),
+        limit: Number(req.query?.limit || 50),
+      });
+      res.json({ ok: true, migrations });
+    } catch (error) {
+      console.error("List cluster Media Node migrations error:", error);
+      res.status(500).json({
+        ok: false,
+        message: "Failed to list cluster Media Node migrations",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/media-nodes/:id/operations",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    try {
+      const operations = await mediaNodeMigrationManager.getNodeOperations(
+        Number(req.params.id),
+      );
+      res.json({ ok: true, ...operations });
+    } catch (error) {
+      const status =
+        error?.code === "media_node_not_found"
+          ? 404
+          : error?.code === "invalid_media_node_id"
+            ? 400
+            : 500;
+      console.error(
+        "Get Media Node operations error:",
+        error?.code || error?.message,
+      );
+      res.status(status).json({
+        ok: false,
+        code: error?.code || "media_node_operations_failed",
+        message: error?.message || "Failed to load Media Node operations",
+      });
+    }
+  },
+);
+
 // OAuth routes are mounted AFTER Stream Targets so disconnecting an OAuth
 // account can safely stop any active target/platform broadcast before the
 // credential relationship is removed.
@@ -19079,6 +19133,13 @@ io.on("connection", (socket) => {
   await ensureMediaNodeMigrationTables(pool);
   await streamTargetManager.reconcileDatabaseState();
   await pullSourceManager.reconcileDatabaseState();
+  const migrationReconcile =
+    await mediaNodeMigrationManager.reconcileIncompleteMigrations({
+      trigger: "backend_startup",
+    });
+  console.log(
+    `[MEDIA-NODE-MIGRATION-RECONCILE] Startup reconciliation complete; inspected=${migrationReconcile.inspected} reconciled=${migrationReconcile.reconciled}.`,
+  );
   await recoverActiveScheduledAutomation();
   await ensureRestartAuditTable();
   await ensureApiKeysTable();

@@ -644,10 +644,196 @@ function createMediaNodeMigrationManager({
     return result.rows[0] || null;
   }
 
+  async function listClusterMigrations(options = {}) {
+    const safeLimit = Math.max(1, Math.min(200, Number(options.limit || 50)));
+    const activeOnly = options.activeOnly === true;
+    const nodeId = Number(options.nodeId || 0);
+    const values = [];
+    const where = [];
+
+    if (activeOnly) {
+      values.push(ACTIVE_MIGRATION_STATUSES);
+      where.push(`m.status = ANY($${values.length}::varchar[])`);
+    }
+    if (Number.isInteger(nodeId) && nodeId > 0) {
+      values.push(nodeId);
+      where.push(
+        `(m.source_media_node_id=$${values.length} OR m.destination_media_node_id=$${values.length})`,
+      );
+    }
+
+    values.push(safeLimit);
+    const result = await pool.query(
+      `SELECT m.*,
+              c.name AS channel_name,
+              c.media_node_id AS current_media_node_id,
+              c.is_live AS channel_is_live,
+              src.name AS source_media_node_name,
+              dst.name AS destination_media_node_name
+       FROM channel_media_node_migrations m
+       LEFT JOIN channels c ON c.id=m.channel_id
+       LEFT JOIN media_nodes src ON src.id=m.source_media_node_id
+       LEFT JOIN media_nodes dst ON dst.id=m.destination_media_node_id
+       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+       ORDER BY m.id DESC
+       LIMIT $${values.length}`,
+      values,
+    );
+    return result.rows;
+  }
+
+  async function getNodeOperations(nodeId) {
+    const cleanNodeId = Number(nodeId);
+    if (!Number.isInteger(cleanNodeId) || cleanNodeId <= 0) {
+      throw codedError(
+        "invalid_media_node_id",
+        "Media Node id must be a positive integer.",
+      );
+    }
+
+    const nodeResult = await pool.query(
+      `SELECT id, name, status, is_enabled, is_draining, max_streams,
+              active_streams, srs_healthy, api_healthy, last_heartbeat_at,
+              last_error
+       FROM media_nodes WHERE id=$1 LIMIT 1`,
+      [cleanNodeId],
+    );
+    const node = nodeResult.rows[0];
+    if (!node)
+      throw codedError("media_node_not_found", "Media Node was not found.");
+
+    const channelsResult = await pool.query(
+      `SELECT id, organization_id, name, is_live, media_node_id
+       FROM channels
+       WHERE media_node_id=$1
+       ORDER BY is_live DESC, name ASC, id ASC`,
+      [cleanNodeId],
+    );
+    const migrations = await listClusterMigrations({
+      nodeId: cleanNodeId,
+      activeOnly: true,
+      limit: 200,
+    });
+
+    const assigned = channelsResult.rows.map((row) => ({
+      ...row,
+      id: Number(row.id),
+      organization_id: Number(row.organization_id),
+      media_node_id: Number(row.media_node_id),
+    }));
+    const liveAssigned = assigned.filter((row) => row.is_live === true);
+
+    return {
+      node: {
+        ...node,
+        id: Number(node.id),
+        max_streams: Number(node.max_streams || 0),
+        active_streams: Number(node.active_streams || 0),
+      },
+      assigned_channels: assigned,
+      active_migrations: migrations,
+      evacuation: {
+        requested: node.is_draining === true,
+        assigned_channels: assigned.length,
+        live_assigned_channels: liveAssigned.length,
+        active_migrations: migrations.length,
+        ready_to_disable:
+          node.is_draining === true &&
+          assigned.length === 0 &&
+          Number(node.active_streams || 0) === 0 &&
+          migrations.length === 0,
+        note:
+          node.is_draining === true && assigned.length > 0
+            ? "Node is draining but still owns channels. Existing assignments are intentionally preserved until controlled migration or reassignment."
+            : null,
+      },
+    };
+  }
+
+  async function reconcileIncompleteMigrations(options = {}) {
+    const rows = await listClusterMigrations({ activeOnly: true, limit: 200 });
+    const results = [];
+
+    for (const migration of rows) {
+      const channelId = Number(migration.channel_id);
+      const sourceNodeId = Number(migration.source_media_node_id || 0);
+      const destinationNodeId = Number(
+        migration.destination_media_node_id || 0,
+      );
+      const currentNodeId = Number(migration.current_media_node_id || 0);
+      const ownershipCommitted = Boolean(migration.ownership_committed_at);
+
+      let classification;
+      let failureCode;
+      let message;
+
+      if (currentNodeId > 0 && currentNodeId === sourceNodeId) {
+        classification = ownershipCommitted
+          ? "ownership_rolled_back_before_restart"
+          : "precommit_abandoned";
+        failureCode = ownershipCommitted
+          ? "backend_restart_ownership_rolled_back"
+          : "backend_restart_precommit_abandoned";
+        message = ownershipCommitted
+          ? "Backend restarted during migration; channel ownership is on the source node. Existing media reconcilers remain authoritative for worker recovery."
+          : "Backend restarted before migration ownership committed. Channel ownership remains on the source node; existing media reconcilers remain authoritative for worker recovery.";
+      } else if (currentNodeId > 0 && currentNodeId === destinationNodeId) {
+        classification = "postcommit_requires_review";
+        failureCode = "backend_restart_postcommit_requires_review";
+        message =
+          "Backend restarted after channel ownership moved to the destination node. Ownership is preserved; worker state is not guessed and must be verified through existing media reconciliation/operations tooling.";
+      } else {
+        classification = "ownership_ambiguous_requires_review";
+        failureCode = "backend_restart_ownership_ambiguous";
+        message =
+          "Backend restarted with migration ownership that does not match the recorded source or destination. No ownership or media-worker action was taken.";
+      }
+
+      const reconciliation = {
+        version: 1,
+        trigger: options.trigger || "backend_startup",
+        classification,
+        previous_status: migration.status,
+        current_media_node_id: currentNodeId || null,
+        source_media_node_id: sourceNodeId || null,
+        destination_media_node_id: destinationNodeId || null,
+        ownership_committed_at: migration.ownership_committed_at || null,
+        media_actions_taken: false,
+        ownership_changed: false,
+        reconciled_at: new Date().toISOString(),
+      };
+
+      const updated = await updateMigration(migration.id, "failed", {
+        failureCode,
+        failureMessage: message,
+        metadata: { reconciliation },
+      });
+
+      results.push({
+        migration_id: Number(migration.id),
+        channel_id: channelId,
+        classification,
+        failure_code: failureCode,
+        current_media_node_id: currentNodeId || null,
+        migration: updated,
+      });
+    }
+
+    return {
+      ok: true,
+      inspected: rows.length,
+      reconciled: results.length,
+      results,
+    };
+  }
+
   return {
     migrateChannel,
     listMigrations,
     getActiveMigration,
+    listClusterMigrations,
+    getNodeOperations,
+    reconcileIncompleteMigrations,
     validateDestinationNode,
   };
 }
