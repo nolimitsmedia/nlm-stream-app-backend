@@ -279,6 +279,59 @@ function timingSafeSecretEqual(expectedValue, receivedValue) {
   return crypto.timingSafeEqual(expected, received);
 }
 
+// Phase 5G.3B — authenticated control-plane resolver for the stable ingest
+// gateway. This credential is deliberately independent from Admin JWTs,
+// public API keys, Media Node Agent tokens, and SRS webhook credentials.
+const INGEST_GATEWAY_TOKEN = String(
+  process.env.INGEST_GATEWAY_TOKEN || "",
+).trim();
+const INGEST_GATEWAY_TARGET_RTMP_PORT = Math.max(
+  1,
+  Math.min(65535, Number(process.env.INGEST_GATEWAY_TARGET_RTMP_PORT || 1935)),
+);
+const INGEST_GATEWAY_TARGET_SRT_PORT = Math.max(
+  1,
+  Math.min(65535, Number(process.env.INGEST_GATEWAY_TARGET_SRT_PORT || 10080)),
+);
+
+function authenticateIngestGateway(req, res, next) {
+  if (INGEST_GATEWAY_TOKEN.length < 32) {
+    console.error(
+      "[INGEST-GATEWAY] Resolver unavailable: INGEST_GATEWAY_TOKEN is not configured with at least 32 characters.",
+    );
+    return res.status(503).json({
+      ok: false,
+      allowed: false,
+      reason: "gateway_auth_not_configured",
+    });
+  }
+
+  const authHeader = String(req.get("authorization") || "").trim();
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  const receivedToken = String(
+    bearerMatch?.[1] || req.get("x-nlm-ingest-gateway-token") || "",
+  ).trim();
+
+  if (!timingSafeSecretEqual(INGEST_GATEWAY_TOKEN, receivedToken)) {
+    console.warn("[INGEST-GATEWAY] Rejected unauthorized resolver request.");
+    return res.status(403).json({
+      ok: false,
+      allowed: false,
+      reason: "invalid_gateway_credential",
+    });
+  }
+
+  return next();
+}
+
+function ingestGatewayDeny(res, status, reason) {
+  return res.status(status).json({
+    ok: true,
+    allowed: false,
+    reason,
+  });
+}
+
 function authenticateSrsWebhook(req) {
   const rawNodeId =
     req.get("x-nlm-media-node-id") ||
@@ -16089,6 +16142,138 @@ const mediaNodeMigrationManager = createMediaNodeMigrationManager({
 });
 
 // Phase 5F.5 — read-only ingest-routing readiness for operations.
+// Phase 5G.3B — authoritative stream-key -> assigned Media Node resolver.
+// The gateway is a routing consumer only: it never chooses a different node,
+// mutates channel ownership, or performs placement. Unknown/unassigned/stale/
+// unhealthy/draining/full destinations fail closed. Stream keys are never
+// written to logs by this route.
+app.post(
+  "/api/internal/ingest/resolve",
+  authenticateIngestGateway,
+  async (req, res) => {
+    try {
+      const streamKey = String(req.body?.stream_key || "").trim();
+      const protocol = String(req.body?.protocol || "")
+        .trim()
+        .toLowerCase();
+
+      if (!streamKey || streamKey.length > 255) {
+        return ingestGatewayDeny(res, 400, "invalid_stream_key");
+      }
+
+      if (!["rtmp", "rtmps", "srt"].includes(protocol)) {
+        return ingestGatewayDeny(res, 400, "unsupported_protocol");
+      }
+
+      const result = await queryWithRetry(
+        `
+        SELECT
+          c.id AS channel_id,
+          c.media_node_id,
+          mn.name AS media_node_name,
+          mn.hostname AS media_node_hostname,
+          host(mn.public_ip) AS media_node_public_ip,
+          host(mn.private_ip) AS media_node_private_ip,
+          mn.status AS media_node_status,
+          mn.is_enabled AS media_node_enabled,
+          mn.is_draining AS media_node_draining,
+          mn.max_streams,
+          mn.active_streams,
+          mn.srs_healthy,
+          mn.api_healthy,
+          mn.last_heartbeat_at
+        FROM channels c
+        LEFT JOIN media_nodes mn ON mn.id = c.media_node_id
+        WHERE c.stream_key = $1
+        LIMIT 1
+        `,
+        [streamKey],
+      );
+
+      const route = result.rows[0];
+      if (!route) return ingestGatewayDeny(res, 404, "stream_not_found");
+      if (!route.media_node_id)
+        return ingestGatewayDeny(res, 409, "channel_unassigned");
+      if (!route.media_node_name)
+        return ingestGatewayDeny(res, 409, "node_not_found");
+      if (route.media_node_enabled !== true)
+        return ingestGatewayDeny(res, 409, "node_disabled");
+      if (route.media_node_draining === true)
+        return ingestGatewayDeny(res, 409, "node_draining");
+      if (route.media_node_status !== "online")
+        return ingestGatewayDeny(res, 409, "node_offline");
+      if (route.srs_healthy !== true || route.api_healthy !== true)
+        return ingestGatewayDeny(res, 409, "node_unhealthy");
+
+      const staleAfterSeconds = Math.max(
+        60,
+        Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
+      );
+      const heartbeatAgeSeconds = route.last_heartbeat_at
+        ? Math.max(
+            0,
+            Math.floor(
+              (Date.now() - new Date(route.last_heartbeat_at).getTime()) / 1000,
+            ),
+          )
+        : null;
+
+      if (
+        heartbeatAgeSeconds === null ||
+        !Number.isFinite(heartbeatAgeSeconds) ||
+        heartbeatAgeSeconds > staleAfterSeconds
+      ) {
+        return ingestGatewayDeny(res, 409, "node_heartbeat_stale");
+      }
+
+      const maxStreams = Number(route.max_streams || 0);
+      const activeStreams = Number(route.active_streams || 0);
+      if (maxStreams > 0 && activeStreams >= maxStreams) {
+        return ingestGatewayDeny(res, 409, "node_at_capacity");
+      }
+
+      const targetHost = normalizeIngestHost(
+        route.media_node_private_ip ||
+          route.media_node_public_ip ||
+          route.media_node_hostname,
+      );
+      if (!targetHost)
+        return ingestGatewayDeny(res, 409, "node_target_unavailable");
+
+      return res.json({
+        ok: true,
+        allowed: true,
+        channel_id: Number(route.channel_id),
+        media_node_id: Number(route.media_node_id),
+        media_node_name: route.media_node_name || null,
+        protocol,
+        target: {
+          host: targetHost,
+          port:
+            protocol === "srt"
+              ? INGEST_GATEWAY_TARGET_SRT_PORT
+              : INGEST_GATEWAY_TARGET_RTMP_PORT,
+          rtmp_port: INGEST_GATEWAY_TARGET_RTMP_PORT,
+          srt_port: INGEST_GATEWAY_TARGET_SRT_PORT,
+          application: "live",
+        },
+        routing: {
+          authoritative_assignment: true,
+          heartbeat_age_seconds: heartbeatAgeSeconds,
+          heartbeat_stale_after_seconds: staleAfterSeconds,
+        },
+      });
+    } catch (error) {
+      console.error("[INGEST-GATEWAY] Resolver error:", error.message);
+      return res.status(503).json({
+        ok: false,
+        allowed: false,
+        reason: "routing_backend_unavailable",
+      });
+    }
+  },
+);
+
 app.get(
   "/api/admin/ingest-routing",
   authenticateAdmin,
