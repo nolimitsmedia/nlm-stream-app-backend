@@ -15,7 +15,10 @@ const {
   getFfmpegProcessCount,
 } = require("./media_node_service");
 
-const AGENT_VERSION = "5A.2a";
+const AGENT_VERSION = "5F.4";
+// Phase 5F.4 — unique to this Agent process lifetime. The control plane uses
+// this opaque value only to detect a restart; it is not a credential.
+const AGENT_BOOT_ID = crypto.randomUUID();
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 5091;
 const DEFAULT_SRS_API_URL = "http://127.0.0.1:1985";
@@ -246,6 +249,7 @@ function baseIdentity() {
     node_name: nodeName,
     hostname: os.hostname(),
     agent_version: AGENT_VERSION,
+    boot_id: AGENT_BOOT_ID,
     transport: useTls ? "https" : "http",
     pid: process.pid,
     uptime_seconds: Math.floor(process.uptime()),
@@ -2003,6 +2007,7 @@ function handleCapabilities(res) {
       automatic_load_balancing: false,
       secure_remote_transport: useTls,
       node_identity_response: true,
+      agent_boot_identity: true,
     },
     protocols: {
       ingest: ["rtmp", "rtmps", "srt"],
@@ -2179,9 +2184,11 @@ server.listen(port, host, () => {
 function shutdown(signal) {
   console.log(`[MediaNodeAgent] ${signal} received; shutting down`);
 
-  // 4D.4B does not yet implement persistent-job reconciliation after an agent
-  // restart. Stop agent-owned workers deliberately so no orphan FFmpeg process
-  // can continue publishing without a control-plane owner.
+  // Phase 5F.4 keeps shutdown conservative: Agent-owned workers are stopped
+  // deliberately. After the Agent returns with a new boot_id, the backend
+  // detects that generation change and runs the existing authoritative Pull
+  // Source and Stream Target reconciliation paths. This avoids orphan workers
+  // and avoids unsafe OS-level process adoption.
   for (const job of jobs.values()) {
     if (job.type === "pull_source_start") clearPullSourceReconnectTimer(job);
     if (job.child && ["starting", "running", "stopping"].includes(job.status)) {

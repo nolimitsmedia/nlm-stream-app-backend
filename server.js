@@ -171,6 +171,17 @@ const STREAM_TARGET_MEDIA_NODE_EXECUTION_ENABLED =
 
 let mediaNodeHeartbeat = null;
 
+// Phase 5F.4 — detect Media Node Agent process-generation changes without
+// persisting a second source of truth. Agent boot IDs are opaque, in-memory
+// restart signals; durable workload intent remains in the existing database.
+const MEDIA_NODE_AGENT_GENERATION_POLL_MS = Math.max(
+  5000,
+  Number(process.env.MEDIA_NODE_AGENT_GENERATION_POLL_MS || 10000),
+);
+const mediaNodeAgentBootIds = new Map();
+let mediaNodeAgentGenerationTimer = null;
+let mediaNodeAgentReconcileInProgress = false;
+
 // Internal Stream Target receiver allow-list.
 //
 // /internal-target is deliberately NOT a general-purpose ingest application.
@@ -19110,6 +19121,108 @@ io.on("connection", (socket) => {
   });
 });
 
+// Phase 5F.4 — Agent restart/generation reconciliation.
+// First observation establishes a baseline. Only a confirmed boot_id change
+// invokes the existing authoritative Pull Source and Stream Target reconcilers.
+async function pollMediaNodeAgentGenerations() {
+  if (mediaNodeAgentReconcileInProgress) return;
+
+  let nodes;
+  try {
+    const result = await queryWithRetry(
+      `SELECT id, name, hostname, host(public_ip) AS public_ip,
+              private_ip::text AS private_ip, metadata
+       FROM media_nodes
+       WHERE is_enabled = TRUE
+       ORDER BY id`,
+    );
+    nodes = result.rows;
+  } catch (error) {
+    console.warn(
+      `[MEDIA-NODE-AGENT-RECONCILE] Unable to list enabled nodes: ${error.message}`,
+    );
+    return;
+  }
+
+  for (const node of nodes) {
+    const nodeId = Number(node.id);
+    try {
+      const connection = resolveAgentConnection(node, {
+        localNodeId: MEDIA_NODE_ID,
+        localPort: MEDIA_NODE_AGENT_PORT,
+        localToken: MEDIA_NODE_AGENT_TOKEN,
+        allowInsecureRemote: MEDIA_NODE_AGENT_ALLOW_INSECURE_REMOTE,
+      });
+      if (!connection.configured || !connection.tokenConfigured) continue;
+
+      const response = await getAgentHealth({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: nodeId,
+      });
+      const bootId = String(response.data?.boot_id || "").trim();
+      if (!bootId) {
+        console.warn(
+          `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} Agent does not expose boot_id; restart detection is unavailable until the Agent is upgraded.`,
+        );
+        continue;
+      }
+
+      const previousBootId = mediaNodeAgentBootIds.get(nodeId);
+      mediaNodeAgentBootIds.set(nodeId, bootId);
+      if (!previousBootId) {
+        console.log(
+          `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} generation baseline established.`,
+        );
+        continue;
+      }
+      if (previousBootId === bootId) continue;
+
+      mediaNodeAgentReconcileInProgress = true;
+      console.warn(
+        `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} Agent generation changed; running authoritative workload reconciliation.`,
+      );
+      try {
+        const pullResult = await pullSourceManager.reconcileDatabaseState();
+        const targetResult = await streamTargetManager.reconcileDatabaseState();
+        console.log(
+          `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} reconciliation complete` +
+            ` pull_adopted=${Number(pullResult?.adopted || 0)}` +
+            ` pull_blocked=${Number(pullResult?.blockedChannels?.length || 0)}` +
+            ` target_adopted=${Number(targetResult?.adopted || 0)}.`,
+        );
+      } catch (error) {
+        console.error(
+          `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} reconciliation failed:`,
+          error,
+        );
+      } finally {
+        mediaNodeAgentReconcileInProgress = false;
+      }
+    } catch (error) {
+      // Keep the previous generation while the Agent is unreachable. The next
+      // healthy response can then prove whether a restart actually occurred.
+      console.warn(
+        `[MEDIA-NODE-AGENT-RECONCILE] node=${nodeId} health unavailable: ${error.message}`,
+      );
+    }
+  }
+}
+
+function startMediaNodeAgentGenerationMonitor() {
+  if (mediaNodeAgentGenerationTimer) return;
+  void pollMediaNodeAgentGenerations();
+  mediaNodeAgentGenerationTimer = setInterval(
+    pollMediaNodeAgentGenerations,
+    MEDIA_NODE_AGENT_GENERATION_POLL_MS,
+  );
+  mediaNodeAgentGenerationTimer.unref?.();
+  console.log(
+    `[MEDIA-NODE-AGENT-RECONCILE] generation monitor enabled interval=${MEDIA_NODE_AGENT_GENERATION_POLL_MS}ms`,
+  );
+}
+
 /*
 |--------------------------------------------------------------------------
 | SERVER
@@ -19173,6 +19286,10 @@ io.on("connection", (socket) => {
         "[MediaNode] heartbeat disabled — MEDIA_NODE_ID is not configured.",
       );
     }
+
+    // Phase 5F.4 — establish Agent generation baselines only after startup DB
+    // reconciliation has completed and the API is listening.
+    startMediaNodeAgentGenerationMonitor();
 
     // Phase 3.1 scheduled automation — execute due starts/ends and recover
     // missed jobs after normal PM2 restarts. Run once immediately, then poll.
