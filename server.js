@@ -137,6 +137,102 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CLIENT_URL)
 const SRS_API_URL = process.env.SRS_API_URL || "http://localhost:1985";
 const HLS_BASE_URL = process.env.HLS_BASE_URL || "http://localhost:8080";
 
+// Phase 5F.5 — stable public ingest-routing contract.
+//
+// PUBLIC_INGEST_HOST is intentionally separate from media_nodes.public_ip. When
+// configured it represents the stable hostname encoders keep across Media Node
+// placement changes. Until a real gateway/router is deployed, leaving it unset
+// preserves the existing direct-node routing behavior.
+const PUBLIC_INGEST_HOST = String(process.env.PUBLIC_INGEST_HOST || "")
+  .trim()
+  .replace(/^\[|\]$/g, "");
+const PUBLIC_INGEST_RTMP_SCHEME =
+  String(process.env.PUBLIC_INGEST_RTMP_SCHEME || "rtmps")
+    .trim()
+    .toLowerCase() === "rtmp"
+    ? "rtmp"
+    : "rtmps";
+const PUBLIC_INGEST_RTMP_PORT = Math.max(
+  1,
+  Math.min(65535, Number(process.env.PUBLIC_INGEST_RTMP_PORT || 1936)),
+);
+const PUBLIC_INGEST_SRT_PORT = Math.max(
+  1,
+  Math.min(65535, Number(process.env.PUBLIC_INGEST_SRT_PORT || 10080)),
+);
+// Phase 5F.5 intentionally does not unlock live direct-ingest migration. A
+// stable hostname is only the public contract; an active publisher still needs
+// a physically validated routing/connection-handoff layer before migration can
+// be automated safely.
+
+function normalizeIngestHost(value) {
+  const host = String(value || "")
+    .trim()
+    .replace(/^\[|\]$/g, "");
+  if (!host || /[\s\/?#]/.test(host)) return null;
+  return host;
+}
+
+function formatIngestAuthority(host, port, defaultPort = null) {
+  const cleanHost = normalizeIngestHost(host);
+  if (!cleanHost) return null;
+  const bracketed = cleanHost.includes(":") ? `[${cleanHost}]` : cleanHost;
+  return defaultPort && Number(port) === Number(defaultPort)
+    ? bracketed
+    : `${bracketed}:${port}`;
+}
+
+function buildChannelIngestRouting(channel = {}, node = null) {
+  const streamKey = String(channel.stream_key || "").trim();
+  const stableHost = normalizeIngestHost(PUBLIC_INGEST_HOST);
+  const directHost = normalizeIngestHost(node?.public_ip || node?.hostname);
+  const useStableGateway = Boolean(stableHost);
+  const host = stableHost || directHost;
+
+  let rtmpServer = null;
+  let srtPublishUrl = null;
+  if (host) {
+    if (useStableGateway) {
+      const defaultRtmpPort =
+        PUBLIC_INGEST_RTMP_SCHEME === "rtmps" ? 443 : 1935;
+      const authority = formatIngestAuthority(
+        host,
+        PUBLIC_INGEST_RTMP_PORT,
+        defaultRtmpPort,
+      );
+      rtmpServer = `${PUBLIC_INGEST_RTMP_SCHEME}://${authority}/live`;
+      const srtAuthority = formatIngestAuthority(host, PUBLIC_INGEST_SRT_PORT);
+      srtPublishUrl = streamKey
+        ? `srt://${srtAuthority}?streamid=#!::r=live/${streamKey},m=publish`
+        : null;
+    } else {
+      const authority = formatIngestAuthority(host, 1935, 1935);
+      rtmpServer = `rtmp://${authority}/live`;
+      const srtAuthority = formatIngestAuthority(host, 10080);
+      srtPublishUrl = streamKey
+        ? `srt://${srtAuthority}?streamid=#!::r=live/${streamKey},m=publish`
+        : null;
+    }
+  }
+
+  return {
+    media_node_id: channel.media_node_id || node?.id || null,
+    media_node_name: channel.media_node_name || node?.name || null,
+    routing_mode: useStableGateway
+      ? "stable_gateway"
+      : host
+        ? "direct_node"
+        : "unavailable",
+    stable_gateway_configured: useStableGateway,
+    direct_ingest_migration_enabled: false,
+    ingest_host: host || null,
+    rtmp_server: rtmpServer,
+    srt_publish_url: srtPublishUrl,
+    assignment_status:
+      channel.media_node_id || node?.id ? "assigned" : "unassigned",
+  };
+}
+
 // Media-node heartbeat. MEDIA_NODE_ID <= 0 disables local node registration.
 const MEDIA_NODE_ID = Number(process.env.MEDIA_NODE_ID || 0);
 const MEDIA_NODE_HEARTBEAT_INTERVAL_MS = Math.max(
@@ -4173,13 +4269,19 @@ app.post(
         membership: membershipResult.rows[0],
         ownerMembership: ownerMembershipResult.rows[0],
         channel: channelResult.rows[0],
-        links: {
-          watch_url: watchUrl,
-          playback_url: playbackUrl,
-          rtmp_server: "rtmp://localhost/live",
-          stream_key: streamKey,
-          srt_url: `srt://localhost:10080?streamid=#!::r=live/${streamKey},m=publish`,
-        },
+        links: (() => {
+          const routing = buildChannelIngestRouting(channelResult.rows[0]);
+          return {
+            watch_url: watchUrl,
+            playback_url: playbackUrl,
+            rtmp_server: routing.rtmp_server || "rtmp://localhost/live",
+            stream_key: streamKey,
+            srt_url:
+              routing.srt_publish_url ||
+              `srt://localhost:10080?streamid=#!::r=live/${streamKey},m=publish`,
+            ingest_routing: routing,
+          };
+        })(),
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -13733,30 +13835,15 @@ app.get(
       );
 
       const channels = result.rows.map((channel) => {
-        // Phase 2 — node-aware ingest routing.
-        //
-        // The assigned media node is now the source of truth for where an
-        // encoder should publish. Prefer the node's public IP because RTMP/SRT
-        // are raw media transports and do not depend on the HTTP API/CDN host.
-        // The legacy VITE_INGEST_HOST fallback remains a frontend safety net for
-        // an unassigned channel, but assigned channels receive explicit routing.
-        const ingestHost =
-          channel.media_node_public_ip || channel.media_node_hostname || null;
-
+        const node = {
+          id: channel.media_node_id,
+          name: channel.media_node_name,
+          hostname: channel.media_node_hostname,
+          public_ip: channel.media_node_public_ip,
+        };
         return {
           ...channel,
-          routing: {
-            media_node_id: channel.media_node_id || null,
-            media_node_name: channel.media_node_name || null,
-            ingest_host: ingestHost,
-            rtmp_server: ingestHost ? `rtmp://${ingestHost}/live` : null,
-            srt_publish_url: ingestHost
-              ? `srt://${ingestHost}:10080?streamid=#!::r=live/${channel.stream_key},m=publish`
-              : null,
-            assignment_status: channel.media_node_id
-              ? "assigned"
-              : "unassigned",
-          },
+          routing: buildChannelIngestRouting(channel, node),
         };
       });
 
@@ -13990,20 +14077,7 @@ app.patch(
           media_node_public_ip: node?.public_ip || null,
           media_node_region: node?.region || null,
           media_node_status: node?.status || null,
-          routing: {
-            media_node_id: node?.id || null,
-            media_node_name: node?.name || null,
-            ingest_host: node?.public_ip || node?.hostname || null,
-            rtmp_server:
-              node?.public_ip || node?.hostname
-                ? `rtmp://${node.public_ip || node.hostname}/live`
-                : null,
-            srt_publish_url:
-              node?.public_ip || node?.hostname
-                ? `srt://${node.public_ip || node.hostname}:10080?streamid=#!::r=live/${updated.rows[0].stream_key},m=publish`
-                : null,
-            assignment_status: node ? "assigned" : "unassigned",
-          },
+          routing: buildChannelIngestRouting(updated.rows[0], node),
         },
       });
     } catch (error) {
@@ -15896,6 +15970,38 @@ const mediaNodeMigrationManager = createMediaNodeMigrationManager({
   heartbeatIntervalMs: MEDIA_NODE_HEARTBEAT_INTERVAL_MS,
 });
 
+// Phase 5F.5 — read-only ingest-routing readiness for operations.
+app.get(
+  "/api/admin/ingest-routing",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (_req, res) => {
+    const stableGatewayConfigured = Boolean(
+      normalizeIngestHost(PUBLIC_INGEST_HOST),
+    );
+    res.json({
+      ok: true,
+      routing_mode: stableGatewayConfigured ? "stable_gateway" : "direct_node",
+      stable_gateway_configured: stableGatewayConfigured,
+      direct_ingest_migration_enabled: false,
+      public_ingest_host: stableGatewayConfigured ? PUBLIC_INGEST_HOST : null,
+      rtmp: stableGatewayConfigured
+        ? {
+            scheme: PUBLIC_INGEST_RTMP_SCHEME,
+            port: PUBLIC_INGEST_RTMP_PORT,
+            application: "live",
+          }
+        : null,
+      srt: stableGatewayConfigured
+        ? { port: PUBLIC_INGEST_SRT_PORT, application: "live" }
+        : null,
+      migration_safety: stableGatewayConfigured
+        ? "gateway_configured_but_live_direct_ingest_migration_locked"
+        : "live_direct_ingest_migration_locked",
+    });
+  },
+);
+
 app.post(
   "/api/admin/channels/:id/media-node/migrate",
   authenticateAdmin,
@@ -15923,6 +16029,7 @@ app.post(
         "destination_at_capacity",
         "ha_transition_busy",
         "direct_ingest_migration_unsupported",
+        "direct_ingest_routing_unavailable",
         "source_ownership_changed",
       ]);
       const notFoundCodes = new Set([

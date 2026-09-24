@@ -214,8 +214,8 @@ function createMediaNodeMigrationManager({
     const activeSource = sourceResult.rows[0] || null;
     if (channel.is_live && !activeSource) {
       throw migrationError(
-        "direct_ingest_migration_unsupported",
-        "Live migration currently requires an active managed Pull Source. Direct OBS/SRT publisher migration requires publisher rerouting and is not safe to automate yet.",
+        "direct_ingest_routing_unavailable",
+        "Live direct OBS/SRT publisher migration remains locked in Phase 5F.5. A stable ingest hostname alone cannot hand off an already-connected publisher; the routing layer must be physically validated before this guard can be relaxed.",
       );
     }
 
