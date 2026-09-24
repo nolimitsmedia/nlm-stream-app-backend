@@ -247,6 +247,87 @@ const MEDIA_NODE_AGENT_PORT = Math.max(
 const MEDIA_NODE_AGENT_TOKEN = String(
   process.env.MEDIA_NODE_AGENT_TOKEN || "",
 ).trim();
+
+// Phase 5G.2 — node-aware SRS webhook authentication.
+// Rolling-safe default: legacy co-located Node01 hooks remain accepted while
+// SRS is transitioned. Remote nodes must always present node_id + a dedicated
+// SRS_WEBHOOK_TOKEN_<nodeId>. Set SRS_WEBHOOK_AUTH_REQUIRED=true only after
+// every production SRS instance has been switched to authenticated hook URLs.
+const SRS_WEBHOOK_AUTH_REQUIRED =
+  String(process.env.SRS_WEBHOOK_AUTH_REQUIRED || "false")
+    .trim()
+    .toLowerCase() === "true";
+
+function resolveSrsWebhookToken(nodeId) {
+  const id = Number(nodeId || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  const specific = String(process.env[`SRS_WEBHOOK_TOKEN_${id}`] || "").trim();
+  if (specific) return specific;
+
+  if (id === MEDIA_NODE_ID) {
+    return String(process.env.SRS_WEBHOOK_TOKEN || "").trim() || null;
+  }
+
+  return null;
+}
+
+function timingSafeSecretEqual(expectedValue, receivedValue) {
+  const expected = Buffer.from(String(expectedValue || ""), "utf8");
+  const received = Buffer.from(String(receivedValue || ""), "utf8");
+  if (!expected.length || expected.length !== received.length) return false;
+  return crypto.timingSafeEqual(expected, received);
+}
+
+function authenticateSrsWebhook(req) {
+  const rawNodeId =
+    req.get("x-nlm-media-node-id") ||
+    req.query?.node_id ||
+    req.body?.media_node_id ||
+    "";
+  const nodeId = Number(rawNodeId || 0);
+
+  // SRS cannot attach arbitrary HTTP headers to http_hooks, so the deployment
+  // package may use query parameters. Tests/internal callers can use headers.
+  const receivedToken = String(
+    req.get("x-nlm-srs-webhook-token") ||
+      req.query?.token ||
+      req.body?.webhook_token ||
+      "",
+  ).trim();
+
+  const identitySupplied = rawNodeId !== "" || receivedToken !== "";
+  if (!identitySupplied && !SRS_WEBHOOK_AUTH_REQUIRED) {
+    return { ok: true, legacy: true, nodeId: null };
+  }
+
+  if (!Number.isInteger(nodeId) || nodeId <= 0) {
+    return { ok: false, status: 403, reason: "invalid_node_identity" };
+  }
+
+  const expectedToken = resolveSrsWebhookToken(nodeId);
+  if (
+    !expectedToken ||
+    expectedToken.length < 32 ||
+    !timingSafeSecretEqual(expectedToken, receivedToken)
+  ) {
+    return { ok: false, status: 403, reason: "invalid_node_credential" };
+  }
+
+  return { ok: true, legacy: false, nodeId };
+}
+
+function rejectInvalidSrsWebhook(res, auth, eventName) {
+  console.warn(
+    `[SRS-WEBHOOK] Rejected ${eventName}: ${auth?.reason || "unauthorized"}`,
+  );
+  return res.status(auth?.status || 403).json({ code: 403 });
+}
+
+function srsWebhookOwnsChannel(auth, channel) {
+  if (!auth || auth.legacy) return true;
+  return Number(channel?.media_node_id || 0) === Number(auth.nodeId);
+}
 const MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS = Math.max(
   500,
   Number(process.env.MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS || 2500),
@@ -13348,6 +13429,11 @@ function scheduleDeferredStreamTargetStop(streamKey, channelId) {
 // Return code 0 = allow, code 403 = reject
 // ══════════════════════════════════════════
 app.post("/api/srs/on_publish", async (req, res) => {
+  const webhookAuth = authenticateSrsWebhook(req);
+  if (!webhookAuth.ok) {
+    return rejectInvalidSrsWebhook(res, webhookAuth, "on_publish");
+  }
+
   const streamKey = req.body?.stream || req.body?.name || "";
   const publishApp = req.body?.app || "";
   console.log(
@@ -13477,6 +13563,14 @@ app.post("/api/srs/on_publish", async (req, res) => {
     }
 
     const channel = channelResult.rows[0];
+
+    if (!srsWebhookOwnsChannel(webhookAuth, channel)) {
+      console.warn(
+        `[SRS-WEBHOOK] REJECTED on_publish — authenticated node ${webhookAuth.nodeId} ` +
+          `does not own channel ${channel.id}.`,
+      );
+      return res.status(403).json({ code: 403 });
+    }
 
     // 2. Check concurrent stream limit for this org's plan
     const plan = await getOrgStreamingPlan(channel.org_id);
@@ -13612,6 +13706,11 @@ app.post("/api/srs/on_publish", async (req, res) => {
 // SRS fires this when a broadcaster disconnects
 // ══════════════════════════════════════════
 app.post("/api/srs/on_unpublish", async (req, res) => {
+  const webhookAuth = authenticateSrsWebhook(req);
+  if (!webhookAuth.ok) {
+    return rejectInvalidSrsWebhook(res, webhookAuth, "on_unpublish");
+  }
+
   const streamKey = req.body?.stream || req.body?.name || "";
   const publishApp = req.body?.app || "";
   console.log(
@@ -13638,7 +13737,7 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     // That made a normal Primary -> Backup handoff look like a brand-new
     // broadcast to the Watch Page and destroyed DVR/session continuity.
     const channelLookup = await pool.query(
-      `SELECT id, organization_id, is_live, live_started_at
+      `SELECT id, organization_id, media_node_id, is_live, live_started_at
        FROM channels
        WHERE stream_key = $1
        LIMIT 1`,
@@ -13646,6 +13745,15 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
     );
 
     const channel = channelLookup.rows[0] || null;
+
+    if (channel && !srsWebhookOwnsChannel(webhookAuth, channel)) {
+      console.warn(
+        `[SRS-WEBHOOK] Ignoring on_unpublish from authenticated node ${webhookAuth.nodeId}; ` +
+          `channel ${channel.id} is assigned to media node ${channel.media_node_id ?? "none"}.`,
+      );
+      return res.json({ code: 0 });
+    }
+
     let handoff = {
       enabled: false,
       activeSourceId: null,
@@ -13749,6 +13857,11 @@ app.post("/api/srs/on_unpublish", async (req, res) => {
 // SRS fires this when a viewer starts watching
 // ══════════════════════════════════════════
 app.post("/api/srs/on_play", async (req, res) => {
+  const webhookAuth = authenticateSrsWebhook(req);
+  if (!webhookAuth.ok) {
+    return rejectInvalidSrsWebhook(res, webhookAuth, "on_play");
+  }
+
   const streamKey = req.body?.stream || req.body?.name || "";
   const clientId = req.body?.client_id || "";
   const ip = req.body?.ip || req.ip || "";
@@ -13766,6 +13879,11 @@ app.post("/api/srs/on_play", async (req, res) => {
 // SRS fires this when a viewer stops watching
 // ══════════════════════════════════════════
 app.post("/api/srs/on_stop", async (req, res) => {
+  const webhookAuth = authenticateSrsWebhook(req);
+  if (!webhookAuth.ok) {
+    return rejectInvalidSrsWebhook(res, webhookAuth, "on_stop");
+  }
+
   const streamKey = req.body?.stream || req.body?.name || "";
   console.log(`[SRS] on_stop — stream=${streamLogId(streamKey)}`);
   res.json({ code: 0 });
