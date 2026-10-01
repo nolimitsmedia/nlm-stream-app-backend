@@ -12165,48 +12165,6 @@ const pollBandwidthCompliance = async () => {
   }
 };
 
-// Cleans up just the raw (uncapped) DVR output for an org's channels —
-// used both for orgs without recording_enabled (cleanupUnrecordedFilesForOrganization
-// cleans both roots) and for orgs WITH recording enabled, where the raw
-// copy still gets written by SRS's DVR (it fires for both the "live" and
-// "live_capped" apps) but is never archived — only the capped copy is.
-// Left uncleaned, raw DVR output would otherwise accumulate disk forever
-// with no purpose.
-const cleanupRawDvrFiles = async (organizationId) => {
-  try {
-    const allowedChannels = await getAllowedChannelMap(organizationId);
-    if (!fs.existsSync(RECORDINGS_LIVE_ROOT)) return;
-
-    for (const streamName of allowedChannels.keys()) {
-      const streamFolder = path.join(RECORDINGS_LIVE_ROOT, streamName);
-      if (
-        !fs.existsSync(streamFolder) ||
-        !fs.statSync(streamFolder).isDirectory()
-      ) {
-        continue;
-      }
-
-      for (const file of fs.readdirSync(streamFolder)) {
-        if (file.endsWith(".tmp") || file.endsWith(".part")) continue;
-        const filePath = path.join(streamFolder, file);
-        try {
-          if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
-        } catch (fileErr) {
-          console.error(
-            `[RAW-DVR-CLEANUP] Failed to remove ${filePath}:`,
-            fileErr.message,
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.error(
-      `[RAW-DVR-CLEANUP] Failed for org ${organizationId}:`,
-      err.message,
-    );
-  }
-};
-
 async function autoSyncRecordingsDelayed(
   organizationId,
   delayMs = 8000,
@@ -12250,10 +12208,6 @@ async function autoSyncRecordingsDelayed(
 
       // Archive newly-ready recordings to Bunny Storage (if configured)
       await archiveReadyRecordingsForOrganization(organizationId);
-
-      // Raw (uncapped) DVR output is never archived — only the capped
-      // copy is — so clean it up here to avoid it silently filling disk.
-      await cleanupRawDvrFiles(organizationId);
 
       // Storage quota check — re-fetch the summary so used_storage_bytes
       // reflects the recording we just archived. Deliberately a WARNING
@@ -16798,7 +16752,7 @@ const getRecordingAbsolutePath = (streamKey, fileName) => {
 
   if (!cleanStream || !cleanFile) return null;
 
-  const basePath = path.resolve(RECORDINGS_LIVE_CAPPED_ROOT);
+  const basePath = path.resolve(RECORDINGS_LIVE_ROOT);
   const filePath = path.resolve(basePath, cleanStream, cleanFile);
 
   if (!filePath.startsWith(basePath)) return null;
@@ -17345,7 +17299,7 @@ const scanRecordingFilesForOrganization = async (
   organizationId,
   { processReady = false } = {},
 ) => {
-  const recordingsPath = RECORDINGS_LIVE_CAPPED_ROOT;
+  const recordingsPath = RECORDINGS_LIVE_ROOT;
   const allowedChannels = await getAllowedChannelMap(organizationId);
   const recordings = [];
 
@@ -17961,14 +17915,131 @@ app.get(
 
       const filePath = getRecordingAbsolutePath(stream, file);
 
-      if (!filePath || !fs.existsSync(filePath)) {
+      // Local recordings keep the existing download behavior.
+      if (filePath && fs.existsSync(filePath)) {
+        return res.download(filePath, file);
+      }
+
+      // Archived recordings no longer have a canonical local MP4.
+      // Resolve the tenant-owned recording row and stream the object
+      // from Bunny Storage as an attachment.
+      const archivedResult = await pool.query(
+        `
+        SELECT
+          id,
+          filename,
+          mp4_filename,
+          archive_status,
+          bunny_storage_path
+        FROM recordings
+        WHERE organization_id = $1
+          AND stream_key = $2
+          AND (
+            filename = $3
+            OR mp4_filename = $3
+          )
+        ORDER BY id DESC
+        LIMIT 1
+        `,
+        [req.organization.id, stream, file],
+      );
+
+      const recording = archivedResult.rows[0];
+
+      if (
+        !recording ||
+        recording.archive_status !== "archived" ||
+        !recording.bunny_storage_path
+      ) {
         return res.status(404).json({
           ok: false,
           message: "Recording file not found",
         });
       }
 
-      res.download(filePath, file);
+      const { zoneCreds } = getOrgBunnyZoneCreds(req.organization);
+
+      const hostname =
+        zoneCreds.hostname || BUNNY_STORAGE_HOSTNAME;
+      const zoneName =
+        zoneCreds.zoneName || BUNNY_STORAGE_ZONE;
+      const apiKey =
+        zoneCreds.apiKey || BUNNY_STORAGE_API_KEY;
+
+      if (!hostname || !zoneName || !apiKey) {
+        console.error(
+          "[BUNNY] Archived recording download credentials unavailable",
+        );
+
+        return res.status(503).json({
+          ok: false,
+          message: "Archived recording storage is unavailable",
+        });
+      }
+
+      const storageUrl =
+        `https://${hostname}/${zoneName}/${recording.bunny_storage_path}`;
+
+      const bunnyResponse = await fetch(storageUrl, {
+        method: "GET",
+        headers: {
+          AccessKey: apiKey,
+        },
+      });
+
+      if (!bunnyResponse.ok) {
+        console.error(
+          `[BUNNY] Archived recording download failed: ${bunnyResponse.status}`,
+        );
+
+        return res.status(
+          bunnyResponse.status === 404 ? 404 : 502,
+        ).json({
+          ok: false,
+          message:
+            bunnyResponse.status === 404
+              ? "Archived recording file not found"
+              : "Failed to retrieve archived recording",
+        });
+      }
+
+      const downloadName =
+        path.basename(recording.mp4_filename || file);
+
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${downloadName.replace(/["\\]/g, "_")}"`,
+      );
+
+      const contentLength =
+        bunnyResponse.headers.get("content-length");
+
+      if (contentLength) {
+        res.setHeader("Content-Length", contentLength);
+      }
+
+      if (!bunnyResponse.body) {
+        return res.status(502).json({
+          ok: false,
+          message: "Archived recording returned no media body",
+        });
+      }
+
+      const { Readable } = require("stream");
+
+      Readable.fromWeb(bunnyResponse.body).on("error", (error) => {
+        console.error(
+          "[BUNNY] Archived recording stream error:",
+          error.message,
+        );
+
+        if (!res.headersSent) {
+          res.status(502).end();
+        } else {
+          res.destroy(error);
+        }
+      }).pipe(res);
     } catch (error) {
       console.error("Download recording error:", error);
 
