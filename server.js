@@ -5239,9 +5239,16 @@ app.post(
           .toLowerCase()
           .replace(/-/g, "_");
         if (
-          !["rtmp", "rtmps", "rtsp", "srt", "hls", "http_flv"].includes(
-            protocol,
-          )
+          ![
+            "rtmp",
+            "rtmps",
+            "rtsp",
+            "srt",
+            "hls",
+            "http_flv",
+            "mpegts_udp",
+            "mpegts_tcp",
+          ].includes(protocol)
         ) {
           return res.status(409).json({
             ok: false,
@@ -15880,6 +15887,84 @@ pullSourceManager.setRemoteExecutor({
     );
     const row = result.rows[0];
     return Boolean(row?.ha_enabled && Number(row?.media_node_id) > 0);
+  },
+
+  async probe(source) {
+    const sourceId = Number(source?.id);
+    const channelId = Number(source?.channel_id);
+    const result = await queryWithRetry(
+      `SELECT ps.id, ps.channel_id, ps.organization_id, ps.protocol, ps.source_url, ps.enabled, c.media_node_id
+       FROM channel_pull_sources ps
+       JOIN channels c ON c.id=ps.channel_id AND c.organization_id=ps.organization_id
+       WHERE ps.id=$1 AND ps.channel_id=$2 LIMIT 1`,
+      [sourceId, channelId],
+    );
+    const row = result.rows[0];
+    if (!row || !row.enabled)
+      throw new Error("Pull Source is unavailable or disabled");
+    const nodeId = Number(row.media_node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0)
+      throw new Error("Channel has no assigned Media Node");
+    const protocol = pullSourceManager.normalizeProtocol(row.protocol);
+    const sourceUrl = decryptSourceUrl(row.source_url);
+    await pullSourceManager.validateSourceUrl(sourceUrl, protocol);
+    const { node, connection } =
+      await getMediaNodeAgentConnectionForControl(nodeId);
+    const response = await requestMediaNodeAgent({
+      baseUrl: connection.baseUrl,
+      token: connection.token,
+      path: "/v1/jobs",
+      method: "POST",
+      body: {
+        type: "pull_source_probe",
+        request_id: `probe-${channelId}-${sourceId}-${crypto.randomUUID()}`,
+        source_id: sourceId,
+        channel_id: channelId,
+        protocol,
+        source_url: sourceUrl,
+      },
+      timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+      expectedNodeId: node.id,
+    });
+    const jobId = response.data?.job?.id;
+    if (!jobId)
+      throw new Error("Media Node Agent did not return a probe job id");
+    const deadline = Date.now() + 12000;
+    let job = response.data.job;
+    while (Date.now() < deadline) {
+      if (
+        ["succeeded", "failed", "stopped"].includes(
+          String(job?.status || "").toLowerCase(),
+        )
+      )
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const status = await requestMediaNodeAgent({
+        baseUrl: connection.baseUrl,
+        token: connection.token,
+        path: `/v1/jobs/${jobId}`,
+        method: "GET",
+        timeoutMs: MEDIA_NODE_AGENT_REQUEST_TIMEOUT_MS,
+        expectedNodeId: node.id,
+      });
+      job = status.data?.job || job;
+    }
+    if (String(job?.status || "").toLowerCase() !== "succeeded") {
+      return {
+        ok: false,
+        code: "remote_probe_failed",
+        message: job?.error || "Media Node source probe did not succeed",
+      };
+    }
+    return {
+      ok: true,
+      code: "source_ready",
+      protocol,
+      source: maskSourceUrl(sourceUrl),
+      video: null,
+      audio: null,
+      execution: "media_node_agent",
+    };
   },
 
   async start(source, channel) {
