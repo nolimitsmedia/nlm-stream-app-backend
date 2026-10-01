@@ -19,6 +19,8 @@ const SUPPORTED_PROTOCOLS = Object.freeze({
   srt: { label: "SRT", schemes: ["srt:"] },
   hls: { label: "HLS", schemes: ["http:", "https:"] },
   http_flv: { label: "HTTP-FLV", schemes: ["http:", "https:"] },
+  mpegts_udp: { label: "MPEG-TS (UDP)", schemes: ["udp:"] },
+  mpegts_tcp: { label: "MPEG-TS (TCP)", schemes: ["tcp:"] },
 });
 
 const BASE_RECONNECT_MS = Math.max(
@@ -176,6 +178,59 @@ async function validateSourceUrl(sourceUrl, protocol) {
     throw error;
   }
 
+  if (normalized === "mpegts_udp") {
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    const port = Number(parsed.port || 0);
+    if (
+      !["0.0.0.0", "::", "[::]"].includes(hostname) ||
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535
+    ) {
+      const error = new Error(
+        "MPEG-TS UDP listener must use udp://0.0.0.0:<port> (port 1024-65535)",
+      );
+      error.code = "invalid_mpegts_udp_listener";
+      throw error;
+    }
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      (parsed.pathname && parsed.pathname !== "/")
+    ) {
+      const error = new Error(
+        "MPEG-TS UDP listener URL must not contain credentials, a path, or query options",
+      );
+      error.code = "invalid_mpegts_udp_listener";
+      throw error;
+    }
+    return parsed;
+  }
+
+  if (normalized === "mpegts_tcp") {
+    const port = Number(parsed.port || 0);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      const error = new Error(
+        "MPEG-TS TCP source requires an explicit port from 1-65535",
+      );
+      error.code = "invalid_mpegts_tcp_source";
+      throw error;
+    }
+    if (
+      parsed.username ||
+      parsed.password ||
+      (parsed.pathname && parsed.pathname !== "/") ||
+      parsed.searchParams.get("listen") === "1"
+    ) {
+      const error = new Error(
+        "MPEG-TS TCP is outbound-only and must not contain credentials, a path, or listen=1",
+      );
+      error.code = "invalid_mpegts_tcp_source";
+      throw error;
+    }
+  }
+
   if (
     normalized === "hls" &&
     !/\.m3u8(?:$|\?)/i.test(parsed.pathname + parsed.search)
@@ -195,6 +250,8 @@ async function validateSourceUrl(sourceUrl, protocol) {
     throw error;
   }
 
+  // TCP MPEG-TS is an outbound connection to an external sender, so it keeps
+  // the same SSRF/private-network protection as the other pull protocols.
   await validateExternalHostname(parsed.hostname);
   return parsed;
 }
@@ -365,7 +422,11 @@ function inputArgs(protocol) {
     "make_zero",
   ];
 
-  if (protocol === "rtmp" || protocol === "rtmps") {
+  if (
+    protocol === "rtmp" ||
+    protocol === "rtmps" ||
+    protocol === "mpegts_tcp"
+  ) {
     return [...common, "-rw_timeout", "15000000"];
   }
   if (protocol === "rtsp") {
@@ -390,7 +451,11 @@ function inputArgs(protocol) {
 function buildWorkerArgs(sourceUrl, protocol, streamKey) {
   const normalized = normalizeProtocol(protocol);
   const normalizeVideo =
-    normalized === "hls" || normalized === "http_flv" || normalized === "rtsp";
+    normalized === "hls" ||
+    normalized === "http_flv" ||
+    normalized === "rtsp" ||
+    normalized === "mpegts_udp" ||
+    normalized === "mpegts_tcp";
 
   const videoArgs = normalizeVideo
     ? [
@@ -648,9 +713,25 @@ function createPullSourceManager({ pool }) {
     const protocol = normalizeProtocol(source.protocol);
     const parsed = await validateSourceUrl(sourceUrl, protocol);
 
+    // Listener-style inputs must be probed on the Media Node that will own
+    // their socket. Reuse remote execution when HA + node assignment says
+    // this source belongs on an Agent; other sources retain local preflight.
+    if (remoteExecutor?.probe && remoteExecutor?.shouldUse) {
+      const useRemote = await remoteExecutor.shouldUse(source, {
+        id: source.channel_id,
+      });
+      if (useRemote) return remoteExecutor.probe(source);
+    }
+
     return new Promise((resolve) => {
       const preflightInputArgs =
-        protocol === "rtsp" ? ["-rtsp_transport", RTSP_TRANSPORT] : [];
+        protocol === "rtsp"
+          ? ["-rtsp_transport", RTSP_TRANSPORT]
+          : protocol === "mpegts_tcp"
+            ? ["-rw_timeout", "15000000", "-f", "mpegts"]
+            : protocol === "mpegts_udp"
+              ? ["-f", "mpegts"]
+              : [];
 
       const args = [
         "-v",
@@ -1347,6 +1428,37 @@ function createPullSourceManager({ pool }) {
     state.retryTimer.unref?.();
   }
 
+  async function ensureLocalUdpListenerAvailable(source, channel, sourceUrl) {
+    if (normalizeProtocol(source?.protocol) !== "mpegts_udp") return;
+    if (
+      remoteExecutor?.shouldUse &&
+      (await remoteExecutor.shouldUse(source, channel))
+    )
+      return;
+    const wantedPort = Number(new URL(String(sourceUrl)).port || 0);
+    const result = await pool.query(
+      `SELECT id, source_url FROM channel_pull_sources
+       WHERE protocol = 'mpegts_udp' AND is_running = TRUE AND id <> $1`,
+      [Number(source.id)],
+    );
+    for (const row of result.rows || []) {
+      try {
+        const existingPort = Number(
+          new URL(decryptSourceUrl(row.source_url)).port || 0,
+        );
+        if (existingPort === wantedPort) {
+          const error = new Error(
+            `MPEG-TS UDP port ${wantedPort} is already owned by Pull Source #${row.id}`,
+          );
+          error.code = "mpegts_udp_port_in_use";
+          throw error;
+        }
+      } catch (error) {
+        if (error?.code === "mpegts_udp_port_in_use") throw error;
+      }
+    }
+  }
+
   async function startSource(source, channel, options = {}) {
     const id = Number(source.id);
     const existing = getState(id);
@@ -1366,6 +1478,7 @@ function createPullSourceManager({ pool }) {
     const sourceUrl = decryptSourceUrl(source.source_url);
     const protocol = normalizeProtocol(source.protocol);
     await validateSourceUrl(sourceUrl, protocol);
+    await ensureLocalUdpListenerAvailable(source, channel, sourceUrl);
 
     // First publisher wins. Never collide with OBS/another source using the same channel key.
     if (await isSrsStreamLive(channel.stream_key)) {

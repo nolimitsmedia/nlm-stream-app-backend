@@ -303,7 +303,16 @@ async function requestMediaNodeAgent({
         throw new Error("Invalid Media Node job channel_id");
       }
       if (
-        !["rtmp", "rtmps", "rtsp", "srt", "hls", "http_flv"].includes(protocol)
+        ![
+          "rtmp",
+          "rtmps",
+          "rtsp",
+          "srt",
+          "hls",
+          "http_flv",
+          "mpegts_udp",
+          "mpegts_tcp",
+        ].includes(protocol)
       ) {
         throw new Error("Unsupported Media Node Pull Source protocol");
       }

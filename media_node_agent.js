@@ -36,6 +36,8 @@ const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
   "srt",
   "hls",
   "http_flv",
+  "mpegts_udp",
+  "mpegts_tcp",
 ]);
 const PULL_SOURCE_START_PROTOCOLS = PULL_SOURCE_PROBE_PROTOCOLS;
 const STREAM_TARGET_START_PROTOCOLS = new Set(["rtmp", "rtmps", "srt"]);
@@ -295,7 +297,7 @@ function sanitizeJobError(job, value) {
         text = text.split(String(sensitive)).join("[source-url-redacted]");
     }
     text = text.replace(
-      /(?:rtmps?|rtsp|srt|https?):\/\/[^\s]+/gi,
+      /(?:rtmps?|rtsp|srt|https?|udp|tcp):\/\/[^\s]+/gi,
       "[source-url-redacted]",
     );
   } else if (job?.type === "stream_target_start") {
@@ -529,10 +531,54 @@ function validatePullProbeUrl(sourceUrl, protocol) {
     srt: ["srt:"],
     hls: ["http:", "https:"],
     http_flv: ["http:", "https:"],
+    mpegts_udp: ["udp:"],
+    mpegts_tcp: ["tcp:"],
   }[normalized];
 
   if (!schemes.includes(parsed.protocol.toLowerCase())) {
     throw new Error("Pull-source probe protocol does not match source URL");
+  }
+  if (normalized === "mpegts_udp") {
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    const port = Number(parsed.port || 0);
+    if (
+      !["0.0.0.0", "::", "[::]"].includes(hostname) ||
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535
+    ) {
+      throw new Error(
+        "MPEG-TS UDP listener must use udp://0.0.0.0:<port> (port 1024-65535)",
+      );
+    }
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      (parsed.pathname && parsed.pathname !== "/")
+    ) {
+      throw new Error(
+        "MPEG-TS UDP listener URL must not contain credentials, a path, or query options",
+      );
+    }
+  }
+  if (normalized === "mpegts_tcp") {
+    const port = Number(parsed.port || 0);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(
+        "MPEG-TS TCP source requires an explicit port from 1-65535",
+      );
+    }
+    if (
+      parsed.username ||
+      parsed.password ||
+      (parsed.pathname && parsed.pathname !== "/") ||
+      parsed.searchParams.get("listen") === "1"
+    ) {
+      throw new Error(
+        "MPEG-TS TCP is outbound-only and must not contain credentials, a path, or listen=1",
+      );
+    }
   }
   return parsed.toString();
 }
@@ -556,7 +602,11 @@ function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
     "make_zero",
   ];
 
-  if (normalized === "rtmp" || normalized === "rtmps") {
+  if (
+    normalized === "rtmp" ||
+    normalized === "rtmps" ||
+    normalized === "mpegts_tcp"
+  ) {
     input.push("-rw_timeout", "15000000");
   } else if (normalized === "rtsp") {
     input.push("-rtsp_transport", RTSP_TRANSPORT);
@@ -573,8 +623,16 @@ function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
     );
   }
 
+  if (normalized === "mpegts_udp" || normalized === "mpegts_tcp") {
+    input.push("-f", "mpegts");
+  }
+
   const normalizeVideo =
-    normalized === "hls" || normalized === "http_flv" || normalized === "rtsp";
+    normalized === "hls" ||
+    normalized === "http_flv" ||
+    normalized === "rtsp" ||
+    normalized === "mpegts_udp" ||
+    normalized === "mpegts_tcp";
   const video = normalizeVideo
     ? [
         "-c:v",
@@ -1210,6 +1268,34 @@ function startPersistentPullSource(
   }
 
   const cleanUrl = validatePullProbeUrl(sourceUrl, normalized);
+  if (normalized === "mpegts_udp") {
+    const requestedPort = Number(new URL(cleanUrl).port || 0);
+    const conflict = Array.from(jobs.values()).find((candidate) => {
+      if (
+        candidate?.type !== "pull_source_start" ||
+        candidate?.protocol !== "mpegts_udp"
+      )
+        return false;
+      if (!["starting", "running", "reconnecting"].includes(candidate.status))
+        return false;
+      if (Number(candidate.source_id) === sourceId) return false;
+      try {
+        return (
+          Number(new URL(candidate.source_url).port || 0) === requestedPort
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (conflict) {
+      const error = new Error(
+        `MPEG-TS UDP port ${requestedPort} is already in use by Pull Source #${conflict.source_id}`,
+      );
+      error.status = 409;
+      error.existingJob = conflict;
+      throw error;
+    }
+  }
   const job = makeJob(requestId, "pull_source_start", {
     source_id: sourceId,
     channel_id: channelId,
@@ -1267,9 +1353,13 @@ function startPullSourceProbe(
     normalized === "rtmp" ||
     normalized === "rtmps" ||
     normalized === "hls" ||
-    normalized === "http_flv"
+    normalized === "http_flv" ||
+    normalized === "mpegts_tcp"
   ) {
     inputArgs.push("-rw_timeout", "15000000");
+  }
+  if (normalized === "mpegts_udp" || normalized === "mpegts_tcp") {
+    inputArgs.push("-f", "mpegts");
   }
 
   const args = [
