@@ -345,6 +345,7 @@ function publicJob(job) {
     exit_code: job.exit_code,
     signal: job.signal,
     error: sanitizeJobError(job, job.error),
+    diagnostic: sanitizeJobError(job, job.diagnostic),
   };
 }
 
@@ -865,6 +866,28 @@ function updateStreamTargetProgress(job, line) {
     if (Number.isFinite(dropped)) job.dropped_frames = Math.max(0, dropped);
   }
 
+  // Network outputs such as RTMP/RTMPS can report total_size=N/A through
+  // FFmpeg's -progress protocol. In that case derive a conservative byte
+  // estimate from mux bitrate and output media time. This is only used after
+  // FFmpeg has reported real output time and bitrate; it is not a PID-only
+  // liveness signal.
+  if (
+    Number(job.output_bytes || 0) < STREAM_TARGET_MIN_VERIFIED_BYTES &&
+    Number(job.bitrate_kbps || 0) > 0 &&
+    Number(job.output_time_ms || 0) > 0
+  ) {
+    const estimatedBytes = Math.floor(
+      ((Number(job.bitrate_kbps) * 1000) / 8) *
+        (Number(job.output_time_ms) / 1000),
+    );
+    if (Number.isFinite(estimatedBytes) && estimatedBytes > 0) {
+      job.output_bytes = Math.max(
+        Number(job.output_bytes || 0),
+        estimatedBytes,
+      );
+    }
+  }
+
   if (
     job.delivery_verified !== true &&
     Number(job.output_bytes || 0) >= STREAM_TARGET_MIN_VERIFIED_BYTES &&
@@ -897,6 +920,10 @@ function finishPersistentStreamTarget(
 
   if (job.status === "stopping") {
     job.status = "stopped";
+    // Preserve sanitized FFmpeg diagnostics even for a control-plane initiated
+    // stop. Previously the verification timeout erased the only evidence of
+    // why a worker had produced no output.
+    job.diagnostic = stderr || job.diagnostic || null;
     job.error = null;
   } else {
     job.status = "failed";
@@ -936,6 +963,7 @@ function attachPersistentStreamTargetProcess(job, child) {
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr = `${stderr}${chunk}`.slice(-12000);
+    job.diagnostic = stderr;
   });
 
   const finish = (code, signal, spawnError = null) => {

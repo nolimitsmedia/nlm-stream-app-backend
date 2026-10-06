@@ -1353,10 +1353,27 @@ function createStreamTargetManager({
   }
 
   function hasVerifiedDelivery(state) {
-    const bytes = safeNumber(state.outputBytes, 0);
+    let bytes = safeNumber(state.outputBytes, 0);
     const outTimeMs = safeNumber(state.outputTimeMs, 0);
     const frames = safeNumber(state.outputFrames, 0);
     const bitrate = safeNumber(state.currentBitrateKbps, 0);
+
+    // FFmpeg commonly reports total_size=N/A for live network muxers. Once
+    // real mux bitrate and output media time are advancing, derive a
+    // conservative byte estimate so a healthy RTMP/RTMPS target can verify.
+    if (
+      bytes < STREAM_TARGET_MIN_VERIFIED_BYTES &&
+      bitrate > 0 &&
+      outTimeMs > 0
+    ) {
+      const estimatedBytes = Math.floor(
+        ((bitrate * 1000) / 8) * (outTimeMs / 1000),
+      );
+      if (Number.isFinite(estimatedBytes) && estimatedBytes > 0) {
+        bytes = Math.max(bytes, estimatedBytes);
+        state.outputBytes = bytes;
+      }
+    }
 
     return Boolean(
       bytes >= STREAM_TARGET_MIN_VERIFIED_BYTES &&
