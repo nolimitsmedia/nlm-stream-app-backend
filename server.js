@@ -1074,13 +1074,24 @@ app.post(
 
 app.post("/api/auth/login", loginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+    const password = String(req.body.password || "");
+
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        message: "Email and password are required",
+      });
+    }
 
     const result = await pool.query(
       `
       SELECT *
       FROM admins
-      WHERE email = $1
+      WHERE LOWER(email) = $1
+      LIMIT 1
       `,
       [email],
     );
@@ -18044,12 +18055,9 @@ app.get(
 
       const { zoneCreds } = getOrgBunnyZoneCreds(req.organization);
 
-      const hostname =
-        zoneCreds.hostname || BUNNY_STORAGE_HOSTNAME;
-      const zoneName =
-        zoneCreds.zoneName || BUNNY_STORAGE_ZONE;
-      const apiKey =
-        zoneCreds.apiKey || BUNNY_STORAGE_API_KEY;
+      const hostname = zoneCreds.hostname || BUNNY_STORAGE_HOSTNAME;
+      const zoneName = zoneCreds.zoneName || BUNNY_STORAGE_ZONE;
+      const apiKey = zoneCreds.apiKey || BUNNY_STORAGE_API_KEY;
 
       if (!hostname || !zoneName || !apiKey) {
         console.error(
@@ -18062,8 +18070,7 @@ app.get(
         });
       }
 
-      const storageUrl =
-        `https://${hostname}/${zoneName}/${recording.bunny_storage_path}`;
+      const storageUrl = `https://${hostname}/${zoneName}/${recording.bunny_storage_path}`;
 
       const bunnyResponse = await fetch(storageUrl, {
         method: "GET",
@@ -18077,9 +18084,7 @@ app.get(
           `[BUNNY] Archived recording download failed: ${bunnyResponse.status}`,
         );
 
-        return res.status(
-          bunnyResponse.status === 404 ? 404 : 502,
-        ).json({
+        return res.status(bunnyResponse.status === 404 ? 404 : 502).json({
           ok: false,
           message:
             bunnyResponse.status === 404
@@ -18088,8 +18093,7 @@ app.get(
         });
       }
 
-      const downloadName =
-        path.basename(recording.mp4_filename || file);
+      const downloadName = path.basename(recording.mp4_filename || file);
 
       res.setHeader("Content-Type", "application/octet-stream");
       res.setHeader(
@@ -18097,8 +18101,7 @@ app.get(
         `attachment; filename="${downloadName.replace(/["\\]/g, "_")}"`,
       );
 
-      const contentLength =
-        bunnyResponse.headers.get("content-length");
+      const contentLength = bunnyResponse.headers.get("content-length");
 
       if (contentLength) {
         res.setHeader("Content-Length", contentLength);
@@ -18113,18 +18116,20 @@ app.get(
 
       const { Readable } = require("stream");
 
-      Readable.fromWeb(bunnyResponse.body).on("error", (error) => {
-        console.error(
-          "[BUNNY] Archived recording stream error:",
-          error.message,
-        );
+      Readable.fromWeb(bunnyResponse.body)
+        .on("error", (error) => {
+          console.error(
+            "[BUNNY] Archived recording stream error:",
+            error.message,
+          );
 
-        if (!res.headersSent) {
-          res.status(502).end();
-        } else {
-          res.destroy(error);
-        }
-      }).pipe(res);
+          if (!res.headersSent) {
+            res.status(502).end();
+          } else {
+            res.destroy(error);
+          }
+        })
+        .pipe(res);
     } catch (error) {
       console.error("Download recording error:", error);
 
