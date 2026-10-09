@@ -77,8 +77,11 @@ async function refreshAccessToken(refreshToken) {
 async function getMyChannel(oauth2Client) {
   const youtube = google.youtube({ version: "v3", auth: oauth2Client });
   const res = await youtube.channels.list({ part: ["snippet"], mine: true });
-  const channel = res.data.items?.[0];
-  if (!channel) return null;
+  const channels = res.data.items || [];
+  // Never silently choose the first channel if an unexpected multi-channel
+  // response is returned. A destination must have one unambiguous identity.
+  if (channels.length !== 1 || !channels[0]?.id) return null;
+  const channel = channels[0];
   return {
     channelId: channel.id,
     channelTitle: channel.snippet?.title || null,

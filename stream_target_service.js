@@ -1144,6 +1144,19 @@ function createStreamTargetManager({
         accessToken,
         refreshToken: account.refresh_token,
       });
+      // Fail closed before making any YouTube broadcast or stream resources.
+      // Google accounts can administer several YouTube/Brand channels; only
+      // the channel explicitly stored for this OAuth account is permitted.
+      const verifiedChannel = await youtubeApi.getMyChannel(oauth2Client);
+      if (
+        !account.external_account_id ||
+        !verifiedChannel?.channelId ||
+        verifiedChannel.channelId !== account.external_account_id
+      ) {
+        throw new Error(
+          "YouTube channel mismatch: connected credentials do not authorize the saved YouTube channel. Disconnect and reconnect the intended YouTube channel before starting this target.",
+        );
+      }
       const created = await youtubeApi.createBroadcastAndStream(oauth2Client, {
         title: channel.name,
       });

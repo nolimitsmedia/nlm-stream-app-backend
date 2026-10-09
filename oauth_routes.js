@@ -516,6 +516,35 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         );
       }
 
+      // Validate the durable refresh token independently. A transient access
+      // token is not sufficient proof of where future broadcasts will go.
+      const refreshed = await youtubeApi.refreshAccessToken(
+        tokens.refresh_token,
+      );
+      if (!refreshed.access_token) {
+        throw new Error(
+          "YouTube refresh token did not provide an access token",
+        );
+      }
+      const refreshedClient = youtubeApi.clientFromTokens({
+        accessToken: refreshed.access_token,
+        refreshToken: tokens.refresh_token,
+      });
+      const refreshedChannel = await youtubeApi.getMyChannel(refreshedClient);
+      if (
+        !refreshedChannel ||
+        refreshedChannel.channelId !== channelInfo.channelId
+      ) {
+        return res.send(
+          closePopupHtml({
+            ok: false,
+            platform: "youtube",
+            message:
+              "YouTube channel verification failed. Please select the intended YouTube channel during Google authorization and reconnect.",
+          }),
+        );
+      }
+
       const accountResult = await pool.query(
         `INSERT INTO social_oauth_accounts
            (organization_id, platform, external_account_id, external_account_name,
@@ -540,9 +569,9 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           claims.organizationId,
           channelInfo.channelId,
           channelInfo.channelTitle,
-          encryptOAuthToken(tokens.access_token),
+          encryptOAuthToken(refreshed.access_token),
           encryptOAuthToken(tokens.refresh_token),
-          tokens.expiry_date ? new Date(tokens.expiry_date) : null,
+          refreshed.expiry_date ? new Date(refreshed.expiry_date) : null,
           claims.adminId,
         ],
       );
