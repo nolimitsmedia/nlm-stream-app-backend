@@ -94,6 +94,19 @@ async function getLongLivedUserToken(shortLivedToken) {
   };
 }
 
+// Basic identity of the person who completed Meta OAuth. This does not
+// grant permission to publish to their personal timeline.
+async function getCurrentUser(userAccessToken) {
+  const params = new URLSearchParams({
+    fields: "id,name",
+    access_token: userAccessToken,
+  });
+  const user = await graphFetch(`/me?${params.toString()}`);
+  if (!user.id || !user.name)
+    throw new Error("Meta did not return an account identity");
+  return { id: String(user.id), name: String(user.name) };
+}
+
 // Step 4: list the Pages this user manages. Page tokens returned here are
 // already long-lived as long as the parent user token is long-lived.
 async function listUserPages(longLivedUserToken) {
@@ -170,6 +183,7 @@ module.exports = {
   exchangeCodeForUserToken,
   getLongLivedUserToken,
   listUserPages,
+  getCurrentUser,
   createLiveVideo,
   endLiveVideo,
   debugToken,

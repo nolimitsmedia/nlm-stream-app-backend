@@ -121,6 +121,9 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
     );
     const account = result.rows[0];
     if (!account) return "Connected account not found";
+    if (account.platform === "facebook_user") {
+      return "A personal Facebook OAuth account cannot publish through the Facebook Page API";
+    }
     if (
       String(account.platform).toLowerCase() !==
       String(targetType).toLowerCase()
@@ -228,12 +231,10 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
 
       const protocol = manager.normalizeProtocol(body.protocol, targetType);
       if (targetType === "facebook_profile_manual" && protocol !== "rtmps") {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message: "Facebook personal profile targets require RTMPS",
-          });
+        return res.status(400).json({
+          ok: false,
+          message: "Facebook personal profile targets require RTMPS",
+        });
       }
       const targetDraft = {
         target_type: targetType,
@@ -426,12 +427,10 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           targetType,
         );
         if (targetType === "facebook_profile_manual" && protocol !== "rtmps") {
-          return res
-            .status(400)
-            .json({
-              ok: false,
-              message: "Facebook personal profile targets require RTMPS",
-            });
+          return res.status(400).json({
+            ok: false,
+            message: "Facebook personal profile targets require RTMPS",
+          });
         }
         const next = {
           ...existing,
@@ -472,13 +471,11 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           targetType !==
           manager.normalizeTargetType(existing.target_type || existing.platform)
         ) {
-          return res
-            .status(400)
-            .json({
-              ok: false,
-              message:
-                "Changing an existing target type is not supported; create a separate target",
-            });
+          return res.status(400).json({
+            ok: false,
+            message:
+              "Changing an existing target type is not supported; create a separate target",
+          });
         }
         const validationError = manager.validateManualTarget(next);
         if (validationError && next.automation_mode !== "oauth")

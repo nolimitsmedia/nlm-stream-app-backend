@@ -1117,6 +1117,11 @@ function createStreamTargetManager({
     );
     const account = decryptOAuthAccount(accountResult.rows[0]);
     if (!account) throw new Error("Connected account not found");
+    if (account.platform === "facebook_user") {
+      throw new Error(
+        "Facebook personal account OAuth cannot create a Page livestream",
+      );
+    }
 
     const targetPlatform = normalizeTargetType(
       target.target_type || target.platform,

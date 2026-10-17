@@ -46,15 +46,21 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
   // Small HTML helper for the popup window's final step — posts a message to
   // the opener (the main app tab) and closes itself. The opener listens for
   // this in the React destinations component to refresh its list.
-  function closePopupHtml({ ok, message, platform }) {
+  function closePopupHtml({
+    ok,
+    message,
+    platform,
+    accountId = null,
+    identityOnly = false,
+  }) {
     return `<!DOCTYPE html>
 <html><body style="font-family: system-ui; padding: 2rem; text-align: center;">
-  <p>${ok ? "Connected!" : "Something went wrong"} ${message ? `— ${message}` : ""}</p>
+  <p>${ok ? "Connected!" : "Something went wrong"} ${message ? `— ${String(message).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch])}` : ""}</p>
   <p>This window will close automatically.</p>
   <script>
     if (window.opener) {
       window.opener.postMessage(
-        { type: "social-oauth-result", ok: ${JSON.stringify(!!ok)}, platform: ${JSON.stringify(platform || "")} },
+        { type: "social-oauth-result", ok: ${JSON.stringify(!!ok)}, platform: ${JSON.stringify(platform || "")}, accountId: ${JSON.stringify(accountId)}, identityOnly: ${JSON.stringify(identityOnly)} },
         "*"
       );
     }
@@ -292,17 +298,26 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
 
       const shortLivedToken =
         await facebookGraph.exchangeCodeForUserToken(code);
-      const { accessToken: longLivedUserToken } =
+      const { accessToken: longLivedUserToken, expiresInSeconds } =
         await facebookGraph.getLongLivedUserToken(shortLivedToken);
+      const user = await facebookGraph.getCurrentUser(longLivedUserToken);
+      await upsertFacebookUser(
+        claims.organizationId,
+        claims.adminId,
+        user,
+        longLivedUserToken,
+        expiresInSeconds,
+      );
       const pages = await facebookGraph.listUserPages(longLivedUserToken);
 
       if (pages.length === 0) {
         return res.send(
           closePopupHtml({
-            ok: false,
+            ok: true,
             platform: "facebook",
             message:
-              "No Pages found — you need to manage at least one Facebook Page",
+              "Facebook account connected. No eligible Pages were returned; personal timeline auto-publishing is not available.",
+            identityOnly: true,
           }),
         );
       }
@@ -318,7 +333,13 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           organizationId: claims.organizationId,
           account,
         });
-        return res.send(closePopupHtml({ ok: true, platform: "facebook" }));
+        return res.send(
+          closePopupHtml({
+            ok: true,
+            platform: "facebook",
+            accountId: account.id,
+          }),
+        );
       }
 
       // Multiple Pages — ask which one before storing anything.
@@ -335,10 +356,22 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         })),
       });
 
+      const escapeHtml = (value) =>
+        String(value).replace(
+          /[&<>"']/g,
+          (ch) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[ch],
+        );
       const optionsHtml = pages
         .map(
           (p, i) =>
-            `<button name="pageIndex" value="${i}" style="display:block;width:100%;margin:6px 0;padding:10px;">${p.pageName}</button>`,
+            `<button name="pageIndex" value="${i}" style="display:block;width:100%;margin:6px 0;padding:10px;">${escapeHtml(p.pageName)}</button>`,
         )
         .join("");
 
@@ -383,7 +416,13 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           organizationId: claims.organizationId,
           account,
         });
-        res.send(closePopupHtml({ ok: true, platform: "facebook" }));
+        res.send(
+          closePopupHtml({
+            ok: true,
+            platform: "facebook",
+            accountId: account.id,
+          }),
+        );
       } catch (error) {
         console.error("Facebook Page Selection Error:", error);
         res.send(
@@ -396,6 +435,43 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
       }
     },
   );
+
+  // Personal account is identity-only: never attach it to a stream target.
+  async function upsertFacebookUser(
+    organizationId,
+    adminId,
+    user,
+    userToken,
+    expiresInSeconds,
+  ) {
+    const expiresAt = new Date(
+      Date.now() + Math.max(0, Number(expiresInSeconds) || 0) * 1000,
+    );
+    const result = await pool.query(
+      `INSERT INTO social_oauth_accounts
+         (organization_id, platform, external_account_id, external_account_name,
+          access_token, token_expires_at, connected_by_admin_id, token_encryption_version,
+          connection_status, token_last_validated_at, token_last_error, reconnect_required_at)
+       VALUES ($1, 'facebook_user', $2, $3, $4, $5, $6, 1, 'connected', NOW(), NULL, NULL)
+       ON CONFLICT (organization_id, platform, external_account_id)
+       DO UPDATE SET external_account_name=EXCLUDED.external_account_name,
+         access_token=EXCLUDED.access_token, token_expires_at=EXCLUDED.token_expires_at,
+         connected_by_admin_id=EXCLUDED.connected_by_admin_id,
+         token_encryption_version=1, connection_status='connected',
+         token_last_validated_at=NOW(), token_last_error=NULL,
+         reconnect_required_at=NULL, updated_at=NOW()
+       RETURNING id`,
+      [
+        organizationId,
+        user.id,
+        user.name,
+        encryptOAuthToken(userToken),
+        expiresAt,
+        adminId,
+      ],
+    );
+    return result.rows[0];
+  }
 
   async function upsertFacebookAccount(organizationId, adminId, page) {
     const encryptedAccessToken = encryptOAuthToken(page.pageAccessToken);
@@ -582,7 +658,13 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         account: accountResult.rows[0],
       });
 
-      res.send(closePopupHtml({ ok: true, platform: "youtube" }));
+      res.send(
+        closePopupHtml({
+          ok: true,
+          platform: "youtube",
+          accountId: accountResult.rows[0].id,
+        }),
+      );
     } catch (error) {
       console.error("YouTube OAuth Callback Error:", error);
       res.send(
@@ -622,6 +704,15 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
         return res
           .status(404)
           .json({ ok: false, message: "Connected account not found" });
+      }
+      if (account.platform === "facebook_user") {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message:
+              "Personal Facebook accounts are identity-only and cannot be linked to OAuth livestream targets",
+          });
       }
 
       const targetResult = await pool.query(
