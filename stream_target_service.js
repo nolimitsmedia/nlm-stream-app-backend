@@ -31,6 +31,12 @@ const TARGET_TYPES = {
     oauth: true,
     baseUrl: "rtmps://live-api-s.facebook.com:443/rtmp",
   },
+  facebook_profile_manual: {
+    label: "Facebook Personal Profile (Manual RTMPS)",
+    protocol: "rtmps",
+    oauth: false,
+    baseUrl: "rtmps://live-api-s.facebook.com:443/rtmp",
+  },
   youtube: {
     label: "YouTube",
     protocol: "rtmp",
@@ -690,6 +696,14 @@ function validateManualTarget(target) {
   const destinationUrl = String(target.destination_url || "").trim();
   const streamKey = String(target.stream_key || "").trim();
   const targetName = String(target.name || "").trim();
+
+  if (type === "facebook_profile_manual") {
+    if (target.automation_mode === "oauth")
+      return "Personal profile targets require manual RTMPS configuration";
+    if (protocol !== "rtmps")
+      return "Facebook personal profile targets require RTMPS";
+    if (!streamKey) return "A Facebook Live Producer stream key is required";
+  }
 
   if (target.automation_mode === "oauth") return null;
   if (!destinationUrl && !config?.baseUrl)
