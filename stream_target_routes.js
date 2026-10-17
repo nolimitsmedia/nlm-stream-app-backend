@@ -227,6 +227,14 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
       }
 
       const protocol = manager.normalizeProtocol(body.protocol, targetType);
+      if (targetType === "facebook_profile_manual" && protocol !== "rtmps") {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message: "Facebook personal profile targets require RTMPS",
+          });
+      }
       const targetDraft = {
         target_type: targetType,
         platform: targetType,
@@ -417,6 +425,14 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           body.protocol || existing.protocol,
           targetType,
         );
+        if (targetType === "facebook_profile_manual" && protocol !== "rtmps") {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              message: "Facebook personal profile targets require RTMPS",
+            });
+        }
         const next = {
           ...existing,
           target_type: targetType,
@@ -452,6 +468,18 @@ module.exports = function registerStreamTargetRoutes(app, pool, deps) {
           }
         }
 
+        if (
+          targetType !==
+          manager.normalizeTargetType(existing.target_type || existing.platform)
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              message:
+                "Changing an existing target type is not supported; create a separate target",
+            });
+        }
         const validationError = manager.validateManualTarget(next);
         if (validationError && next.automation_mode !== "oauth")
           return res.status(400).json({ ok: false, message: validationError });
