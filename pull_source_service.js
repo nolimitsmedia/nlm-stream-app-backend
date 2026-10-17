@@ -21,6 +21,7 @@ const SUPPORTED_PROTOCOLS = Object.freeze({
   http_flv: { label: "HTTP-FLV", schemes: ["http:", "https:"] },
   mpegts_udp: { label: "MPEG-TS (UDP)", schemes: ["udp:"] },
   mpegts_tcp: { label: "MPEG-TS (TCP)", schemes: ["tcp:"] },
+  rist: { label: "RIST", schemes: ["rist:"] },
 });
 
 const BASE_RECONNECT_MS = Math.max(
@@ -206,6 +207,41 @@ async function validateSourceUrl(sourceUrl, protocol) {
       throw error;
     }
     return parsed;
+  }
+
+  if (normalized === "rist") {
+    const raw = String(sourceUrl || "").trim();
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    const port = Number(parsed.port || 0);
+
+    if (
+      !raw.toLowerCase().startsWith("rist://@") ||
+      !["0.0.0.0", "::", "[::]"].includes(hostname) ||
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535
+    ) {
+      const error = new Error(
+        "RIST listener must use rist://@0.0.0.0:<port> (port 1024-65535)",
+      );
+      error.code = "invalid_rist_listener";
+      throw error;
+    }
+
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      (parsed.pathname && parsed.pathname !== "/")
+    ) {
+      const error = new Error(
+        "RIST listener URL must not contain credentials, a path, or query options",
+      );
+      error.code = "invalid_rist_listener";
+      throw error;
+    }
+
+    return `rist://@${hostname}:${port}`;
   }
 
   if (normalized === "mpegts_tcp") {
@@ -455,7 +491,8 @@ function buildWorkerArgs(sourceUrl, protocol, streamKey) {
     normalized === "http_flv" ||
     normalized === "rtsp" ||
     normalized === "mpegts_udp" ||
-    normalized === "mpegts_tcp";
+    normalized === "mpegts_tcp" ||
+    normalized === "rist";
 
   const videoArgs = normalizeVideo
     ? [
@@ -712,6 +749,21 @@ function createPullSourceManager({ pool }) {
     const sourceUrl = decryptSourceUrl(source.source_url);
     const protocol = normalizeProtocol(source.protocol);
     const parsed = await validateSourceUrl(sourceUrl, protocol);
+
+    // RIST v1 is a controlled listener. Opening it during preflight would
+    // consume/wait on the listener socket before the persistent worker owns it.
+    // URL validation above is the complete preflight for this protocol.
+    if (protocol === "rist") {
+      return {
+        ok: true,
+        code: "listener_ready",
+        protocol,
+        source: maskSourceUrl(sourceUrl),
+        validation_only: true,
+        video: null,
+        audio: null,
+      };
+    }
 
     // Listener-style inputs must be probed on the Media Node that will own
     // their socket. Reuse remote execution when HA + node assignment says
@@ -1429,7 +1481,8 @@ function createPullSourceManager({ pool }) {
   }
 
   async function ensureLocalUdpListenerAvailable(source, channel, sourceUrl) {
-    if (normalizeProtocol(source?.protocol) !== "mpegts_udp") return;
+    const listenerProtocol = normalizeProtocol(source?.protocol);
+    if (!["mpegts_udp", "rist"].includes(listenerProtocol)) return;
     if (
       remoteExecutor?.shouldUse &&
       (await remoteExecutor.shouldUse(source, channel))
@@ -1438,7 +1491,8 @@ function createPullSourceManager({ pool }) {
     const wantedPort = Number(new URL(String(sourceUrl)).port || 0);
     const result = await pool.query(
       `SELECT id, source_url FROM channel_pull_sources
-       WHERE protocol = 'mpegts_udp' AND is_running = TRUE AND id <> $1`,
+       WHERE protocol IN ('mpegts_udp', 'rist')
+         AND is_running = TRUE AND id <> $1`,
       [Number(source.id)],
     );
     for (const row of result.rows || []) {
@@ -1448,13 +1502,20 @@ function createPullSourceManager({ pool }) {
         );
         if (existingPort === wantedPort) {
           const error = new Error(
-            `MPEG-TS UDP port ${wantedPort} is already owned by Pull Source #${row.id}`,
+            `UDP listener port ${wantedPort} is already owned by Pull Source #${row.id}`,
           );
-          error.code = "mpegts_udp_port_in_use";
+          error.code =
+            listenerProtocol === "rist"
+              ? "rist_port_in_use"
+              : "mpegts_udp_port_in_use";
           throw error;
         }
       } catch (error) {
-        if (error?.code === "mpegts_udp_port_in_use") throw error;
+        if (
+          error?.code === "rist_port_in_use" ||
+          error?.code === "mpegts_udp_port_in_use"
+        )
+          throw error;
       }
     }
   }
@@ -1670,7 +1731,11 @@ function createPullSourceManager({ pool }) {
     console.log(
       `[PULL-SOURCE] Starting #${id} (${protocol}) ${maskSourceUrl(sourceUrl)} -> ${channel.stream_key}`,
     );
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const ffmpegBinary =
+      protocol === "rist" ? "/opt/nlm-stream/bin/ffmpeg-rist" : "ffmpeg";
+    const proc = spawn(ffmpegBinary, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     state.proc = proc;
     state.startedAt = Date.now();
     state.stderr = "";

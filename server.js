@@ -5259,6 +5259,7 @@ app.post(
             "http_flv",
             "mpegts_udp",
             "mpegts_tcp",
+            "rist",
           ].includes(protocol)
         ) {
           return res.status(409).json({

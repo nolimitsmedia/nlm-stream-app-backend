@@ -39,7 +39,10 @@ const PULL_SOURCE_PROBE_PROTOCOLS = new Set([
   "mpegts_udp",
   "mpegts_tcp",
 ]);
-const PULL_SOURCE_START_PROTOCOLS = PULL_SOURCE_PROBE_PROTOCOLS;
+const PULL_SOURCE_START_PROTOCOLS = new Set([
+  ...PULL_SOURCE_PROBE_PROTOCOLS,
+  "rist",
+]);
 const STREAM_TARGET_START_PROTOCOLS = new Set(["rtmp", "rtmps", "srt"]);
 const STREAM_TARGET_MIN_VERIFIED_BYTES = Math.max(
   1,
@@ -506,17 +509,22 @@ function startLiveStreamProbe(requestId, channelId, streamKey) {
   return attachJobProcess(job, child);
 }
 
-function normalizeProbeProtocol(value) {
+function normalizePullSourceProtocol(value) {
   const protocol = String(value || "")
     .trim()
     .toLowerCase()
     .replace(/-/g, "_");
-  return PULL_SOURCE_PROBE_PROTOCOLS.has(protocol) ? protocol : null;
+  return PULL_SOURCE_START_PROTOCOLS.has(protocol) ? protocol : null;
 }
 
-function validatePullProbeUrl(sourceUrl, protocol) {
-  const normalized = normalizeProbeProtocol(protocol);
-  if (!normalized) throw new Error("Unsupported pull-source probe protocol");
+function normalizeProbeProtocol(value) {
+  const protocol = normalizePullSourceProtocol(value);
+  return protocol && PULL_SOURCE_PROBE_PROTOCOLS.has(protocol) ? protocol : null;
+}
+
+function validatePullSourceUrl(sourceUrl, protocol) {
+  const normalized = normalizePullSourceProtocol(protocol);
+  if (!normalized) throw new Error("Unsupported Pull Source protocol");
 
   let parsed;
   try {
@@ -534,6 +542,7 @@ function validatePullProbeUrl(sourceUrl, protocol) {
     http_flv: ["http:", "https:"],
     mpegts_udp: ["udp:"],
     mpegts_tcp: ["tcp:"],
+    rist: ["rist:"],
   }[normalized];
 
   if (!schemes.includes(parsed.protocol.toLowerCase())) {
@@ -563,6 +572,37 @@ function validatePullProbeUrl(sourceUrl, protocol) {
       );
     }
   }
+  if (normalized === "rist") {
+    const raw = String(sourceUrl || "").trim();
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    const port = Number(parsed.port || 0);
+
+    if (
+      !raw.toLowerCase().startsWith("rist://@") ||
+      !["0.0.0.0", "::", "[::]"].includes(hostname) ||
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535
+    ) {
+      throw new Error(
+        "RIST listener must use rist://@0.0.0.0:<port> (port 1024-65535)",
+      );
+    }
+
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      (parsed.pathname && parsed.pathname !== "/")
+    ) {
+      throw new Error(
+        "RIST listener URL must not contain credentials, a path, or query options",
+      );
+    }
+
+    return `rist://@${hostname}:${port}`;
+  }
+
   if (normalized === "mpegts_tcp") {
     const port = Number(parsed.port || 0);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -585,7 +625,7 @@ function validatePullProbeUrl(sourceUrl, protocol) {
 }
 
 function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
-  const normalized = normalizeProbeProtocol(protocol);
+  const normalized = normalizePullSourceProtocol(protocol);
   if (!normalized) throw new Error("Unsupported Pull Source start protocol");
   if (!isValidStreamKey(streamKey)) throw new Error("Invalid stream key");
 
@@ -633,7 +673,8 @@ function buildPersistentPullSourceArgs(sourceUrl, protocol, streamKey) {
     normalized === "http_flv" ||
     normalized === "rtsp" ||
     normalized === "mpegts_udp" ||
-    normalized === "mpegts_tcp";
+    normalized === "mpegts_tcp" ||
+    normalized === "rist";
   const video = normalizeVideo
     ? [
         "-c:v",
@@ -1254,7 +1295,9 @@ function spawnPersistentPullSourceAttempt(job) {
     job.protocol,
     job.stream_key,
   );
-  const child = spawn("ffmpeg", args, {
+  const ffmpegBinary =
+    job.protocol === "rist" ? "/opt/nlm-stream/bin/ffmpeg-rist" : "ffmpeg";
+  const child = spawn(ffmpegBinary, args, {
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
   });
@@ -1275,7 +1318,7 @@ function startPersistentPullSource(
     return jobs.get(requestIds.get(requestId));
   }
 
-  const normalized = normalizeProbeProtocol(protocol);
+  const normalized = normalizePullSourceProtocol(protocol);
   if (!normalized || !PULL_SOURCE_START_PROTOCOLS.has(normalized)) {
     throw new Error("Unsupported Pull Source start protocol");
   }
@@ -1295,13 +1338,13 @@ function startPersistentPullSource(
     throw error;
   }
 
-  const cleanUrl = validatePullProbeUrl(sourceUrl, normalized);
-  if (normalized === "mpegts_udp") {
+  const cleanUrl = validatePullSourceUrl(sourceUrl, normalized);
+  if (normalized === "mpegts_udp" || normalized === "rist") {
     const requestedPort = Number(new URL(cleanUrl).port || 0);
     const conflict = Array.from(jobs.values()).find((candidate) => {
       if (
         candidate?.type !== "pull_source_start" ||
-        candidate?.protocol !== "mpegts_udp"
+        !["mpegts_udp", "rist"].includes(candidate?.protocol)
       )
         return false;
       if (!["starting", "running", "reconnecting"].includes(candidate.status))
@@ -1317,9 +1360,13 @@ function startPersistentPullSource(
     });
     if (conflict) {
       const error = new Error(
-        `MPEG-TS UDP port ${requestedPort} is already in use by Pull Source #${conflict.source_id}`,
+        `UDP listener port ${requestedPort} is already in use by Pull Source #${conflict.source_id}`,
       );
       error.status = 409;
+      error.code =
+        normalized === "rist"
+          ? "rist_port_in_use"
+          : "mpegts_udp_port_in_use";
       error.existingJob = conflict;
       throw error;
     }
@@ -1365,7 +1412,7 @@ function startPullSourceProbe(
     throw new Error("Invalid channel_id");
   }
 
-  const cleanUrl = validatePullProbeUrl(sourceUrl, normalized);
+  const cleanUrl = validatePullSourceUrl(sourceUrl, normalized);
   const job = makeJob(requestId, "pull_source_probe", {
     source_id: sourceId,
     channel_id: channelId,

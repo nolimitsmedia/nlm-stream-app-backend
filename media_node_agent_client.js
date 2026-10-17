@@ -312,6 +312,7 @@ async function requestMediaNodeAgent({
           "http_flv",
           "mpegts_udp",
           "mpegts_tcp",
+          "rist",
         ].includes(protocol)
       ) {
         throw new Error("Unsupported Media Node Pull Source protocol");
