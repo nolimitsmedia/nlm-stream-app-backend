@@ -685,7 +685,7 @@ function createMediaNodeMigrationManager({
   async function getNodeOperations(nodeId) {
     const cleanNodeId = Number(nodeId);
     if (!Number.isInteger(cleanNodeId) || cleanNodeId <= 0) {
-      throw codedError(
+      throw migrationError(
         "invalid_media_node_id",
         "Media Node id must be a positive integer.",
       );
@@ -700,7 +700,7 @@ function createMediaNodeMigrationManager({
     );
     const node = nodeResult.rows[0];
     if (!node)
-      throw codedError("media_node_not_found", "Media Node was not found.");
+      throw migrationError("media_node_not_found", "Media Node was not found.");
 
     const channelsResult = await pool.query(
       `SELECT id, organization_id, name, is_live, media_node_id

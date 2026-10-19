@@ -101,6 +101,7 @@ const registerStreamTargetRoutes = require("./stream_target_routes");
 const {
   ensurePullSourceTables,
   decryptSourceUrl,
+  maskSourceUrl,
 } = require("./pull_source_schema");
 const {
   ensureMediaNodeMigrationTables,
@@ -1513,9 +1514,38 @@ const resolveOrganizationForRequest = async (req, res, next) => {
     const requestedId =
       req.headers["x-organization-id"] || req.query.organization_id;
 
+    if (!req.admin?.id) {
+      // Every route that uses this middleware runs authenticateAdmin first.
+      // Fail closed if that ever stops being true instead of falling through
+      // to a default tenant for an unauthenticated caller.
+      return res.status(401).json({
+        ok: false,
+        message: "Authentication required",
+      });
+    }
+
     if (!requestedId) {
-      const defaultOrg = await getDefaultOrganization();
-      req.organization = defaultOrg || null;
+      // Phase 1 security fix (2026-10-20): only super_admin keeps the
+      // historical fallback to the house "no-limits-media" organization.
+      // Previously every authenticated admin who omitted x-organization-id
+      // (for example a direct API call) was handed that organization without
+      // a membership check. Client admins now resolve to their own first
+      // membership, matching /api/auth/me's currentOrganization (same
+      // getAdminOrganizations() ordering), so the dashboard's first requests
+      // before Topbar persists an organization keep working.
+      if (req.admin.role === "super_admin") {
+        const defaultOrg = await getDefaultOrganization();
+        req.organization = defaultOrg || null;
+      } else {
+        const memberships = await getAdminOrganizations(req.admin.id);
+        if (!memberships[0]) {
+          return res.status(403).json({
+            ok: false,
+            message: "You do not have access to any active organization",
+          });
+        }
+        req.organization = memberships[0];
+      }
       return requestContext.run(
         {
           organization_id: req.organization?.id ?? null,
@@ -11470,6 +11500,36 @@ function getInternalHlsSourceUrl(streamKey) {
   );
 }
 
+// Phase 1 fix (2026-10-20): File Broadcast start and Manual Recording start
+// called isSrsStreamLive(), which only ever existed as a private closure inside
+// pull_source_service.js, so both routes threw ReferenceError (HTTP 500) on
+// their normal path. Same semantics as that helper: true only when the raw
+// "live" app publisher is active on this backend's local SRS. Any SRS/API
+// failure is reported as "not live" rather than throwing.
+async function isSrsStreamLive(streamKey) {
+  const key = String(streamKey || "").trim();
+  if (!key) return false;
+  try {
+    const response = await fetch(
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      {
+        signal: AbortSignal.timeout(4000),
+        cache: "no-store",
+      },
+    );
+    if (!response.ok) return false;
+    const data = await response.json();
+    return (data.streams || []).some(
+      (stream) =>
+        stream.name === key &&
+        stream.app === "live" &&
+        stream.publish?.active === true,
+    );
+  } catch {
+    return false;
+  }
+}
+
 function spawnRenditionsForStream(streamKey, renditions, generation) {
   // Consume the raw source through SRS's local HLS endpoint. Production
   // verification showed this path immediately exposes valid H.264/AAC media,
@@ -18283,7 +18343,45 @@ app.get(
   },
 );
 
-app.use("/recordings", express.static(RECORDINGS_ROOT));
+// Phase 1 security fix (2026-10-20): RECORDINGS_ROOT is also SRS's HLS
+// output directory (docker-compose mounts it as objs/nginx/html), so this
+// unauthenticated static mount exposed live .m3u8/.ts files and the AES-128
+// .key files, bypassing Bunny token auth, signed key URLs and recording
+// visibility. Nothing in this backend or the dashboard builds /recordings/*
+// URLs, so the mount is now disabled by default. Rollback without a code
+// change: set LEGACY_RECORDINGS_STATIC_ENABLED=true and restart. Even then,
+// HLS key/manifest/segment files and dotfiles are never served.
+const LEGACY_RECORDINGS_STATIC_ENABLED =
+  String(process.env.LEGACY_RECORDINGS_STATIC_ENABLED || "")
+    .trim()
+    .toLowerCase() === "true";
+
+if (LEGACY_RECORDINGS_STATIC_ENABLED) {
+  console.warn(
+    "[SECURITY] LEGACY_RECORDINGS_STATIC_ENABLED=true — /recordings static mount is active (HLS keys, manifests and segments remain blocked).",
+  );
+  app.use(
+    "/recordings",
+    (req, res, next) => {
+      const requestPath = String(req.path || "").toLowerCase();
+      if (
+        /\.(key|m3u8|ts|m4s)$/.test(requestPath) ||
+        requestPath.split("/").some((part) => part.startsWith("."))
+      ) {
+        return res.status(404).end();
+      }
+      return next();
+    },
+    express.static(RECORDINGS_ROOT, { dotfiles: "deny", index: false }),
+  );
+} else {
+  app.use("/recordings", (req, res) => {
+    res.status(404).json({
+      ok: false,
+      message: "Not found",
+    });
+  });
+}
 
 app.post(
   "/api/recordings/sync",
@@ -19101,56 +19199,140 @@ app.post(
 |--------------------------------------------------------------------------
 */
 
-app.post("/api/transcode/start", authenticateAdmin, async (req, res) => {
-  try {
-    const { stream } = req.body;
+// Phase 1 security fix (2026-10-20). The previous implementation interpolated
+// req.body.stream into a shell string passed to exec() (remote command
+// execution for any authenticated admin), had no tenant scoping, and started
+// unmanaged FFmpeg processes that published the same <key>_720p/<key>_480p
+// names as the managed ABR ladder, so repeated clicks produced duplicate
+// publishers. It now validates the key, enforces organization ownership, and
+// delegates to the managed ABR path: spawn() with an argument array, per-
+// rendition startup locks, SRS readiness gate, load guard, watchdog/retry,
+// and the organization's plan-driven rendition ladder. Response keeps the
+// original ok/message/input/outputs fields for API compatibility.
+const MANUAL_TRANSCODE_STREAM_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
-    if (!stream) {
-      return res.status(400).json({
+app.post(
+  "/api/transcode/start",
+  authenticateAdmin,
+  resolveOrganizationForRequest,
+  async (req, res) => {
+    try {
+      const stream = String(req.body?.stream || "").trim();
+
+      if (!stream) {
+        return res.status(400).json({
+          ok: false,
+          message: "Stream name is required",
+        });
+      }
+
+      if (
+        !MANUAL_TRANSCODE_STREAM_KEY_PATTERN.test(stream) ||
+        isAbrRenditionStreamKey(stream)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message: "Invalid stream name",
+        });
+      }
+
+      const isPlatformAdmin = req.admin?.role === "super_admin";
+      const channelResult = await pool.query(
+        `
+        SELECT id, organization_id
+        FROM channels
+        WHERE stream_key = $1
+          AND ($2::boolean OR organization_id = $3)
+        LIMIT 1
+        `,
+        [stream, isPlatformAdmin, req.organization?.id ?? null],
+      );
+      const channel = channelResult.rows[0];
+
+      if (!channel) {
+        return res.status(404).json({
+          ok: false,
+          message: "Stream not found",
+        });
+      }
+
+      const renditions = await getRenditionPlanForOrg(channel.organization_id);
+      if (!renditions.length) {
+        return res.status(409).json({
+          ok: false,
+          message:
+            "Adaptive bitrate transcoding is not included in this organization's current plan.",
+        });
+      }
+
+      const isLive = await isSrsStreamLive(stream);
+      if (!isLive) {
+        return res.status(409).json({
+          ok: false,
+          message: "The stream is not live. Start broadcasting first.",
+        });
+      }
+
+      let generation = bitrateCapGeneration.get(stream);
+      if (!generation) {
+        generation = 1;
+        bitrateCapGeneration.set(stream, generation);
+      }
+
+      const input = getInternalHlsSourceUrl(stream);
+      const outputs = [];
+      const started = [];
+      const alreadyRunning = [];
+
+      for (const rendition of renditions) {
+        const retryKey = `${stream}:${rendition.label}`;
+        const output = `rtmp://127.0.0.1:1935/live/${stream}_${rendition.label}`;
+        outputs.push(output);
+
+        const proc = activeTranscodeProcesses.get(retryKey);
+        const processRunning = proc && proc.exitCode === null && !proc.killed;
+        const startupInProgress =
+          transcodeStartupLocks.get(retryKey) === generation;
+
+        if (processRunning || startupInProgress) {
+          alreadyRunning.push(rendition.label);
+          continue;
+        }
+
+        // A manual request begins a fresh retry budget, the same way the
+        // periodic reconciler does for a missing rendition.
+        transcodeRetryCount.delete(retryKey);
+        const args = buildRenditionFfmpegArgs(stream, input, output, rendition);
+        spawnFfmpegVariant(rendition.label, stream, args, generation).catch(
+          (error) =>
+            console.error(
+              `[Transcode] Manual ${rendition.label} start failed for ${streamLogId(stream)}:`,
+              error.message,
+            ),
+        );
+        started.push(rendition.label);
+      }
+
+      res.json({
+        ok: true,
+        message: started.length
+          ? "Transcoding started"
+          : "Transcoding is already running",
+        input,
+        outputs,
+        started,
+        already_running: alreadyRunning,
+      });
+    } catch (error) {
+      console.error("Start transcode error:", error);
+
+      res.status(500).json({
         ok: false,
-        message: "Stream name is required",
+        message: "Failed to start transcoding",
       });
     }
-
-    // Use the same verified local SRS HLS source path as automatic ABR.
-    const input = getInternalHlsSourceUrl(stream);
-    const output720 = `rtmp://127.0.0.1/live/${stream}_720p`;
-    const output480 = `rtmp://127.0.0.1/live/${stream}_480p`;
-
-    const command720 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 2500k -s 1280x720 -c:a aac -b:a 128k -f flv "${output720}"`;
-
-    const command480 = `ffmpeg -y -i "${input}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -b:v 1200k -s 854x480 -c:a aac -b:a 96k -f flv "${output480}"`;
-
-    exec(command720, (error, stdout, stderr) => {
-      if (error) {
-        console.error("720p transcode error:", error.message);
-        console.error(stderr);
-      }
-    });
-
-    exec(command480, (error, stdout, stderr) => {
-      if (error) {
-        console.error("480p transcode error:", error.message);
-        console.error(stderr);
-      }
-    });
-
-    res.json({
-      ok: true,
-      message: "Transcoding started",
-      input,
-      outputs: [output720, output480],
-    });
-  } catch (error) {
-    console.error("Start transcode error:", error);
-
-    res.status(500).json({
-      ok: false,
-      message: "Failed to start transcoding",
-      error: error.message,
-    });
-  }
-});
+  },
+);
 
 /*
 |--------------------------------------------------------------------------
