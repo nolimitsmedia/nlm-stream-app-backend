@@ -719,6 +719,9 @@ module.exports = {
   register(app, pool, deps) {
     const {
       getPublicWatchStatus,
+      lookupPlaybackAliasByStreamKey,
+      runWithPlaybackAlias,
+      swapStreamKeyForPlaybackId,
       authenticateAdmin,
       resolveOrganizationForRequest,
       requireRole,
@@ -864,16 +867,47 @@ module.exports = {
               .json({ ok: false, message: "Embed not found" });
           }
 
-          const status = await getPublicWatchStatus(channel.stream_key);
-
-          res.set("Cache-Control", "no-store, private");
-          res.json({
+          // Phase 2: viewers must never receive the stream key (it is the
+          // ingest credential). Resolve the channel's public playback alias,
+          // compute the status (and its Bunny-signed URLs) under it, then
+          // rewrite any remaining occurrence of the key. The embed page's JS
+          // builds its manifest URLs from `streamKey`, so that field now
+          // carries the playback ID; `playbackId` is the explicit name.
+          let alias = null;
+          if (typeof lookupPlaybackAliasByStreamKey === "function") {
+            try {
+              alias = await lookupPlaybackAliasByStreamKey(channel.stream_key);
+            } catch (aliasError) {
+              console.error(
+                "Embed playback alias lookup failed:",
+                aliasError.message,
+              );
+            }
+          }
+          const outboundAlias = alias && alias.swapOutbound ? alias : null;
+          const status =
+            outboundAlias && typeof runWithPlaybackAlias === "function"
+              ? await runWithPlaybackAlias(outboundAlias, () =>
+                  getPublicWatchStatus(channel.stream_key),
+                )
+              : await getPublicWatchStatus(channel.stream_key);
+          const payload = {
             ok: true,
             channelName: channel.name,
             streamKey: channel.stream_key,
             embedSettings: channel.embed_settings || {},
             ...status,
-          });
+            playbackId: outboundAlias ? outboundAlias.playbackId : null,
+          };
+          let body = JSON.stringify(payload);
+          if (
+            outboundAlias &&
+            typeof swapStreamKeyForPlaybackId === "function"
+          ) {
+            body = swapStreamKeyForPlaybackId(body, outboundAlias);
+          }
+          res.set("Cache-Control", "no-store, private");
+          res.type("application/json").send(body);
         } catch (error) {
           console.error("Public Embed Status Error:", error);
           res

@@ -1,4 +1,6 @@
-// NLM Streaming App — Phase 1 security regression harness: preload.
+// NLM Streaming App — Phase 2 playback-ID regression harness: preload.
+// Derived from tests/phase1/preload.js (same isolation guarantees) with the
+// additional channel/embed/viewer-session queries the Phase 2 routes issue.
 // Loaded with `node -r` into an ISOLATED copy of the backend (see run.js).
 // It replaces ./db with an in-memory fake pool driven by fixture.json,
 // replaces child_process with a recorder (nothing is ever executed), and
@@ -117,6 +119,70 @@ const fakePool = {
             recording_enabled: true,
             analytics_enabled: true,
             plan_key: "premium",
+          },
+        ],
+        rowCount: 1,
+      };
+    }
+    // ---- Phase 2 additions ----
+    if (/FROM channels c\s+WHERE c\.playback_id = \$1/.test(q)) {
+      const rows = D.channels.filter((c) => c.playback_id === params[0]);
+      return { rows: rows.slice(0, 1), rowCount: rows.length ? 1 : 0 };
+    }
+    if (/FROM channels c\s+WHERE c\.stream_key = \$1\s+LIMIT 1/.test(q)) {
+      const rows = D.channels.filter((c) => c.stream_key === params[0]);
+      return { rows: rows.slice(0, 1), rowCount: rows.length ? 1 : 0 };
+    }
+    if (/SELECT organization_id FROM channels WHERE stream_key = \$1/.test(q)) {
+      const rows = D.channels
+        .filter((c) => c.stream_key === params[0])
+        .map((c) => ({ organization_id: c.organization_id }));
+      return { rows: rows.slice(0, 1), rowCount: rows.length ? 1 : 0 };
+    }
+    if (
+      /FROM channels\s+WHERE stream_key = \$1 AND organization_id = \$2/.test(q)
+    ) {
+      const rows = D.channels
+        .filter(
+          (c) =>
+            c.stream_key === params[0] &&
+            c.organization_id === Number(params[1]),
+        )
+        .map((c) => ({
+          ...c,
+          live_started_at: c.is_live
+            ? new Date(Date.now() - 600000).toISOString()
+            : null,
+          uptime_seconds: 600,
+        }));
+      return { rows: rows.slice(0, 1), rowCount: rows.length ? 1 : 0 };
+    }
+    if (/SELECT live_started_at FROM channels WHERE stream_key = \$1/.test(q)) {
+      const rows = D.channels
+        .filter((c) => c.stream_key === params[0])
+        .map((c) => ({
+          live_started_at: c.is_live
+            ? new Date(Date.now() - 600000).toISOString()
+            : null,
+        }));
+      return { rows, rowCount: rows.length };
+    }
+    if (/WHERE c\.embed_token = \$1 AND o\.is_active = TRUE/.test(q)) {
+      const rows = D.channels
+        .filter((c) => c.embed_token === params[0])
+        .map((c) => ({ ...c, embed_settings: {} }));
+      return { rows: rows.slice(0, 1), rowCount: rows.length ? 1 : 0 };
+    }
+    if (/^\s*INSERT INTO viewer_sessions/i.test(q)) {
+      process.stdout.write(
+        "[HARNESS-VIEWER-INSERT] " + JSON.stringify(params) + "\n",
+      );
+      return {
+        rows: [
+          {
+            id: 1,
+            session_token: "sess-test",
+            ...Object.fromEntries((params || []).map((v, i) => ["p" + i, v])),
           },
         ],
         rowCount: 1,

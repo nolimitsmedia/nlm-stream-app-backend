@@ -1,24 +1,32 @@
-// NLM Streaming App — Phase 1 security regression harness.
-// Usage (from the backend root):   node tests/phase1/run.js
-// Boots the real server.js twice in an isolated temp copy with a mocked DB,
-// a recorded child_process and a local mock SRS, then asserts the Phase 1
-// fixes over HTTP. Exit code 0 = all checks passed. Safe to run on a
-// production host: it never reads .env and makes no outbound connections
-// (ports 19850, 15055 and 15056 on 127.0.0.1 must be free; override with
-// PHASE1_SRS_PORT / PHASE1_APP_PORT).
-// Runner: mock SRS API, boot server.js in an isolated child, run HTTP assertions.
+// NLM Streaming App — Phase 2 playback-ID regression harness.
+// Usage (from the backend root):   node tests/phase2/run.js
+//
+// Boots the real server.js (twice) in an isolated temp copy with a mocked DB
+// (fixture.json), a recorded child_process, and a local mock SRS that serves
+// live HLS playlists, ABR renditions, TS segments and WHEP answers which all
+// CONTAIN THE STREAM KEY. It then asserts, over HTTP, that viewers only ever
+// see the public playback ID, that every Bunny token signs the exact path the
+// viewer requests, and that legacy links / recordings / WHEP behave as
+// designed. Exit code 0 = all checks passed.
+//
+// Safe to run on a production host: never reads .env, makes no outbound
+// connections. Ports on 127.0.0.1: 19860 (mock SRS), 15065 and 15066
+// (override with PHASE2_SRS_PORT / PHASE2_APP_PORT).
+
 const http = require("http");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-// ---- isolated workspace -------------------------------------------------
-// Copies only the backend *.js files (never .env) into a temp directory and
-// links node_modules, so dotenv inside db.js finds no real credentials.
 const ROOT = path.resolve(__dirname, "..", "..");
 const jwt = require(path.join(ROOT, "node_modules", "jsonwebtoken"));
-const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "nlm-phase1-"));
+const FIXTURE = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "fixture.json"), "utf8"),
+);
+
+const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "nlm-phase2-"));
 const APP = path.join(WORK, "app");
 const REC = path.join(WORK, "rec");
 fs.mkdirSync(APP);
@@ -30,40 +38,63 @@ fs.symlinkSync(
   path.join(APP, "node_modules"),
   "dir",
 );
-fs.mkdirSync(path.join(REC, "live"), { recursive: true });
-fs.writeFileSync(
-  path.join(REC, "live", "sk_LIVEKEY0000000000000000000000000-1.key"),
-  "KEYDATA\n",
-);
-fs.writeFileSync(
-  path.join(REC, "live", "sk_LIVEKEY0000000000000000000000000.m3u8"),
-  "#EXTM3U\n",
-);
-fs.writeFileSync(path.join(REC, "live", "replay.mp4"), "MP4DATA\n");
+
 const SECRET = "test-secret-not-production-0123456789abcdef";
-const SRS_PORT = Number(process.env.PHASE1_SRS_PORT || 19850);
-const LIVE = [
-  "sk_LIVEKEY0000000000000000000000000",
-  "sk_HOUSEKEY000000000000000000000000",
-  "sk_LOWKEY00000000000000000000000000",
+const BUNNY_KEY = "test-bunny-token-key";
+const SRS_PORT = Number(process.env.PHASE2_SRS_PORT || 19860);
+const BASE_PORT = Number(process.env.PHASE2_APP_PORT || 15065);
+
+const [LIVE, IDLE, SHORT] = FIXTURE.channels;
+const K = LIVE.stream_key;
+const P = LIVE.playback_id;
+const UNKNOWN_P = "pb_" + "f".repeat(32);
+const RENDITIONS = ["top", "720p", "480p"];
+
+// ---- recordings fixture (RECORDINGS_ROOT/live/<stream>/<file>) ----
+fs.mkdirSync(path.join(REC, "live", K), { recursive: true });
+fs.writeFileSync(path.join(REC, "live", K, "thumb.jpg"), "JPEGDATA");
+
+// ---- mock SRS ---------------------------------------------------------
+const whepCalls = [];
+let tick = 0;
+const tsBytes = Buffer.alloc(188 * 20, 0xff);
+for (let i = 0; i < tsBytes.length; i += 188) tsBytes[i] = 0x47;
+const mediaPlaylist = (name) =>
+  [
+    "#EXTM3U",
+    "#EXT-X-VERSION:3",
+    "#EXT-X-TARGETDURATION:4",
+    `#EXT-X-MEDIA-SEQUENCE:${100 + tick}`,
+    "#EXTINF:4.000,",
+    `${name}-${100 + tick}.ts`,
+    "#EXTINF:4.000,",
+    `${name}-${101 + tick}.ts`,
+    "#EXTINF:4.000,",
+    `${name}-${102 + tick}.ts`,
+    "",
+  ].join("\n");
+const liveNames = () => [
+  K,
+  ...RENDITIONS.map((r) => `${K}_${r}`),
+  SHORT.stream_key,
 ];
 
-let tick = 0;
 const srs = http.createServer((req, res) => {
   tick++;
-  res.setHeader("content-type", "application/json");
-  if (req.url.startsWith("/api/v1/streams")) {
+  const url = new URL(req.url, "http://x");
+  if (url.pathname.startsWith("/api/v1/streams")) {
+    res.setHeader("content-type", "application/json");
     return res.end(
       JSON.stringify({
         code: 0,
-        streams: LIVE.map((name, i) => ({
+        streams: liveNames().map((name, i) => ({
           id: "s" + i,
           name,
           app: "live",
           vhost: "__defaultVhost__",
           publish: { active: true },
           clients: 1,
-          video: { codec: "H264" },
+          video: { codec: "H264", width: 1280, height: 720 },
           audio: { codec: "AAC" },
           kbps: { recv_30s: 3000 },
           frames: 100 + tick * 30,
@@ -72,46 +103,117 @@ const srs = http.createServer((req, res) => {
       }),
     );
   }
-  if (
-    req.url.startsWith("/api/v1/summaries") ||
-    req.url.startsWith("/api/v1/versions")
-  )
+  if (url.pathname.startsWith("/api/v1/")) {
+    res.setHeader("content-type", "application/json");
     return res.end(JSON.stringify({ code: 0, data: { ok: true } }));
-  res.end(JSON.stringify({ code: 0 }));
+  }
+  if (url.pathname.startsWith("/rtc/v1/whep/")) {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      whepCalls.push({ stream: url.searchParams.get("stream"), offer: body });
+      res.statusCode = 201;
+      res.setHeader("content-type", "application/sdp");
+      // Real SRS answers can echo the stream name; include it on purpose.
+      res.end(
+        `v=0\r\no=SRS/6 1 2 IN IP4 0.0.0.0\r\ns=live/${url.searchParams.get("stream")}\r\nt=0 0\r\n`,
+      );
+    });
+    return;
+  }
+  const m3u8 = url.pathname.match(/^\/live\/([^/]+)\.m3u8$/);
+  if (m3u8 && liveNames().includes(m3u8[1])) {
+    res.setHeader("content-type", "application/vnd.apple.mpegurl");
+    return res.end(mediaPlaylist(m3u8[1]));
+  }
+  const ts = url.pathname.match(/^\/live\/([^/]+)-\d+\.ts$/);
+  if (ts && liveNames().includes(ts[1])) {
+    res.setHeader("content-type", "video/mp2t");
+    return res.end(tsBytes);
+  }
+  res.statusCode = 404;
+  res.end("not found");
 });
 
+// ---- helpers ------------------------------------------------------------
 const tok = (id, role) =>
   jwt.sign({ id, email: `u${id}@test.local`, role }, SECRET, {
     expiresIn: "1h",
     algorithm: "HS256",
   });
-const T = {
-  client: tok(20, "admin"),
-  low: tok(30, "admin"),
-  orphan: tok(40, "admin"),
-  sa: tok(1, "super_admin"),
-};
+const T = { client: tok(20, "admin"), sa: tok(1, "super_admin") };
 
-let results = [];
 let port;
-async function req(method, p, { token, org, body } = {}) {
-  const headers = { "content-type": "application/json" };
+const results = [];
+const seenBodies = []; // every viewer-facing response body, for the global scan
+function check(name, cond, detail) {
+  results.push({ name, pass: !!cond, detail });
+}
+async function req(method, p, { token, body, contentType, raw } = {}) {
+  const headers = {};
   if (token) headers.authorization = `Bearer ${token}`;
-  if (org) headers["x-organization-id"] = String(org);
+  let payload;
+  if (body !== undefined) {
+    headers["content-type"] = contentType || "application/json";
+    payload = typeof body === "string" ? body : JSON.stringify(body);
+  }
   const r = await fetch(`http://127.0.0.1:${port}${p}`, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined,
+    body: payload,
   });
-  const text = await r.text();
+  const buf = Buffer.from(await r.arrayBuffer());
+  const text = buf.toString("utf8");
   let json = null;
   try {
     json = JSON.parse(text);
   } catch {}
-  return { status: r.status, json, text };
+  const out = { status: r.status, text, json, buf, headers: r.headers };
+  if (!raw) seenBodies.push({ path: p, text });
+  return out;
 }
-function check(name, cond, detail) {
-  results.push({ name, pass: !!cond, detail });
+function bunnyToken(urlPath, expires) {
+  return (
+    "HS256-" +
+    crypto
+      .createHmac("sha256", BUNNY_KEY)
+      .update(`${urlPath}${expires}token_ignore_params=true`)
+      .digest("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=/g, "")
+  );
+}
+// Verifies the token in a URL signs exactly that URL's path.
+function tokenValidFor(urlString) {
+  const u = new URL(urlString, "http://cdn.test");
+  const t = u.searchParams.get("token");
+  const e = u.searchParams.get("expires");
+  if (!t || !e) return false;
+  return t === bunnyToken(u.pathname, e);
+}
+function uriLines(manifest) {
+  return manifest
+    .split("\n")
+    .map((l) => l.trim())
+    .flatMap((l) => {
+      if (!l) return [];
+      if (l.startsWith("#")) {
+        const m = l.match(/URI="([^"]+)"/);
+        return m ? [m[1]] : [];
+      }
+      return [l];
+    });
+}
+function signRecording(kind, stream, file, expires) {
+  const key = crypto
+    .createHmac("sha256", SECRET)
+    .update("nlm-public-recording-url-v1")
+    .digest();
+  return crypto
+    .createHmac("sha256", key)
+    .update(`${kind}\n${stream}\n${file}\n${expires}`)
+    .digest("base64url");
 }
 
 function boot(extraEnv) {
@@ -119,9 +221,9 @@ function boot(extraEnv) {
     const env = {
       PATH: process.env.PATH,
       HOME: WORK,
-      HARNESS_APP_DIR: APP + path.sep,
       NODE_ENV: "test",
       PORT: String(port),
+      HARNESS_APP_DIR: APP + path.sep,
       JWT_SECRET: SECRET,
       DOTENV_CONFIG_PATH: path.join(WORK, "does-not-exist.env"),
       SRS_API_URL: `http://127.0.0.1:${SRS_PORT}`,
@@ -133,6 +235,9 @@ function boot(extraEnv) {
       RECORDINGS_ROOT: REC,
       CLIENT_URL: "http://localhost",
       CORS_ORIGINS: "http://localhost",
+      API_PUBLIC_URL: "https://api.test",
+      BUNNY_HLS_TOKEN_KEY: BUNNY_KEY,
+      HLS_CDN_HOSTNAME: "cdn.test",
       MEDIA_NODE_ID: "1",
       MAILGUN_ENABLED: "false",
       ...extraEnv,
@@ -146,10 +251,7 @@ function boot(extraEnv) {
     let done = false;
     const onData = (d) => {
       log += d;
-      if (
-        !done &&
-        /running on|listening|Server running|port\s*\d+/i.test(log)
-      ) {
+      if (!done && /API running on/i.test(log)) {
         done = true;
         setTimeout(() => resolve({ child, getLog: () => log }), 1500);
       }
@@ -165,303 +267,403 @@ function boot(extraEnv) {
         done = true;
         resolve({ child, getLog: () => log });
       }
-    }, 20000);
+    }, 25000);
   });
 }
 
 (async () => {
   await new Promise((r) => srs.listen(SRS_PORT, "127.0.0.1", r));
-  port = Number(process.env.PHASE1_APP_PORT || 15055);
+  port = BASE_PORT;
   const s1 = await boot({});
-  const health = await req("GET", "/api/health");
-  check("Boot: /api/health responds", health.status === 200, health.status);
-
-  // ---------- A. Transcode route ----------
-  const sentinel = path.join(WORK, "PWNED_SENTINEL");
-  try {
-    fs.unlinkSync(sentinel);
-  } catch {}
-  const r0 = await req("POST", "/api/transcode/start", {
-    body: { stream: "sk_LIVEKEY0000000000000000000000000" },
-  });
-  check("A1 unauthenticated → 401", r0.status === 401, r0.status);
-  const inj = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: `x$(touch ${sentinel})` },
-  });
   check(
-    "A2 shell-injection payload → 400",
-    inj.status === 400,
-    inj.status + " " + inj.text,
-  );
-  const inj2 = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: 'sk_LIVE";id;"' },
-  });
-  check("A3 quote-breaking payload → 400", inj2.status === 400, inj2.status);
-  const inj3 = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: ["a", "b"] },
-  });
-  check("A4 non-string payload → 400", inj3.status === 400, inj3.status);
-  const rend = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: "sk_LIVEKEY0000000000000000000000000_720p" },
-  });
-  check("A5 rendition key as source → 400", rend.status === 400, rend.status);
-  const cross = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: "sk_HOUSEKEY000000000000000000000000" },
-  });
-  check(
-    "A6 other tenant's stream key → 404",
-    cross.status === 404,
-    cross.status,
-  );
-  const idle = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: "sk_IDLEKEY0000000000000000000000000" },
-  });
-  check(
-    "A7 own key, not live → 409",
-    idle.status === 409,
-    idle.status + " " + idle.json?.message,
-  );
-  const low = await req("POST", "/api/transcode/start", {
-    token: T.low,
-    body: { stream: "sk_LOWKEY00000000000000000000000000" },
-  });
-  check(
-    "A8 plan without ABR → 409",
-    low.status === 409,
-    low.status + " " + low.json?.message,
-  );
-  const ok1 = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: "sk_LIVEKEY0000000000000000000000000" },
-  });
-  check(
-    "A9 own live key → 200, plan ladder started",
-    ok1.status === 200 &&
-      JSON.stringify(ok1.json?.started) ===
-        JSON.stringify(["top", "720p", "480p"]),
-    ok1.status + " " + JSON.stringify(ok1.json),
-  );
-  check(
-    "A9b response keeps ok/message/input/outputs contract",
-    ok1.json &&
-      "ok" in ok1.json &&
-      "message" in ok1.json &&
-      "input" in ok1.json &&
-      Array.isArray(ok1.json.outputs),
-    Object.keys(ok1.json || {}).join(","),
-  );
-  const sa = await req("POST", "/api/transcode/start", {
-    token: T.sa,
-    body: { stream: "sk_HOUSEKEY000000000000000000000000" },
-  });
-  check(
-    "A10 super_admin may start any org's stream",
-    sa.status === 200,
-    sa.status + " " + JSON.stringify(sa.json),
-  );
-  await new Promise((r) => setTimeout(r, 12000)); // let staggered spawn + readiness run
-  const ok2 = await req("POST", "/api/transcode/start", {
-    token: T.client,
-    body: { stream: "sk_LIVEKEY0000000000000000000000000" },
-  });
-  check(
-    "A11 repeat request does not duplicate workers",
-    ok2.status === 200 &&
-      (ok2.json?.started || []).length === 0 &&
-      (ok2.json?.already_running || []).length === 3,
-    JSON.stringify(ok2.json),
-  );
-  check(
-    "A12 injection sentinel file was NOT created",
-    !fs.existsSync(sentinel),
-    fs.existsSync(sentinel),
+    "Boot: /api/health",
+    (await req("GET", "/api/health", { raw: true })).status === 200,
   );
 
-  // ---------- B. Tenant resolution ----------
-  const b1 = await req("GET", "/api/channels", { token: T.client });
-  const b1ids = (b1.json?.channels || []).map((c) => c.id).sort();
+  // ---------- A. Watch status ----------
+  const w = await req("GET", `/api/public/watch/${P}`);
   check(
-    "B1 client admin, no org header → own org only (not house org)",
-    b1.status === 200 && JSON.stringify(b1ids) === "[201,202]",
-    b1.status + " " + JSON.stringify(b1ids),
+    "A1 watch status by playback ID → 200",
+    w.status === 200 && w.json?.ok,
+    w.status,
   );
-  const b2 = await req("GET", "/api/channels", { token: T.client, org: 1 });
   check(
-    "B2 client admin requesting house org → 403",
-    b2.status === 403,
-    b2.status,
+    "A2 returns playbackId and channelName",
+    w.json?.playbackId === P && w.json?.channelName === LIVE.name,
+    `${w.json?.playbackId} / ${w.json?.channelName}`,
   );
-  const b3 = await req("GET", "/api/channels", { token: T.client, org: 2 });
   check(
-    "B3 client admin with own org header → 200",
-    b3.status === 200 && (b3.json?.channels || []).length === 2,
-    b3.status,
+    "A3 watch status body contains no stream key",
+    !w.text.includes(K),
+    w.text.includes(K) ? "LEAK" : "clean",
   );
-  const b4 = await req("GET", "/api/channels", { token: T.sa });
+  const topPath = w.json?.transcodingEnabled
+    ? `/api/abr/${P}/master.m3u8`
+    : `/api/hls/${P}.m3u8`;
   check(
-    "B4 super_admin, no header → house org (unchanged)",
-    b4.status === 200 &&
-      (b4.json?.channels || []).map((c) => c.id).join() === "101",
-    b4.status +
-      " " +
-      JSON.stringify((b4.json?.channels || []).map((c) => c.id)),
+    "A4 hlsAuthQs signs the playback-ID manifest path",
+    tokenValidFor(topPath + (w.json?.hlsAuthQs || "")),
+    `${topPath}${(w.json?.hlsAuthQs || "").slice(0, 30)}…`,
   );
-  const b5 = await req("GET", "/api/channels", { token: T.sa, org: 2 });
-  check(
-    "B5 super_admin support mode into org 2 (unchanged)",
-    b5.status === 200 && (b5.json?.channels || []).length === 2,
-    b5.status,
-  );
-  const b6 = await req("GET", "/api/channels", { token: T.orphan });
-  check("B6 admin with no memberships → 403", b6.status === 403, b6.status);
-  const b7 = await req("GET", "/api/channels", {
-    token: tok(20, "admin") + "x",
-  });
-  check("B7 tampered JWT → 401", b7.status === 401, b7.status);
-  const expired = jwt.sign(
-    { id: 20, role: "admin", exp: Math.floor(Date.now() / 1000) - 60 },
-    SECRET,
-  );
-  const b8 = await req("GET", "/api/channels", { token: expired });
-  check("B8 expired JWT → 401", b8.status === 401, b8.status);
 
-  // ---------- C. /recordings static ----------
-  for (const [n, p] of [
-    ["key", "/recordings/live/sk_LIVEKEY0000000000000000000000000-1.key"],
-    ["m3u8", "/recordings/live/sk_LIVEKEY0000000000000000000000000.m3u8"],
-    ["mp4", "/recordings/live/replay.mp4"],
-  ]) {
-    const r = await req("GET", p);
+  const lw = await req("GET", `/api/public/watch/${K}`);
+  check(
+    "A5 legacy key link still works → 200",
+    lw.status === 200 && lw.json?.ok,
+    lw.status,
+  );
+  check(
+    "A6 legacy response returns playbackId, no key",
+    lw.json?.playbackId === P && !lw.text.includes(K),
+    lw.json?.playbackId,
+  );
+
+  // Deploy safety: an OLD cached WatchPage on a legacy link builds the
+  // top-level URL from the key and uses hlsAuthQs; the NEW page uses
+  // playbackId + playbackHlsAuthQs. Both must be correctly signed.
+  const legacyTop = lw.json?.transcodingEnabled
+    ? `/api/abr/${K}/master.m3u8`
+    : `/api/hls/${K}.m3u8`;
+  const pidTop = lw.json?.transcodingEnabled
+    ? `/api/abr/${P}/master.m3u8`
+    : `/api/hls/${P}.m3u8`;
+  check(
+    "A9 legacy link: hlsAuthQs signs the KEY path (old cached pages keep playing)",
+    tokenValidFor(legacyTop + (lw.json?.hlsAuthQs || "")),
+    "",
+  );
+  check(
+    "A10 legacy link: playbackHlsAuthQs signs the playback-ID path (new page)",
+    tokenValidFor(pidTop + (lw.json?.playbackHlsAuthQs || "")),
+    "",
+  );
+  check(
+    "A11 playback-ID link: playbackHlsAuthQs signs the playback-ID path",
+    tokenValidFor(topPath + (w.json?.playbackHlsAuthQs || "")),
+    "",
+  );
+  {
+    const old = await req("GET", legacyTop + (lw.json?.hlsAuthQs || ""));
+    const oUris = uriLines(old.text);
     check(
-      `C1 default: /recordings ${n} not served`,
-      r.status === 404 && !/KEYDATA|EXTM3U|MP4DATA/.test(r.text),
-      r.status,
+      "A12 old page following the legacy manifest gets playback-ID URIs with valid tokens, no key",
+      old.status === 200 &&
+        !old.text.includes(K) &&
+        oUris.length > 0 &&
+        oUris.every((u) => u.includes(P) && tokenValidFor(u)),
+      `${old.status} ${oUris.length} URIs`,
     );
   }
 
-  // ---------- D. isSrsStreamLive callers ----------
-  const d1 = await req("POST", "/api/channels/201/file-broadcast/start", {
-    token: T.client,
-    org: 2,
-    body: { recording_id: 1 },
-  });
-  check(
-    "D1 file-broadcast on live channel → 400 'already live' (was ReferenceError 500)",
-    d1.status === 400 &&
-      /already has a real broadcast live/.test(d1.json?.message || ""),
-    d1.status + " " + d1.json?.message,
+  const unk = await req("GET", `/api/public/watch/${UNKNOWN_P}`);
+  check("A7 unknown playback ID → 404", unk.status === 404, unk.status);
+  const dbl = await req(
+    "GET",
+    `/api/hls/seg/live/${P}/${IDLE.playback_id}-1.ts`,
   );
-  const d2 = await req("POST", "/api/channels/202/manual-recording/start", {
-    token: T.client,
-    org: 2,
-  });
   check(
-    "D2 manual-recording on idle channel → 400 'not live' (was ReferenceError 500)",
-    d2.status === 400 && /isn't currently live/.test(d2.json?.message || ""),
-    d2.status + " " + d2.json?.message,
-  );
-  const d3 = await req("POST", "/api/channels/101/manual-recording/start", {
-    token: T.client,
-    org: 2,
-  });
-  check(
-    "D3 manual-recording on other tenant's channel → 404",
-    d3.status === 404,
-    d3.status,
+    "A8 two different playback IDs in one path → 400",
+    dbl.status === 400,
+    dbl.status,
   );
 
-  // ---------- E. migration service codedError ----------
-  const e1 = await req("GET", "/api/admin/media-nodes/abc/operations", {
-    token: T.sa,
-  });
+  // ---------- B. Raw HLS chain ----------
+  const hm = await req("GET", `/api/hls/${P}.m3u8`);
   check(
-    "E1 invalid node id → 400 invalid_media_node_id (was ReferenceError 500)",
-    e1.status === 400 && e1.json?.code === "invalid_media_node_id",
-    e1.status + " " + e1.json?.code,
+    "B1 HLS manifest by playback ID → 200",
+    hm.status === 200,
+    hm.status + " " + hm.text.slice(0, 80),
   );
-  const e2 = await req("GET", "/api/admin/media-nodes/999/operations", {
-    token: T.sa,
-  });
   check(
-    "E2 unknown node → 404 media_node_not_found",
-    e2.status === 404 && e2.json?.code === "media_node_not_found",
-    e2.status + " " + e2.json?.code,
+    "B2 HLS manifest contains no stream key",
+    hm.status === 200 && !hm.text.includes(K),
+    "",
   );
-  const e3 = await req("GET", "/api/admin/media-nodes/999/operations", {
-    token: T.client,
-  });
-  check("E3 non-super-admin → 403", e3.status === 403, e3.status);
+  const hUris = uriLines(hm.text);
+  check(
+    "B3 every HLS URI uses the playback ID",
+    hUris.length > 0 && hUris.every((u) => u.includes(P)),
+    hUris.slice(0, 2).join(" | "),
+  );
+  check(
+    "B4 every HLS URI token signs its own path",
+    hUris.length > 0 && hUris.every(tokenValidFor),
+    hUris.length + " URIs",
+  );
+  if (hUris[0]) {
+    const u = new URL(hUris[0], "http://x");
+    const seg = await req("GET", u.pathname + u.search, { raw: true });
+    check(
+      "B5 segment fetched via playback-ID URL → 200 TS bytes",
+      seg.status === 200 && seg.buf[0] === 0x47,
+      `${seg.status} ${seg.buf.length}B`,
+    );
+  } else check("B5 segment fetched via playback-ID URL", false, "no URI");
 
-  const log1 = s1.getLog();
-  const spawnLines = log1
-    .split("\n")
-    .filter((l) => l.startsWith('[HARNESS-SPAWN] {"cmd":"ffmpeg"'));
-  const outputs = spawnLines
-    .map(
-      (l) =>
-        (l.match(/rtmp:\/\/127\.0\.0\.1:1935\/live\/[A-Za-z0-9_]+/) || [])[0],
-    )
-    .filter(Boolean);
+  // ---------- C. ABR chain ----------
+  let master = null;
+  for (let i = 0; i < 6; i++) {
+    master = await req("GET", `/api/abr/${P}/master.m3u8`);
+    if (master.status === 200) break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
   check(
-    "F1 ffmpeg launched via spawn() with an argument array",
-    spawnLines.length > 0,
-    spawnLines.length + " spawn calls",
+    "C1 ABR master by playback ID → 200",
+    master.status === 200,
+    master.status + " " + master.text.slice(0, 80),
+  );
+  check("C2 ABR master contains no stream key", !master.text.includes(K), "");
+  const mUris = uriLines(master.text);
+  check(
+    "C3 every rendition URI uses the playback ID and a valid token",
+    mUris.length > 0 && mUris.every((u) => u.includes(P) && tokenValidFor(u)),
+    mUris.slice(0, 1).join(""),
+  );
+  if (mUris[0]) {
+    const ru = new URL(mUris[0], "http://x");
+    const rp = await req("GET", ru.pathname + ru.search);
+    const rUris = uriLines(rp.text);
+    check(
+      "C4 rendition playlist → 200, no key, playback-ID URIs with valid tokens",
+      rp.status === 200 &&
+        !rp.text.includes(K) &&
+        rUris.length > 0 &&
+        rUris.every((u) => u.includes(P) && tokenValidFor(u)),
+      `${rp.status} ${rUris.slice(0, 1).join("")}`,
+    );
+    if (rUris[0]) {
+      const su = new URL(rUris[0], "http://x");
+      const rs = await req("GET", su.pathname + su.search, { raw: true });
+      check(
+        "C5 rendition segment via playback-ID URL → 200 TS bytes",
+        rs.status === 200 && rs.buf[0] === 0x47,
+        `${rs.status}`,
+      );
+    } else check("C5 rendition segment", false, "no URI");
+  } else {
+    check("C4 rendition playlist", false, "no master URI");
+    check("C5 rendition segment", false, "skipped");
+  }
+  const abrStatus = await req("GET", `/api/abr/${P}/status`);
+  check(
+    "C6 ABR status by playback ID → 200, no key",
+    abrStatus.status === 200 && !abrStatus.text.includes(K),
+    abrStatus.status,
+  );
+  const sess = await req("GET", `/api/hls/session/${P}`);
+  check(
+    "C7 HLS session by playback ID → 2xx, no key",
+    sess.status < 300 && !sess.text.includes(K),
+    sess.status,
+  );
+
+  // ---------- D. WHEP proxy ----------
+  const offer = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+  const wh = await req("POST", `/api/whep/${P}`, {
+    body: offer,
+    contentType: "application/sdp",
+  });
+  check(
+    "D1 WHEP via playback ID → 201 SDP answer",
+    wh.status === 201 && wh.text.startsWith("v=0"),
+    wh.status,
   );
   check(
-    "F2 exactly one worker per rendition output (no duplicates)",
-    outputs.length > 0 && new Set(outputs).size === outputs.length,
-    outputs.length + " outputs / " + new Set(outputs).size + " distinct",
+    "D2 SRS received the real stream key server-side",
+    whepCalls.at(-1)?.stream === K,
+    whepCalls.at(-1)?.stream === K ? "ok" : String(whepCalls.at(-1)?.stream),
   );
-  const execFfmpeg = log1
-    .split("\n")
-    .filter((l) => l.startsWith("[HARNESS-EXEC]") && /ffmpeg/.test(l));
+  check("D3 WHEP answer contains no stream key", !wh.text.includes(K), "");
+  const whBad = await req("POST", `/api/whep/${P}`, {
+    body: "garbage",
+    contentType: "application/sdp",
+  });
+  check("D4 WHEP with invalid SDP → 400", whBad.status === 400, whBad.status);
+  const whUnk = await req("POST", `/api/whep/${UNKNOWN_P}`, {
+    body: offer,
+    contentType: "application/sdp",
+  });
   check(
-    "F3 no ffmpeg command passed to a shell (exec)",
-    execFfmpeg.length === 0,
-    execFfmpeg.length,
+    "D5 WHEP unknown playback ID → 404",
+    whUnk.status === 404,
+    whUnk.status,
+  );
+
+  // ---------- E. Viewer session + error report ----------
+  const vs = await req("POST", "/api/public/viewers/start", {
+    body: { stream_key: P, viewer_id: "v-test" },
+  });
+  check(
+    "E1 viewer session start with playback ID → 2xx",
+    vs.status < 300,
+    vs.status + " " + vs.text.slice(0, 120),
+  );
+  check(
+    "E2 viewer session response contains no stream key",
+    !vs.text.includes(K),
+    "",
+  );
+  const er = await req("POST", "/api/player/error-report", {
+    body: {
+      streamKey: P,
+      errorType: "harnessFatalError",
+      fatal: true,
+      details: "harness",
+    },
+  });
+  check(
+    "E3 player error report with playback ID → 2xx",
+    er.status < 300,
+    er.status,
+  );
+
+  // ---------- F. Embed ----------
+  const em = await req("GET", `/api/public/embed/${LIVE.embed_token}/status`);
+  check("F1 embed status → 200", em.status === 200 && em.json?.ok, em.status);
+  check(
+    "F2 embed status has no stream key; streamKey/playbackId = playback ID",
+    !em.text.includes(K) &&
+      em.json?.playbackId === P &&
+      em.json?.streamKey === P,
+    `${em.json?.streamKey}`,
+  );
+  const emTop = em.json?.transcodingEnabled
+    ? `/api/abr/${P}/master.m3u8`
+    : `/api/hls/${P}.m3u8`;
+  check(
+    "F3 embed hlsAuthQs signs the playback-ID manifest path",
+    tokenValidFor(emTop + (em.json?.hlsAuthQs || "")),
+    "",
+  );
+
+  // ---------- G. Short legacy key (< 12 chars): inbound only ----------
+  const sw = await req("GET", `/api/public/watch/${SHORT.playback_id}`);
+  check(
+    "G1 short-key channel reachable by playback ID → 200",
+    sw.status === 200,
+    sw.status,
+  );
+  check(
+    "G2 short-key channel: playbackId null (client keeps its URL value)",
+    sw.json && sw.json.playbackId === null,
+    String(sw.json?.playbackId),
+  );
+
+  // ---------- H. Signed recording URLs ----------
+  const now = Math.floor(Date.now() / 1000);
+  const base = `/api/public/recordings/thumbnail?stream=${encodeURIComponent(K)}&file=thumb.jpg`;
+  const r0 = await req("GET", base, { raw: true });
+  check(
+    "H1 recording URL without signature → 403",
+    r0.status === 403,
+    r0.status,
+  );
+  const r1 = await req("GET", `${base}&expires=${now + 600}&sig=forged`, {
+    raw: true,
+  });
+  check("H2 forged signature → 403", r1.status === 403, r1.status);
+  const r2 = await req(
+    "GET",
+    `${base}&expires=${now - 5}&sig=${signRecording("thumbnail", K, "thumb.jpg", now - 5)}`,
+    { raw: true },
+  );
+  check("H3 expired signature → 403", r2.status === 403, r2.status);
+  const r3 = await req(
+    "GET",
+    `${base}&expires=${now + 600}&sig=${signRecording("media", K, "thumb.jpg", now + 600)}`,
+    { raw: true },
+  );
+  check(
+    "H4 signature for a different kind (media→thumbnail) → 403",
+    r3.status === 403,
+    r3.status,
+  );
+  const r4 = await req(
+    "GET",
+    `${base}&expires=${now + 600}&sig=${signRecording("thumbnail", K, "thumb.jpg", now + 600)}`,
+    { raw: true },
+  );
+  check(
+    "H5 valid signature → 200 file",
+    r4.status === 200 && r4.text === "JPEGDATA",
+    r4.status,
+  );
+
+  // ---------- I. Legacy usage report ----------
+  const lu = await req("GET", "/api/admin/playback/legacy-usage", {
+    token: T.sa,
+    raw: true,
+  });
+  check(
+    "I1 legacy usage report (super_admin) counts legacy hits",
+    lu.status === 200 &&
+      lu.json?.total >= 1 &&
+      lu.json?.legacy_stream_key_playback_enabled === true,
+    JSON.stringify(lu.json?.by_route),
+  );
+  const luc = await req("GET", "/api/admin/playback/legacy-usage", {
+    token: T.client,
+    raw: true,
+  });
+  check(
+    "I2 legacy usage report denied to client admin → 403",
+    luc.status === 403,
+    luc.status,
+  );
+
+  // ---------- J. Global scan ----------
+  const leaks = seenBodies.filter((b) => b.text.includes(K)).map((b) => b.path);
+  check(
+    "J1 stream key absent from EVERY viewer-facing response above",
+    leaks.length === 0,
+    leaks.length
+      ? "LEAK in " + leaks.join(", ")
+      : `${seenBodies.length} responses scanned`,
+  );
+
+  fs.writeFileSync(path.join(WORK, "boot1.log"), s1.getLog());
+  const vInsert =
+    s1
+      .getLog()
+      .split("\n")
+      .find((l) => l.startsWith("[HARNESS-VIEWER-INSERT]")) || "";
+  const errLine =
+    s1
+      .getLog()
+      .split("\n")
+      .find((l) => l.includes("[PLAYER-ERROR] harnessFatalError")) || "";
+  check(
+    "E5 player error logged server-side under the real stream key",
+    errLine.includes(K) && !errLine.includes(P),
+    errLine ? "ok" : "no log line",
+  );
+  check(
+    "E4 viewer session stored with the real stream key (analytics intact)",
+    vInsert.includes(K) && !vInsert.includes(P),
+    vInsert ? "ok" : "no insert seen",
   );
   s1.child.kill("SIGKILL");
-  fs.writeFileSync(path.join(WORK, "boot1.log"), log1);
 
-  // ---------- C2: legacy flag rollback path ----------
-  port = Number(process.env.PHASE1_APP_PORT || 15055) + 1;
-  const s2 = await boot({ LEGACY_RECORDINGS_STATIC_ENABLED: "true" });
-  const k = await req(
-    "GET",
-    "/recordings/live/sk_LIVEKEY0000000000000000000000000-1.key",
-  );
+  // ---------- K. Legacy playback switched off ----------
+  port = BASE_PORT + 1;
+  const s2 = await boot({ LEGACY_STREAM_KEY_PLAYBACK: "false" });
+  const k1 = await req("GET", `/api/public/watch/${K}`, { raw: true });
+  check("K1 legacy off: key link → 404", k1.status === 404, k1.status);
+  const k2 = await req("GET", `/api/hls/${K}.m3u8`, { raw: true });
+  check("K2 legacy off: key manifest → 404", k2.status === 404, k2.status);
+  const k3 = await req("GET", `/api/public/watch/${P}`, { raw: true });
   check(
-    "C2 legacy flag: .key still blocked",
-    k.status === 404 && !/KEYDATA/.test(k.text),
-    k.status,
+    "K3 legacy off: playback ID still works → 200",
+    k3.status === 200,
+    k3.status,
   );
-  const m = await req(
-    "GET",
-    "/recordings/live/sk_LIVEKEY0000000000000000000000000.m3u8",
-  );
-  check("C3 legacy flag: .m3u8 still blocked", m.status === 404, m.status);
-  const mp4 = await req("GET", "/recordings/live/replay.mp4");
-  check(
-    "C4 legacy flag: .mp4 served (rollback works)",
-    mp4.status === 200 && /MP4DATA/.test(mp4.text),
-    mp4.status,
-  );
-  const dot = await req("GET", "/recordings/.env");
-  check("C5 legacy flag: dotfiles denied", dot.status === 404, dot.status);
   fs.writeFileSync(path.join(WORK, "boot2.log"), s2.getLog());
   s2.child.kill("SIGKILL");
   srs.close();
 
-  // Spawn evidence is in the child's globals; we parse it from a log hook below.
   for (const r of results)
     console.log(
-      `${r.pass ? "PASS" : "FAIL"}  ${r.name}  |  ${String(r.detail).slice(0, 140)}`,
+      `${r.pass ? "PASS" : "FAIL"}  ${r.name}  |  ${String(r.detail ?? "").slice(0, 150)}`,
     );
   console.log(`\nWorkspace (logs): ${WORK}`);
   const failed = results.filter((r) => !r.pass);

@@ -18,6 +18,11 @@ const whmcs = require("./whmcs_client");
 const bunny = require("./bunny_client");
 const embedRoutes = require("./embed_routes"); // Phase 1 — embedded player (Copy Embed Code)
 const {
+  ensurePlaybackIdColumns,
+  isPlaybackId,
+  PLAYBACK_ID_SEARCH_PATTERN,
+} = require("./playback_id_schema"); // Phase 2 — public playback IDs
+const {
   analyzeLiveStream,
   getCachedStreamAnalysis,
   scheduleLiveStreamAnalysis,
@@ -953,6 +958,352 @@ const statusPollLimiter = rateLimit({
 });
 
 app.use(express.json());
+
+/*
+|--------------------------------------------------------------------------
+| PHASE 2 — PUBLIC PLAYBACK IDs (2026-10-20)
+|--------------------------------------------------------------------------
+| channels.stream_key is the ingest credential. Viewers now use
+| channels.playback_id ("pb_" + 32 hex, see playback_id_schema.js) instead.
+|
+| Three cooperating pieces keep the existing HLS/ABR/CMAF/session/segment
+| routes untouched:
+|   1. Inbound: the middleware below finds a playback ID in a viewer-facing
+|      path (or the one body field that carries the identifier) and rewrites
+|      it to the stream key before the existing route matches.
+|   2. Signing: appendBunnyToken() signs the playback-ID form of every path
+|      while a playback alias is active, so Bunny Token Auth validates the
+|      URL the viewer actually requests.
+|   3. Outbound: res.send/res.end replace the stream key with the playback ID
+|      in text responses (manifests, JSON, SDP), so it never reaches viewers.
+|
+| Legacy stream-key URLs keep working while LEGACY_STREAM_KEY_PLAYBACK is not
+| "false" (default: enabled). Their responses are rewritten to playback IDs
+| too, and every legacy hit is counted (GET /api/admin/playback/legacy-usage)
+| so the flag can be turned off once old links stop being used.
+*/
+const LEGACY_STREAM_KEY_PLAYBACK_ENABLED =
+  String(process.env.LEGACY_STREAM_KEY_PLAYBACK ?? "true")
+    .trim()
+    .toLowerCase() !== "false";
+const PLAYBACK_ALIAS_CACHE_TTL_MS = 30 * 1000;
+const PLAYBACK_ALIAS_NEGATIVE_TTL_MS = 10 * 1000;
+const PLAYBACK_ALIAS_CACHE_MAX_ENTRIES = 5000;
+// Outbound rewriting replaces every occurrence of the key in a response
+// body. Very short legacy keys could collide with ordinary text, so they are
+// translated inbound but never rewritten outbound (and their URLs are signed
+// in their original form, keeping Bunny tokens consistent).
+const PLAYBACK_ALIAS_MIN_KEY_LENGTH = 12;
+const PLAYBACK_ALIAS_ROUTE_PREFIXES = [
+  "/api/public/watch/",
+  "/api/hls/",
+  "/api/abr/",
+  "/api/cmaf/",
+  "/api/whep/",
+  "/api/public/viewers/start",
+  "/api/player/error-report",
+];
+const PLAYBACK_ALIAS_BODY_FIELDS = {
+  "/api/public/viewers/start": "stream_key",
+  "/api/player/error-report": "streamKey",
+};
+const PLAYBACK_ALIAS_TEXT_CONTENT_TYPE = /mpegurl|json|sdp|text|xml/i;
+const PLAYBACK_RENDITION_SUFFIX_PATTERN = /_(?:top|\d{3,4}p)$/;
+
+const playbackAliasStorage = new AsyncLocalStorage();
+const playbackAliasCache = new Map(); // "id:<pid>" | "key:<key>" -> { alias, at }
+const legacyPlaybackUsage = {
+  since: new Date().toISOString(),
+  total: 0,
+  lastLoggedTotal: 0,
+  byRoute: new Map(),
+};
+
+function playbackAliasFromRow(row) {
+  if (!row?.stream_key || !row?.playback_id) return null;
+  const streamKey = String(row.stream_key);
+  return {
+    streamKey,
+    playbackId: String(row.playback_id),
+    channelId: row.id,
+    organizationId: row.organization_id,
+    channelName: row.name || null,
+    swapOutbound: streamKey.length >= PLAYBACK_ALIAS_MIN_KEY_LENGTH,
+  };
+}
+
+function readPlaybackAliasCache(cacheKey) {
+  const entry = playbackAliasCache.get(cacheKey);
+  if (!entry) return undefined;
+  const ttl = entry.alias
+    ? PLAYBACK_ALIAS_CACHE_TTL_MS
+    : PLAYBACK_ALIAS_NEGATIVE_TTL_MS;
+  if (Date.now() - entry.at > ttl) {
+    playbackAliasCache.delete(cacheKey);
+    return undefined;
+  }
+  return entry.alias;
+}
+
+function writePlaybackAliasCache(cacheKey, alias) {
+  if (playbackAliasCache.size >= PLAYBACK_ALIAS_CACHE_MAX_ENTRIES) {
+    playbackAliasCache.clear();
+  }
+  const at = Date.now();
+  playbackAliasCache.set(cacheKey, { alias, at });
+  if (alias) {
+    playbackAliasCache.set(`id:${alias.playbackId}`, { alias, at });
+    playbackAliasCache.set(`key:${alias.streamKey}`, { alias, at });
+  }
+}
+
+// Call after anything that changes a channel's stream_key or playback_id.
+function invalidatePlaybackAliasCache() {
+  playbackAliasCache.clear();
+}
+
+async function lookupPlaybackAliasById(playbackId) {
+  if (!isPlaybackId(playbackId)) return null;
+  const cacheKey = `id:${playbackId}`;
+  const cached = readPlaybackAliasCache(cacheKey);
+  if (cached !== undefined) return cached;
+  const result = await pool.query(
+    `SELECT c.id, c.name, c.stream_key, c.playback_id, c.organization_id
+       FROM channels c
+      WHERE c.playback_id = $1
+      LIMIT 1`,
+    [playbackId],
+  );
+  const alias = playbackAliasFromRow(result.rows[0]);
+  writePlaybackAliasCache(cacheKey, alias);
+  return alias;
+}
+
+async function lookupPlaybackAliasByStreamKey(streamKey) {
+  const key = String(streamKey || "").trim();
+  if (!key || key.length > 255) return null;
+  const cacheKey = `key:${key}`;
+  const cached = readPlaybackAliasCache(cacheKey);
+  if (cached !== undefined) return cached;
+  const result = await pool.query(
+    `SELECT c.id, c.name, c.stream_key, c.playback_id, c.organization_id
+       FROM channels c
+      WHERE c.stream_key = $1
+      LIMIT 1`,
+    [key],
+  );
+  const alias = playbackAliasFromRow(result.rows[0]);
+  writePlaybackAliasCache(cacheKey, alias);
+  return alias;
+}
+
+// Legacy URLs can name either the source key or an ABR rendition stream
+// ("<key>_720p"); both belong to the same channel.
+async function lookupPlaybackAliasForLegacyIdentifier(identifier) {
+  const exact = await lookupPlaybackAliasByStreamKey(identifier);
+  if (exact) return exact;
+  const base = String(identifier || "").replace(
+    PLAYBACK_RENDITION_SUFFIX_PATTERN,
+    "",
+  );
+  if (base && base !== identifier) {
+    return lookupPlaybackAliasByStreamKey(base);
+  }
+  return null;
+}
+
+function getCurrentPlaybackAlias() {
+  return playbackAliasStorage.getStore() || null;
+}
+
+function swapStreamKeyForPlaybackId(text, alias) {
+  if (
+    typeof text !== "string" ||
+    !alias?.swapOutbound ||
+    !alias.streamKey ||
+    alias.streamKey === alias.playbackId ||
+    !text.includes(alias.streamKey)
+  ) {
+    return text;
+  }
+  return text.split(alias.streamKey).join(alias.playbackId);
+}
+
+function runWithPlaybackAlias(alias, fn) {
+  return alias ? playbackAliasStorage.run(alias, fn) : fn();
+}
+
+function safeDecodePathSegment(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+// Position of the identifier in each legacy viewer route.
+function extractLegacyPlaybackIdentifier(pathname) {
+  const parts = String(pathname || "")
+    .split("/")
+    .filter(Boolean)
+    .map(safeDecodePathSegment);
+  if (parts[0] !== "api") return null;
+  if (parts[1] === "public" && parts[2] === "watch") return parts[3] || null;
+  if (parts[1] === "hls") {
+    if (parts[2] === "session") return parts[3] || null;
+    if (parts[2] === "seg") return parts[4] || null;
+    if (parts[2] === "key") return null;
+    if (parts.length === 3 && parts[2].endsWith(".m3u8")) {
+      return parts[2].slice(0, -".m3u8".length) || null;
+    }
+    return null;
+  }
+  if (parts[1] === "abr" || parts[1] === "cmaf" || parts[1] === "whep") {
+    return parts[2] || null;
+  }
+  return null;
+}
+
+function legacyPlaybackRouteLabel(pathname) {
+  const parts = String(pathname || "").split("/").filter(Boolean);
+  if (parts[1] === "public") return `public/${parts[2] || ""}`;
+  if (parts[1] === "hls" && ["session", "seg"].includes(parts[2])) {
+    return `hls/${parts[2]}`;
+  }
+  if (parts[1] === "player") return "player/error-report";
+  return parts[1] || "unknown";
+}
+
+function recordLegacyPlaybackUsage(pathname) {
+  const label = legacyPlaybackRouteLabel(pathname);
+  legacyPlaybackUsage.total += 1;
+  legacyPlaybackUsage.byRoute.set(
+    label,
+    (legacyPlaybackUsage.byRoute.get(label) || 0) + 1,
+  );
+}
+
+const legacyPlaybackUsageLogTimer = setInterval(
+  () => {
+    if (legacyPlaybackUsage.total === legacyPlaybackUsage.lastLoggedTotal) {
+      return;
+    }
+    const delta =
+      legacyPlaybackUsage.total - legacyPlaybackUsage.lastLoggedTotal;
+    legacyPlaybackUsage.lastLoggedTotal = legacyPlaybackUsage.total;
+    console.log(
+      `[PLAYBACK-ID] Legacy stream-key playback requests: +${delta} in the last 10 min (total ${legacyPlaybackUsage.total} since ${legacyPlaybackUsage.since}).`,
+    );
+  },
+  10 * 60 * 1000,
+);
+legacyPlaybackUsageLogTimer.unref?.();
+
+function installPlaybackAliasResponseRewrite(res, alias) {
+  if (!alias?.swapOutbound) return;
+
+  const originalSend = res.send;
+  res.send = function playbackAliasSend(body) {
+    if (typeof body === "string") {
+      body = swapStreamKeyForPlaybackId(body, alias);
+    } else if (Buffer.isBuffer(body)) {
+      const contentType = String(this.getHeader("Content-Type") || "");
+      if (PLAYBACK_ALIAS_TEXT_CONTENT_TYPE.test(contentType)) {
+        const text = body.toString("utf8");
+        if (text.includes(alias.streamKey)) {
+          body = Buffer.from(swapStreamKeyForPlaybackId(text, alias), "utf8");
+        }
+      }
+    }
+    return originalSend.call(this, body);
+  };
+
+  const originalEnd = res.end;
+  res.end = function playbackAliasEnd(chunk, ...rest) {
+    if (typeof chunk === "string" && chunk.includes(alias.streamKey)) {
+      chunk = swapStreamKeyForPlaybackId(chunk, alias);
+      if (!this.headersSent && this.getHeader("Content-Length") != null) {
+        const encoding = typeof rest[0] === "string" ? rest[0] : "utf8";
+        this.setHeader("Content-Length", Buffer.byteLength(chunk, encoding));
+      }
+    }
+    return originalEnd.call(this, chunk, ...rest);
+  };
+}
+
+app.use(async (req, res, next) => {
+  const pathname = req.path || "";
+  if (
+    !PLAYBACK_ALIAS_ROUTE_PREFIXES.some((prefix) => pathname.startsWith(prefix))
+  ) {
+    return next();
+  }
+
+  try {
+    const pathIds = [
+      ...new Set(pathname.match(PLAYBACK_ID_SEARCH_PATTERN) || []),
+    ];
+    const bodyField = PLAYBACK_ALIAS_BODY_FIELDS[pathname] || null;
+    const bodyValue =
+      bodyField && req.body && typeof req.body[bodyField] === "string"
+        ? req.body[bodyField].trim()
+        : "";
+    const bodyIds = bodyValue && isPlaybackId(bodyValue) ? [bodyValue] : [];
+    const ids = [...new Set([...pathIds, ...bodyIds])];
+
+    if (ids.length > 1) {
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid playback identifier",
+      });
+    }
+
+    let alias = null;
+
+    if (ids.length === 1) {
+      alias = await lookupPlaybackAliasById(ids[0]);
+      if (!alias) {
+        return res.status(404).json({
+          ok: false,
+          message: "Stream not found",
+        });
+      }
+      if (pathIds.length) {
+        req.url = req.url.split(ids[0]).join(alias.streamKey);
+      }
+      if (bodyIds.length) {
+        req.body[bodyField] = alias.streamKey;
+      }
+    } else {
+      const legacyIdentifier =
+        extractLegacyPlaybackIdentifier(pathname) || bodyValue || null;
+      if (legacyIdentifier) {
+        alias = await lookupPlaybackAliasForLegacyIdentifier(legacyIdentifier);
+        if (alias) {
+          if (!LEGACY_STREAM_KEY_PLAYBACK_ENABLED) {
+            return res.status(404).json({
+              ok: false,
+              message: "Stream not found",
+            });
+          }
+          recordLegacyPlaybackUsage(pathname);
+        }
+      }
+    }
+
+    if (!alias) return next();
+
+    res.locals.playbackAlias = alias;
+    res.locals.playbackAliasVia = ids.length ? "playback_id" : "stream_key";
+    installPlaybackAliasResponseRewrite(res, alias);
+    return playbackAliasStorage.run(alias, () => next());
+  } catch (error) {
+    // A lookup failure must never take viewer routes down: fall through to
+    // the unmodified route (an unresolved playback ID simply 404s there).
+    console.error("[PLAYBACK-ID] Alias resolution failed:", error.message);
+    return next();
+  }
+});
 
 const io = new Server(server, {
   cors: {
@@ -8779,10 +9130,46 @@ app.get("/api/public/watch/:streamKey", statusPollLimiter, async (req, res) => {
   try {
     const { streamKey } = req.params;
     const status = await getPublicWatchStatus(streamKey);
+    const alias = res.locals.playbackAlias || null;
+
+    // Phase 2 deploy safety: tokens are normally signed for the playback-ID
+    // path (that is what the current client requests). A request that used a
+    // legacy /watch/<stream_key> address may come from an OLDER cached
+    // WatchPage bundle that builds the top-level manifest URL from the
+    // address-bar key, so hlsAuthQs/cmafAuthQs are re-signed for the key path
+    // in that case. The current client always uses playbackHlsAuthQs /
+    // playbackCmafAuthQs together with playbackId. Tokens contain no key.
+    const tokenCompat = {};
+    if (alias?.swapOutbound) {
+      tokenCompat.playbackHlsAuthQs = status.hlsAuthQs || "";
+      tokenCompat.playbackCmafAuthQs = status.cmafAuthQs || "";
+      if (res.locals.playbackAliasVia === "stream_key") {
+        const signForKeyPath = (urlPath) =>
+          playbackAliasStorage.exit(() => appendBunnyToken(urlPath));
+        if (status.hlsAuthQs) {
+          tokenCompat.hlsAuthQs = signForKeyPath(
+            status.transcodingEnabled
+              ? `/api/abr/${alias.streamKey}/master.m3u8`
+              : `/api/hls/${alias.streamKey}.m3u8`,
+          );
+        }
+        if (status.cmafAuthQs) {
+          tokenCompat.cmafAuthQs = signForKeyPath(
+            `/api/cmaf/${alias.streamKey}/index.m3u8`,
+          );
+        }
+      }
+    }
 
     res.json({
       ok: true,
       ...status,
+      ...tokenCompat,
+      // Phase 2: the client builds every playback URL from playbackId (and
+      // replaces a legacy /watch/<stream_key> address with it). null when no
+      // outbound alias applies, so the client keeps using its URL value.
+      playbackId: alias?.swapOutbound ? alias.playbackId : null,
+      channelName: alias?.channelName || null,
     });
   } catch (error) {
     console.error("Public watch status error:", error);
@@ -8794,6 +9181,76 @@ app.get("/api/public/watch/:streamKey", statusPollLimiter, async (req, res) => {
     });
   }
 });
+
+// Phase 2: WebRTC (WHEP) playback through the backend. The browser used to POST
+// its SDP offer straight to SRS (/rtc/v1/whep/?stream=<stream_key>), which put
+// the ingest credential in every viewer's network log. The playback-alias
+// middleware has already translated the playback ID in this path to the
+// stream key; SRS is reached on its local API address only. Media still flows
+// directly between the browser and SRS over UDP 8000.
+app.post(
+  "/api/whep/:streamKey",
+  statusPollLimiter,
+  express.text({ type: ["application/sdp", "text/plain"], limit: "256kb" }),
+  async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store");
+    const alias = res.locals.playbackAlias || null;
+    if (!alias) {
+      return res.status(404).type("text/plain").send("Stream not found");
+    }
+    const offer = typeof req.body === "string" ? req.body : "";
+    if (!offer.trim().startsWith("v=0")) {
+      return res.status(400).type("text/plain").send("Invalid SDP offer");
+    }
+    try {
+      const upstream = await fetch(
+        `${SRS_API_URL.replace(/\/$/, "")}/rtc/v1/whep/?app=live&stream=${encodeURIComponent(alias.streamKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: offer,
+          signal: AbortSignal.timeout(10000),
+        },
+      );
+      const answer = await upstream.text();
+      if (!upstream.ok || !answer.trim().startsWith("v=0")) {
+        return res
+          .status(upstream.status === 404 ? 404 : 502)
+          .type("text/plain")
+          .send("WebRTC playback unavailable");
+      }
+      return res.status(201).type("application/sdp").send(answer);
+    } catch (error) {
+      console.error(
+        `[WHEP-PROXY] ${streamLogId(alias.streamKey)} failed:`,
+        error.message,
+      );
+      return res
+        .status(502)
+        .type("text/plain")
+        .send("WebRTC playback unavailable");
+    }
+  },
+);
+
+// Phase 2: how many viewer requests still use legacy stream-key URLs since
+// this process started. Turn LEGACY_STREAM_KEY_PLAYBACK=false only once this
+// stays flat.
+app.get(
+  "/api/admin/playback/legacy-usage",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  (req, res) => {
+    res.json({
+      ok: true,
+      legacy_stream_key_playback_enabled: LEGACY_STREAM_KEY_PLAYBACK_ENABLED,
+      since: legacyPlaybackUsage.since,
+      total: legacyPlaybackUsage.total,
+      by_route: Object.fromEntries(legacyPlaybackUsage.byRoute),
+    });
+  },
+);
 
 app.get(
   "/api/schedules",
@@ -9147,7 +9604,7 @@ app.get(
       const data = await response.json();
 
       const allowedResult = await pool.query(
-        `SELECT id, name, stream_key, live_started_at
+        `SELECT id, name, stream_key, playback_id, live_started_at
          FROM channels
          WHERE organization_id = $1`,
         [req.organization.id],
@@ -9519,6 +9976,7 @@ app.get(
           return {
             ...stream,
             channel_id: channel?.id || null,
+            playback_id: channel?.playback_id || null,
             channel_name: channel?.name || null,
             srs_clients: Number(stream.clients || 0),
             clients: viewerMetrics.active_viewers,
@@ -12381,7 +12839,14 @@ function signBunnyUrlPath(urlPath, expiresUnix) {
 function appendBunnyToken(urlPath, existingQs = "") {
   if (!BUNNY_HLS_TOKEN_KEY) return existingQs;
   const expires = Math.floor(Date.now() / 1000) + HLS_TOKEN_TTL_SECONDS;
-  const token = signBunnyUrlPath(urlPath, expires);
+  // Phase 2: while a playback alias is active, the response rewrite turns
+  // every stream key in this path into the playback ID before it reaches the
+  // viewer, so sign exactly that public form or Bunny rejects the token.
+  const signedPath = swapStreamKeyForPlaybackId(
+    urlPath,
+    getCurrentPlaybackAlias(),
+  );
+  const token = signBunnyUrlPath(signedPath, expires);
   const sep = existingQs ? "&" : "?";
   return `${existingQs}${sep}token=${encodeURIComponent(token)}&expires=${expires}&token_ignore_params=true`;
 }
@@ -14370,6 +14835,7 @@ app.post(
 
       const newStreamKey = await generateUniqueStreamKey();
 
+      invalidatePlaybackAliasCache(); // Phase 2: old key must stop resolving
       await pool.query(`UPDATE channels SET stream_key = $1 WHERE id = $2`, [
         newStreamKey,
         channel.id,
@@ -15615,6 +16081,9 @@ ${errorEntries.map((e) => `- ${e.timestamp || e.created_at || "?"}: ${e.message 
 // already being defined above this line.
 embedRoutes.register(app, pool, {
   getPublicWatchStatus,
+  lookupPlaybackAliasByStreamKey,
+  runWithPlaybackAlias,
+  swapStreamKeyForPlaybackId,
   authenticateAdmin,
   resolveOrganizationForRequest,
   requireRole,
@@ -16891,13 +17360,78 @@ const formatRecordingUrl = (streamKey, fileName) => {
   return `${API_PUBLIC_URL}/api/recordings/files/download?stream=${encodeURIComponent(streamKey)}&file=${encodeURIComponent(fileName)}`;
 };
 
+// Phase 2 (2026-10-20): /api/public/recordings/{thumbnail,media} serve local
+// recording files without a login because <img>/<video> elements cannot send
+// the dashboard's bearer token. They used to accept ANY stream key + file name,
+// so anyone holding a key could download every local recording regardless of
+// visibility. These URLs are only ever produced for authenticated callers
+// (dashboard recording DTOs, API-key /api/v1/recordings) and are built fresh on
+// every response, so they now carry an expiring HMAC signature the routes
+// verify. Rollback without a code change: LEGACY_UNSIGNED_RECORDING_URLS=true.
+const PUBLIC_RECORDING_URL_TTL_SECONDS = 12 * 60 * 60;
+const LEGACY_UNSIGNED_RECORDING_URLS_ENABLED =
+  String(process.env.LEGACY_UNSIGNED_RECORDING_URLS || "")
+    .trim()
+    .toLowerCase() === "true";
+
+function getRecordingUrlSigningKey() {
+  if (process.env.RECORDING_URL_SIGNING_SECRET) {
+    return process.env.RECORDING_URL_SIGNING_SECRET;
+  }
+  return crypto
+    .createHmac("sha256", String(process.env.JWT_SECRET || ""))
+    .update("nlm-public-recording-url-v1")
+    .digest();
+}
+
+function signPublicRecordingParams(kind, stream, file, expires) {
+  return crypto
+    .createHmac("sha256", getRecordingUrlSigningKey())
+    .update(`${kind}\n${stream}\n${file}\n${expires}`)
+    .digest("base64url");
+}
+
+function buildSignedPublicRecordingUrl(kind, streamKey, fileName) {
+  const stream = String(streamKey || "");
+  const file = String(fileName || "");
+  const expires =
+    Math.floor(Date.now() / 1000) + PUBLIC_RECORDING_URL_TTL_SECONDS;
+  const sig = signPublicRecordingParams(kind, stream, file, expires);
+  return (
+    `${API_PUBLIC_URL}/api/public/recordings/${kind}` +
+    `?stream=${encodeURIComponent(stream)}&file=${encodeURIComponent(file)}` +
+    `&expires=${expires}&sig=${encodeURIComponent(sig)}`
+  );
+}
+
+function isValidPublicRecordingRequest(kind, req) {
+  if (LEGACY_UNSIGNED_RECORDING_URLS_ENABLED) return true;
+  const stream = typeof req.query.stream === "string" ? req.query.stream : "";
+  const file = typeof req.query.file === "string" ? req.query.file : "";
+  const expiresRaw =
+    typeof req.query.expires === "string" ? req.query.expires : "";
+  const sig = typeof req.query.sig === "string" ? req.query.sig : "";
+  if (!stream || !file || !/^\d{1,12}$/.test(expiresRaw) || !sig) return false;
+  const expires = Number(expiresRaw);
+  if (expires < Math.floor(Date.now() / 1000)) return false;
+  const expected = Buffer.from(
+    signPublicRecordingParams(kind, stream, file, expires),
+  );
+  const provided = Buffer.from(sig);
+  return (
+    provided.length === expected.length &&
+    crypto.timingSafeEqual(provided, expected)
+  );
+}
+
 const formatRecordingThumbnailUrl = (streamKey, fileName) => {
-  return `${API_PUBLIC_URL}/api/public/recordings/thumbnail?stream=${encodeURIComponent(streamKey)}&file=${encodeURIComponent(fileName)}`;
+  return buildSignedPublicRecordingUrl("thumbnail", streamKey, fileName);
 };
 
 const formatRecordingPlaybackUrl = (streamKey, fileName) => {
-  return `${API_PUBLIC_URL}/api/public/recordings/media?stream=${encodeURIComponent(streamKey)}&file=${encodeURIComponent(fileName)}`;
+  return buildSignedPublicRecordingUrl("media", streamKey, fileName);
 };
+
 
 const formatBunnyRecordingUrl = (storagePath) => {
   return `${BUNNY_RECORDINGS_CDN_URL.replace(/\/$/, "")}/${storagePath}`;
@@ -18256,6 +18790,10 @@ app.get("/api/public/recordings/thumbnail", async (req, res) => {
       return res.status(400).send("Stream and file are required");
     }
 
+    if (!isValidPublicRecordingRequest("thumbnail", req)) {
+      return res.status(403).send("This link has expired or is invalid");
+    }
+
     const filePath = getRecordingAbsolutePath(stream, file);
 
     if (!filePath || !fs.existsSync(filePath)) {
@@ -18277,6 +18815,10 @@ app.get("/api/public/recordings/media", async (req, res) => {
 
     if (!stream || !file) {
       return res.status(400).send("Stream and file are required");
+    }
+
+    if (!isValidPublicRecordingRequest("media", req)) {
+      return res.status(403).send("This link has expired or is invalid");
     }
 
     const filePath = getRecordingAbsolutePath(stream, file);
@@ -19998,6 +20540,16 @@ function startMediaNodeAgentGenerationMonitor() {
   await ensureStreamTargetColumns(pool);
   await ensurePullSourceTables(pool);
   await ensureMediaNodeMigrationTables(pool);
+  try {
+    await ensurePlaybackIdColumns(pool); // Phase 2 — public playback IDs
+  } catch (playbackIdError) {
+    // Non-fatal: without the column, playback-ID lookups fail and the alias
+    // middleware falls through to the unchanged legacy behaviour.
+    console.error(
+      "[PLAYBACK-ID] Could not ensure channels.playback_id:",
+      playbackIdError.message,
+    );
+  }
   await streamTargetManager.reconcileDatabaseState();
   await pullSourceManager.reconcileDatabaseState();
   const migrationReconcile =
