@@ -1,0 +1,73 @@
+{
+  "orgs": {
+    "1": {
+      "id": 1,
+      "name": "No Limits Media",
+      "slug": "no-limits-media",
+      "is_active": true
+    },
+    "2": {
+      "id": 2,
+      "name": "Grace Church",
+      "slug": "grace",
+      "is_active": true
+    },
+    "3": {
+      "id": 3,
+      "name": "Legacy Org",
+      "slug": "legacy",
+      "is_active": true
+    }
+  },
+  "memberships": {
+    "20": [
+      2
+    ],
+    "30": [
+      3
+    ]
+  },
+  "plans": {
+    "1": {
+      "transcoding_enabled": true,
+      "max_bitrate_kbps": 15000
+    },
+    "2": {
+      "transcoding_enabled": true,
+      "max_bitrate_kbps": 10000
+    },
+    "3": {}
+  },
+  "channels": [
+    {
+      "id": 201,
+      "organization_id": 2,
+      "name": "Grace Sunday Service",
+      "stream_key": "sk_GraceLiveKey00000000000000000000",
+      "playback_id": "pb_1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+      "embed_token": "embtok201",
+      "is_live": true,
+      "is_active": true
+    },
+    {
+      "id": 202,
+      "organization_id": 2,
+      "name": "Grace Idle",
+      "stream_key": "sk_GraceIdleKey00000000000000000000",
+      "playback_id": "pb_2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+      "embed_token": "embtok202",
+      "is_live": false,
+      "is_active": true
+    },
+    {
+      "id": 301,
+      "organization_id": 3,
+      "name": "Legacy Channel",
+      "stream_key": "short-key",
+      "playback_id": "pb_3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "embed_token": "embtok301",
+      "is_live": true,
+      "is_active": true
+    }
+  ]
+}
