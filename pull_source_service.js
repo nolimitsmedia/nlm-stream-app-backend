@@ -728,10 +728,13 @@ function createPullSourceManager({ pool }) {
 
   async function isSrsStreamLive(streamKey) {
     try {
-      const response = await fetch(`${SRS_API_URL}/api/v1/streams/`, {
-        signal: AbortSignal.timeout(4000),
-        cache: "no-store",
-      });
+      const response = await fetch(
+        `${SRS_API_URL}/api/v1/streams/?count=1000`,
+        {
+          signal: AbortSignal.timeout(4000),
+          cache: "no-store",
+        },
+      );
       if (!response.ok) return false;
       const data = await response.json();
       return (data.streams || []).some(

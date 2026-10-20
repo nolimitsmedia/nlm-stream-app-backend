@@ -228,7 +228,7 @@ async function fetchJson(url, timeoutMs = 5000) {
 }
 
 async function getSanitizedStreams() {
-  const data = await fetchJson(`${srsApiUrl}/api/v1/streams`);
+  const data = await fetchJson(`${srsApiUrl}/api/v1/streams/?count=1000`);
   const streams = Array.isArray(data?.streams) ? data.streams : [];
 
   return streams.map((stream) => ({
@@ -519,7 +519,9 @@ function normalizePullSourceProtocol(value) {
 
 function normalizeProbeProtocol(value) {
   const protocol = normalizePullSourceProtocol(value);
-  return protocol && PULL_SOURCE_PROBE_PROTOCOLS.has(protocol) ? protocol : null;
+  return protocol && PULL_SOURCE_PROBE_PROTOCOLS.has(protocol)
+    ? protocol
+    : null;
 }
 
 function validatePullSourceUrl(sourceUrl, protocol) {
@@ -1364,9 +1366,7 @@ function startPersistentPullSource(
       );
       error.status = 409;
       error.code =
-        normalized === "rist"
-          ? "rist_port_in_use"
-          : "mpegts_udp_port_in_use";
+        normalized === "rist" ? "rist_port_in_use" : "mpegts_udp_port_in_use";
       error.existingJob = conflict;
       throw error;
     }

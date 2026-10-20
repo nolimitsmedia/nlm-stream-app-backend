@@ -871,7 +871,7 @@ function createStreamTargetManager({
   async function isSrsStreamLive(streamKey) {
     try {
       const res = await fetch(
-        `${process.env.SRS_API_URL || "http://127.0.0.1:1985"}/api/v1/streams/`,
+        `${process.env.SRS_API_URL || "http://127.0.0.1:1985"}/api/v1/streams/?count=1000`,
         {
           signal: AbortSignal.timeout(5000),
         },

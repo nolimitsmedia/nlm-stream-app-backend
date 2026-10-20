@@ -1165,7 +1165,9 @@ function extractLegacyPlaybackIdentifier(pathname) {
 }
 
 function legacyPlaybackRouteLabel(pathname) {
-  const parts = String(pathname || "").split("/").filter(Boolean);
+  const parts = String(pathname || "")
+    .split("/")
+    .filter(Boolean);
   if (parts[1] === "public") return `public/${parts[2] || ""}`;
   if (parts[1] === "hls" && ["session", "seg"].includes(parts[2])) {
     return `hls/${parts[2]}`;
@@ -3130,7 +3132,7 @@ const isAbrRenditionStreamKey = (streamKey) =>
 
 const pollBitrateCompliance = async () => {
   try {
-    const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
+    const response = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`);
     if (!response.ok) return;
 
     const data = await response.json();
@@ -4918,9 +4920,12 @@ app.get(
       let srsAvailable = true;
 
       try {
-        const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`, {
-          signal: AbortSignal.timeout(5000),
-        });
+        const srsResponse = await fetch(
+          `${SRS_API_URL}/api/v1/streams/?count=1000`,
+          {
+            signal: AbortSignal.timeout(5000),
+          },
+        );
         if (!srsResponse.ok) {
           throw new Error(`SRS responded ${srsResponse.status}`);
         }
@@ -6588,9 +6593,12 @@ async function collectServerMetricsSnapshot() {
       const knownStreamKeys = new Set(
         channelsResult.rows.map((row) => String(row.stream_key)),
       );
-      const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`, {
-        signal: AbortSignal.timeout(5000),
-      });
+      const srsResponse = await fetch(
+        `${SRS_API_URL}/api/v1/streams/?count=1000`,
+        {
+          signal: AbortSignal.timeout(5000),
+        },
+      );
       if (srsResponse.ok) {
         const srsData = await srsResponse.json();
         const active = (srsData.streams || []).filter(
@@ -6779,7 +6787,7 @@ async function getIntegrationHealthSnapshot() {
   // SRS
   try {
     const started = Date.now();
-    const srsRes = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+    const srsRes = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`, {
       signal: AbortSignal.timeout(5000),
     });
     results.srs = {
@@ -8832,7 +8840,7 @@ const getPublicWatchStatus = async (streamKey) => {
 
   try {
     const response = await fetch(
-      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
       { signal: AbortSignal.timeout(4000) },
     );
 
@@ -9595,7 +9603,7 @@ app.get(
   resolveOrganizationForRequest,
   async (req, res) => {
     try {
-      const response = await fetch(`${SRS_API_URL}/api/v1/streams`);
+      const response = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`);
 
       if (!response.ok) {
         throw new Error(`SRS API responded with ${response.status}`);
@@ -10092,6 +10100,53 @@ async function getOrgStreamingPlan(organizationId) {
 }
 
 // ── Helper: count currently live streams for an org ───────────────
+// Phase 3 (2026-10-20): stale is_live cleanup that cannot touch a broadcast
+// which is still running. A channel is reset only when ALL of these hold:
+//   - it has been flagged live for over 2 hours (unchanged threshold),
+//   - it is not the stream publishing right now,
+//   - this node's SRS lists no active publisher for its stream key,
+//   - it is assigned to this media node (or unassigned): other nodes' streams
+//     never appear in the local SRS list, so they must not be judged here.
+// If the SRS publisher list cannot be read, nothing is reset (fail safe).
+async function resetStaleLiveFlags(currentStreamKey = "") {
+  let activePublishers;
+  try {
+    const response = await fetch(
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
+      { signal: AbortSignal.timeout(3000), cache: "no-store" },
+    );
+    if (!response.ok) throw new Error(`SRS API HTTP ${response.status}`);
+    const data = await response.json();
+    activePublishers = (data.streams || [])
+      .filter((stream) => stream.app === "live" && stream.publish?.active)
+      .map((stream) => String(stream.name));
+  } catch (error) {
+    console.warn(
+      `[LIVE-STATE] Skipped stale is_live cleanup; SRS publisher list unavailable: ${error.message}`,
+    );
+    return 0;
+  }
+
+  const result = await pool.query(
+    `UPDATE channels SET is_live = FALSE, live_started_at = NULL
+      WHERE is_live = TRUE
+        AND live_started_at < NOW() - INTERVAL '2 hours'
+        AND stream_key <> $1
+        AND NOT (stream_key = ANY($2::text[]))
+        AND (media_node_id IS NULL OR media_node_id = $3)
+      RETURNING id`,
+    [String(currentStreamKey || ""), activePublishers, MEDIA_NODE_ID || null],
+  );
+  if (result.rowCount) {
+    console.log(
+      `[LIVE-STATE] Cleared stale is_live on ${result.rowCount} channel(s) with no active SRS publisher: ${result.rows
+        .map((row) => row.id)
+        .join(", ")}`,
+    );
+  }
+  return result.rowCount || 0;
+}
+
 async function getActiveLiveCount(organizationId, excludeStreamKey = null) {
   const result = await pool.query(
     `SELECT COUNT(*)::int AS count
@@ -10500,7 +10555,7 @@ async function sampleStreamHealthHistory() {
          FROM channels
          WHERE organization_id IS NOT NULL`,
       ),
-      fetch(`${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`, {
+      fetch(`${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`, {
         signal: AbortSignal.timeout(5000),
         cache: "no-store",
       }),
@@ -11254,7 +11309,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // against it.
 // ══════════════════════════════════════════
 async function getSrsRawStream(streamKey) {
-  const response = await fetch(`${SRS_API_URL}/api/v1/streams/`, {
+  const response = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`, {
     signal: AbortSignal.timeout(5000),
   });
   if (!response.ok) {
@@ -11969,7 +12024,7 @@ async function isSrsStreamLive(streamKey) {
   if (!key) return false;
   try {
     const response = await fetch(
-      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
       {
         signal: AbortSignal.timeout(4000),
         cache: "no-store",
@@ -12023,7 +12078,7 @@ const ABR_RECOVERY_COOLDOWN_MS = 15000;
 async function reconcileAbrTranscoders() {
   try {
     const response = await fetch(
-      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+      `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
       {
         signal: AbortSignal.timeout(5000),
       },
@@ -14085,12 +14140,13 @@ app.post("/api/srs/on_publish", async (req, res) => {
   );
 
   try {
-    // 0. Auto-reset stale is_live flags older than 2 hours (cleanup)
-    await pool.query(
-      `UPDATE channels SET is_live = FALSE, live_started_at = NULL
-       WHERE is_live = TRUE
-         AND live_started_at < NOW() - INTERVAL '2 hours'`,
-    );
+    // 0. Clear stale is_live flags left behind by a missed on_unpublish.
+    // Phase 3 fix (2026-10-20): this used to clear EVERY channel live for
+    // more than 2 hours whenever ANY channel published, including services
+    // that were still broadcasting; the watch page then re-marked them live
+    // with a new start time, which viewers' players treated as a new
+    // broadcast. Only channels SRS confirms are not publishing are cleared now.
+    await resetStaleLiveFlags(streamKey);
 
     // 1. Validate stream key exists and is active in our DB
     const channelResult = await pool.query(
@@ -15015,7 +15071,9 @@ app.post(
       let srsAvailable = true;
       let srsStreamsByKey = new Map();
       try {
-        const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`);
+        const srsResponse = await fetch(
+          `${SRS_API_URL}/api/v1/streams/?count=1000`,
+        );
         if (!srsResponse.ok)
           throw new Error(`SRS responded ${srsResponse.status}`);
         const srsData = await srsResponse.json();
@@ -15171,7 +15229,7 @@ async function runSystemHealthChecks() {
   // rather than inventing a second pattern.
   const srsStart = Date.now();
   try {
-    const res = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+    const res = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`, {
       signal: AbortSignal.timeout(5000),
     });
     systemHealthSnapshot.checks.srs = {
@@ -15719,7 +15777,9 @@ async function getActiveStreamsSnapshot() {
   );
 
   try {
-    const srsResponse = await fetch(`${SRS_API_URL}/api/v1/streams`);
+    const srsResponse = await fetch(
+      `${SRS_API_URL}/api/v1/streams/?count=1000`,
+    );
     if (!srsResponse.ok) throw new Error(`SRS responded ${srsResponse.status}`);
     const srsData = await srsResponse.json();
 
@@ -17431,7 +17491,6 @@ const formatRecordingThumbnailUrl = (streamKey, fileName) => {
 const formatRecordingPlaybackUrl = (streamKey, fileName) => {
   return buildSignedPublicRecordingUrl("media", streamKey, fileName);
 };
-
 
 const formatBunnyRecordingUrl = (storagePath) => {
   return `${BUNNY_RECORDINGS_CDN_URL.replace(/\/$/, "")}/${storagePath}`;
@@ -20141,7 +20200,7 @@ app.get("/api/abr/:stream/status", async (req, res) => {
 
     try {
       const srsResponse = await fetch(
-        `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/`,
+        `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
         { signal: AbortSignal.timeout(5000) },
       );
 
@@ -20810,7 +20869,7 @@ function startMediaNodeAgentGenerationMonitor() {
     setInterval(async () => {
       let healthy = false;
       try {
-        const res = await fetch(`${SRS_API_URL}/api/v1/streams`, {
+        const res = await fetch(`${SRS_API_URL}/api/v1/streams/?count=1000`, {
           signal: AbortSignal.timeout(5000),
         });
         healthy = res.ok;
