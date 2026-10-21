@@ -15,7 +15,10 @@
 // vars, used elsewhere in server.js) — only NEW organizations get their
 // own dedicated zones via this module.
 
-const BUNNY_API_BASE = "https://api.bunny.net";
+// Overridable only so the automated tests can point at a local mock API.
+const BUNNY_API_BASE = (
+  process.env.BUNNY_API_BASE_URL || "https://api.bunny.net"
+).replace(/\/$/, "");
 const BUNNY_ACCOUNT_API_KEY = process.env.BUNNY_ACCOUNT_API_KEY || "";
 
 // The origin server pull zones fetch HLS segments from — same origin the
@@ -37,6 +40,21 @@ const BUNNY_STORAGE_ZONE_REGION = process.env.BUNNY_STORAGE_ZONE_REGION || "NY";
 // server.js reads (BUNNY_HLS_TOKEN_KEY) or signed URLs will validate
 // against the wrong key.
 const BUNNY_HLS_TOKEN_KEY = process.env.BUNNY_HLS_TOKEN_KEY || "";
+
+// Origin key (added 2026-10-20). nginx on the origin server refuses raw-IP
+// requests that do not carry this header (see /etc/nginx/conf.d/
+// nlm-stream.conf and 00-nlm-origin-key.conf), so EVERY pull zone whose
+// origin is BUNNY_ORIGIN_URL must have an Edge Rule that adds it to the
+// requests Bunny sends to the origin. Must equal the key in nginx's map
+// (/root/nlm-origin-key.txt on the server).
+const BUNNY_ORIGIN_KEY = (process.env.BUNNY_ORIGIN_KEY || "").trim();
+const BUNNY_ORIGIN_KEY_HEADER = "X-NLM-Origin-Key";
+const BUNNY_ORIGIN_KEY_RULE_DESCRIPTION = "NLM origin key";
+
+// Bunny API enums (docs.bunny.net, Add/Update Edge Rule, EdgeRuleV2Model).
+const EDGE_RULE_ACTION_SET_REQUEST_HEADER = 6;
+const EDGE_RULE_TRIGGER_URL = 0;
+const EDGE_RULE_MATCH_ANY = 0;
 
 const isBunnyAccountConfigured = () => Boolean(BUNNY_ACCOUNT_API_KEY);
 
@@ -108,6 +126,67 @@ const enableTokenAuthForPullZone = async (pullZoneId) => {
   });
 };
 
+const getPullZone = async (pullZoneId) =>
+  callBunnyApi("GET", `/pullzone/${pullZoneId}`);
+
+const isOriginKeyRule = (rule) =>
+  Number(rule?.ActionType) === EDGE_RULE_ACTION_SET_REQUEST_HEADER &&
+  String(rule?.ActionParameter1 || "").toLowerCase() ===
+    BUNNY_ORIGIN_KEY_HEADER.toLowerCase();
+
+// Ensures the pull zone has exactly the origin-key Edge Rule, enabled and
+// carrying the CURRENT key. Idempotent and safe to re-run:
+//   - correct rule already present  -> nothing changed ("ok")
+//   - rule present with an old key, or disabled -> updated in place
+//     (same Guid, so no duplicate rule is created)        ("updated")
+//   - no rule                        -> created           ("created")
+// Never prints or returns the key itself.
+const ensureOriginKeyEdgeRule = async (pullZoneId) => {
+  if (!BUNNY_ORIGIN_KEY) {
+    throw new Error(
+      "BUNNY_ORIGIN_KEY is not configured — refusing to provision a pull zone whose requests the origin will reject (set it to the value in /root/nlm-origin-key.txt)",
+    );
+  }
+
+  const zone = await getPullZone(pullZoneId);
+  const rules = Array.isArray(zone?.EdgeRules) ? zone.EdgeRules : [];
+  const existing = rules.filter(isOriginKeyRule);
+  if (
+    existing.some(
+      (rule) => rule.Enabled && rule.ActionParameter2 === BUNNY_ORIGIN_KEY,
+    )
+  ) {
+    return { status: "ok", ruleCount: existing.length };
+  }
+
+  const body = {
+    ActionType: EDGE_RULE_ACTION_SET_REQUEST_HEADER,
+    ActionParameter1: BUNNY_ORIGIN_KEY_HEADER,
+    ActionParameter2: BUNNY_ORIGIN_KEY,
+    Triggers: [
+      {
+        Type: EDGE_RULE_TRIGGER_URL,
+        PatternMatches: ["*"],
+        PatternMatchingType: EDGE_RULE_MATCH_ANY,
+      },
+    ],
+    TriggerMatchingType: EDGE_RULE_MATCH_ANY,
+    Description: BUNNY_ORIGIN_KEY_RULE_DESCRIPTION,
+    Enabled: true,
+  };
+  if (existing[0]?.Guid) body.Guid = existing[0].Guid;
+
+  await callBunnyApi(
+    "POST",
+    `/pullzone/${pullZoneId}/edgerules/addOrUpdate`,
+    body,
+  );
+  return {
+    status: existing[0]?.Guid ? "updated" : "created",
+    ruleCount: Math.max(existing.length, 1),
+  };
+};
+
 // Creates a new Pull Zone for an organization's live HLS delivery. Returns
 // the zone's id and its default CDN hostname ({name}.b-cdn.net).
 //
@@ -139,6 +218,11 @@ const createPullZoneForOrganization = async (orgSlug) => {
   // — if this fails, provisioning should fail loudly rather than hand
   // back an org with a silently unprotected pull zone.
   await enableTokenAuthForPullZone(result.Id);
+
+  // Every new zone MUST also send the origin key, or the origin refuses
+  // all of its requests and the organization's playback fails. Same policy
+  // as Token Authentication above: not caught, provisioning fails loudly.
+  await ensureOriginKeyEdgeRule(result.Id);
 
   return {
     pullZoneId: result.Id,
@@ -236,11 +320,15 @@ const getTotalBandwidthUsedBytes = async (pullZoneId, dateFrom, dateTo) => {
 };
 
 module.exports = {
+  callBunnyApi,
   isBunnyAccountConfigured,
   provisionBunnyZonesForOrganization,
   createPullZoneForOrganization,
   createStorageZoneForOrganization,
   enableTokenAuthForPullZone,
+  ensureOriginKeyEdgeRule,
+  getPullZone,
+  isOriginKeyRule,
   getPullZoneStatistics,
   getTotalBandwidthUsedBytes,
 };
