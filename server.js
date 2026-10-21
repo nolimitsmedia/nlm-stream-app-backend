@@ -2506,6 +2506,58 @@ const getFeatureFlags = async () => {
 // done by the poller on client_email + plan_key instead (see
 // pollWhmcsBilling below), and this function is called with the already
 // -matched pending row plus the WHMCS identifiers it should be stamped with.
+// Safe automatic media-node placement for a NEW channel (2026-10-21: shared
+// by the Channels page, the Client Onboarding Wizard and WHMCS signups).
+// Only a fresh, healthy, enabled, non-draining node with remaining stream
+// capacity may receive a newly-created channel; existing assignments are never
+// moved. Returns null when no node qualifies (same as before).
+//
+// Why it matters: with authenticated SRS webhooks, on_publish only accepts a
+// channel whose media_node_id equals the publishing node, so a channel created
+// without a node can never go live. The wizard and WHMCS signup used to insert
+// channels without one.
+// `db` may be the pool or a transaction client.
+async function selectMediaNodeIdForNewChannel(db = pool) {
+  const staleAfterSeconds = Math.max(
+    60,
+    Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
+  );
+  const nodeResult = await db.query(
+    `
+        SELECT
+          mn.id,
+          COUNT(c.id)::int AS assigned_channels,
+          mn.active_streams,
+          mn.max_streams
+        FROM media_nodes mn
+        LEFT JOIN channels c ON c.media_node_id = mn.id
+        WHERE mn.is_enabled = TRUE
+          AND mn.is_draining = FALSE
+          AND mn.status = 'online'
+          AND mn.srs_healthy IS TRUE
+          AND mn.api_healthy IS TRUE
+          AND mn.last_heartbeat_at IS NOT NULL
+          AND mn.last_heartbeat_at >= NOW() - ($1 * INTERVAL '1 second')
+          AND (
+            mn.max_streams IS NULL
+            OR mn.max_streams <= 0
+            OR mn.active_streams < mn.max_streams
+          )
+        GROUP BY mn.id
+        ORDER BY
+          CASE
+            WHEN mn.max_streams IS NULL OR mn.max_streams <= 0 THEN 0
+            ELSE mn.active_streams::numeric / mn.max_streams
+          END ASC,
+          COUNT(c.id) ASC,
+          mn.id ASC
+        LIMIT 1
+    `,
+    [staleAfterSeconds],
+  );
+  return nodeResult.rows[0]?.id || null;
+}
+
 const completePendingSignupFromWhmcs = async (
   pending,
   { whmcsClientId, whmcsOrderId, whmcsInvoiceId, nextDueDate } = {},
@@ -2610,10 +2662,11 @@ const completePendingSignupFromWhmcs = async (
       [organization.id, admin.id],
     );
 
+    const signupMediaNodeId = await selectMediaNodeIdForNewChannel(client);
     const channelResult = await client.query(
       `
-      INSERT INTO channels (organization_id, name, stream_key, description)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO channels (organization_id, name, stream_key, description, media_node_id)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *
       `,
       [
@@ -2621,6 +2674,7 @@ const completePendingSignupFromWhmcs = async (
         `${organization.name} Main`,
         pending.stream_key,
         "Primary livestream channel",
+        signupMediaNodeId,
       ],
     );
 
@@ -4761,15 +4815,17 @@ app.post(
         channelName || organizationName,
       );
 
+      const wizardMediaNodeId = await selectMediaNodeIdForNewChannel(client);
       const channelResult = await client.query(
         `
         INSERT INTO channels (
           organization_id,
           name,
           stream_key,
-          description
+          description,
+          media_node_id
         )
-        VALUES ($1, $2, $3, $4)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         `,
         [
@@ -4777,15 +4833,29 @@ app.post(
           channelName || `${organization.name} Main`,
           streamKey,
           channelDescription || "Primary livestream channel",
+          wizardMediaNodeId,
         ],
       );
 
       await client.query("COMMIT");
-
       await provisionBunnyZonesForNewOrganization(organization);
+      // The ingest links (RTMP server / SRT URL) come from the assigned media
+      // node's public address; without it they fell back to "localhost".
+      const wizardMediaNode = wizardMediaNodeId
+        ? (
+            await pool.query(
+              `SELECT id, name, public_ip, hostname FROM media_nodes WHERE id = $1`,
+              [wizardMediaNodeId],
+            )
+          ).rows[0] || null
+        : null;
 
-      const watchUrl = `${CLIENT_URL.replace(/\/$/, "")}/watch/${streamKey}`;
-      const playbackUrl = `${HLS_BASE_URL.replace(/\/$/, "")}/live/${streamKey}.m3u8`;
+      // Phase 2: share the public playback ID, never the stream key (the
+      // ingest credential). The old playback URL pointed at a raw /hls/ route
+      // that does not exist and also contained the key.
+      const publicPlaybackRef = channelResult.rows[0]?.playback_id || streamKey;
+      const watchUrl = `${CLIENT_URL.replace(/\/$/, "")}/watch/${publicPlaybackRef}`;
+      const playbackUrl = `${API_PUBLIC_URL.replace(/\/$/, "")}/api/hls/${publicPlaybackRef}.m3u8`;
 
       res.json({
         ok: true,
@@ -4798,7 +4868,10 @@ app.post(
         ownerMembership: ownerMembershipResult.rows[0],
         channel: channelResult.rows[0],
         links: (() => {
-          const routing = buildChannelIngestRouting(channelResult.rows[0]);
+          const routing = buildChannelIngestRouting(
+            channelResult.rows[0],
+            wizardMediaNode,
+          );
           return {
             watch_url: watchUrl,
             playback_url: playbackUrl,
@@ -14607,48 +14680,9 @@ app.post(
 
       const streamKey = await generateUniqueStreamKey(name);
 
-      // Phase 3: safe automatic placement.
-      // Only a fresh, healthy, enabled, non-draining node with remaining
-      // stream capacity may receive a newly-created channel. Existing channel
-      // assignments are never moved by this selector.
-      const staleAfterSeconds = Math.max(
-        60,
-        Math.ceil((MEDIA_NODE_HEARTBEAT_INTERVAL_MS / 1000) * 3),
-      );
-      const nodeResult = await pool.query(
-        `
-        SELECT
-          mn.id,
-          COUNT(c.id)::int AS assigned_channels,
-          mn.active_streams,
-          mn.max_streams
-        FROM media_nodes mn
-        LEFT JOIN channels c ON c.media_node_id = mn.id
-        WHERE mn.is_enabled = TRUE
-          AND mn.is_draining = FALSE
-          AND mn.status = 'online'
-          AND mn.srs_healthy IS TRUE
-          AND mn.api_healthy IS TRUE
-          AND mn.last_heartbeat_at IS NOT NULL
-          AND mn.last_heartbeat_at >= NOW() - ($1 * INTERVAL '1 second')
-          AND (
-            mn.max_streams IS NULL
-            OR mn.max_streams <= 0
-            OR mn.active_streams < mn.max_streams
-          )
-        GROUP BY mn.id
-        ORDER BY
-          CASE
-            WHEN mn.max_streams IS NULL OR mn.max_streams <= 0 THEN 0
-            ELSE mn.active_streams::numeric / mn.max_streams
-          END ASC,
-          COUNT(c.id) ASC,
-          mn.id ASC
-        LIMIT 1
-        `,
-        [staleAfterSeconds],
-      );
-      const mediaNodeId = nodeResult.rows[0]?.id || null;
+      // Phase 3: safe automatic placement (shared helper, see
+      // selectMediaNodeIdForNewChannel).
+      const mediaNodeId = await selectMediaNodeIdForNewChannel(pool);
 
       const result = await pool.query(
         `
