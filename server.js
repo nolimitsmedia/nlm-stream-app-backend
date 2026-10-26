@@ -15,6 +15,7 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const whmcs = require("./whmcs_client");
+const whmcsLinkService = require("./whmcs_link_service"); // Import from WHMCS (2026-10-26)
 const bunny = require("./bunny_client");
 const embedRoutes = require("./embed_routes"); // Phase 1 — embedded player (Copy Embed Code)
 const {
@@ -9311,6 +9312,102 @@ app.post(
         .status(502)
         .type("text/plain")
         .send("WebRTC playback unavailable");
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
+| IMPORT FROM WHMCS (super admin, 2026-10-26)
+|--------------------------------------------------------------------------
+| Connects clients who bought StreamControl in WHMCS before using the app.
+| Logic and safety checks live in whmcs_link_service.js (shared with
+| link-whmcs-client.js). Read-only towards WHMCS: nothing is written there.
+*/
+function sendWhmcsLinkError(res, error, fallbackMessage) {
+  const status = Number(error?.status) || 500;
+  if (status >= 500)
+    console.error(`[WHMCS-LINK] ${fallbackMessage}:`, error?.message);
+  return res.status(status).json({
+    ok: false,
+    message: status >= 500 ? fallbackMessage : error.message,
+    ...(error?.serviceIds ? { service_ids: error.serviceIds } : {}),
+    ...(error?.preview ? { preview: error.preview } : {}),
+  });
+}
+
+app.get(
+  "/api/admin/whmcs/clients",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    if (!whmcs.isWhmcsConfigured()) {
+      return res
+        .status(503)
+        .json({ ok: false, message: "WHMCS is not configured on this server" });
+    }
+    try {
+      const clients = await whmcsLinkService.listStreamControlClients({
+        pool,
+        whmcs,
+      });
+      res.json({ ok: true, clients });
+    } catch (error) {
+      sendWhmcsLinkError(res, error, "Failed to load WHMCS clients");
+    }
+  },
+);
+
+app.post(
+  "/api/admin/whmcs/link/preview",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    if (!whmcs.isWhmcsConfigured()) {
+      return res
+        .status(503)
+        .json({ ok: false, message: "WHMCS is not configured on this server" });
+    }
+    try {
+      const preview = await whmcsLinkService.previewLink({
+        pool,
+        whmcs,
+        organization: req.body?.organization_id ?? req.body?.organization,
+        whmcsClientId: req.body?.whmcs_client_id,
+        serviceId: req.body?.service_id || null,
+      });
+      res.json({ ok: true, preview });
+    } catch (error) {
+      sendWhmcsLinkError(res, error, "Failed to preview the WHMCS link");
+    }
+  },
+);
+
+app.post(
+  "/api/admin/whmcs/link",
+  authenticateAdmin,
+  requireRole("super_admin"),
+  async (req, res) => {
+    if (!whmcs.isWhmcsConfigured()) {
+      return res
+        .status(503)
+        .json({ ok: false, message: "WHMCS is not configured on this server" });
+    }
+    try {
+      const { preview, after } = await whmcsLinkService.applyLink({
+        pool,
+        whmcs,
+        organization: req.body?.organization_id ?? req.body?.organization,
+        whmcsClientId: req.body?.whmcs_client_id,
+        serviceId: req.body?.service_id || null,
+        force: req.body?.force === true,
+      });
+      console.log(
+        `[WHMCS-LINK] Admin ${req.admin?.id} linked org ${after.organization_id} to WHMCS client ${after.whmcs_client_id} (plan ${after.plan_key}, ${after.status})${preview.blocked ? " — FORCED past: " + preview.problems.join("; ") : ""}`,
+      );
+      res.json({ ok: true, preview, after });
+    } catch (error) {
+      sendWhmcsLinkError(res, error, "Failed to link the WHMCS client");
     }
   },
 );
