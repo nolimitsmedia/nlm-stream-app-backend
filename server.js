@@ -9121,7 +9121,10 @@ const getPublicWatchStatus = async (streamKey) => {
 
   if (activeStream && transcodingEnabled && organizationId) {
     try {
-      const renditionPlan = await getRenditionPlanForOrg(organizationId);
+      const renditionPlan = await getRenditionPlanForOrg(
+        organizationId,
+        streamKey,
+      );
       for (const rendition of renditionPlan) {
         const upstreamUrl =
           `${SRS_INTERNAL_HLS_BASE_URL.replace(/\/$/, "")}/live/` +
@@ -9902,7 +9905,10 @@ app.get(
           const channel = channelByStreamKey.get(String(stream.name)) || null;
 
           const renditions = await Promise.all(
-            (renditionPlan || []).map(async (planned) => {
+            fitRenditionsForStream(
+              renditionPlan || [],
+              String(stream.name),
+            ).map(async (planned) => {
               const renditionName = `${stream.name}_${planned.label}`;
               const actual = srsStreamByName.get(renditionName) || null;
               const isLive = Boolean(actual?.publish?.active);
@@ -10790,7 +10796,10 @@ async function sampleStreamHealthHistory() {
 
       let renditionPlan = [];
       try {
-        renditionPlan = await getRenditionPlanForOrg(channel.organization_id);
+        renditionPlan = await getRenditionPlanForOrg(
+          channel.organization_id,
+          channel.stream_key,
+        );
       } catch (error) {
         console.debug(
           `[STREAM-HEALTH-HISTORY channel=${channel.id}] rendition plan unavailable:`,
@@ -12025,7 +12034,124 @@ function pickResolutionForBitrate(bitrateKbps) {
   return "854x480";
 }
 
-async function getRenditionPlanForOrg(organizationId) {
+// ── Source-fitted ABR ladder (2026-10-27) ──────────────────────────────
+// The plan ladder always started at 1920x1080 (at the plan's bitrate
+// ceiling) regardless of what the encoder actually sent, so a 720p church
+// stream was UPSCALED to 1080p: the most expensive encode, no visible gain,
+// and more CDN bandwidth for every viewer. The ladder is now fitted to the
+// broadcast's real source size:
+//   - the top rung never exceeds the source (encoded AT the source size,
+//     bitrate capped for that size and never above the plan ceiling);
+//   - lower rungs are kept only when genuinely smaller than the source;
+//   - 1080p (or larger) sources keep the full plan ladder, unchanged;
+//   - if the source size is unknown, the full plan ladder is used (the
+//     previous behaviour), so nothing breaks.
+// The source size is captured once per broadcast generation (just before
+// the encoders start, when SRS already knows it) and every caller — encoder
+// start, reconciler, master playlist, status pages — derives the ladder from
+// the same stored value, so the playlist always matches what is encoded.
+const streamSourceVideo = new Map(); // streamKey -> { width, height, generation }
+const SOURCE_TOP_BITRATE_BY_HEIGHT = [
+  [900, 5000],
+  [720, 3500],
+  [540, 2000],
+  [0, 1200],
+];
+function parseResolution(value) {
+  const match = /^(\d+)x(\d+)$/.exec(String(value || ""));
+  return match ? { width: Number(match[1]), height: Number(match[2]) } : null;
+}
+function fitRenditionsToSource(renditions, video) {
+  const sourceWidth = Number(video?.width) || 0;
+  const sourceHeight = Number(video?.height) || 0;
+  if (!renditions?.length || sourceWidth <= 0 || sourceHeight <= 0) {
+    return renditions || [];
+  }
+  const even = (n) => Math.max(2, Math.floor(n / 2) * 2);
+  const fitted = [];
+  for (const rendition of renditions) {
+    const size = parseResolution(rendition.resolution);
+    if (!size) {
+      fitted.push(rendition);
+      continue;
+    }
+    if (rendition.label === "top") {
+      if (size.height <= sourceHeight) {
+        fitted.push(rendition);
+        continue;
+      }
+      const tierCap = SOURCE_TOP_BITRATE_BY_HEIGHT.find(
+        ([minHeight]) => sourceHeight >= minHeight,
+      )[1];
+      fitted.push({
+        ...rendition,
+        resolution: `${even(sourceWidth)}x${even(sourceHeight)}`,
+        bitrateKbps: Math.min(
+          Number(rendition.bitrateKbps) || tierCap,
+          tierCap,
+        ),
+        fittedToSource: true,
+      });
+      continue;
+    }
+    if (size.height < sourceHeight) fitted.push(rendition);
+  }
+  return fitted;
+}
+function rememberStreamSourceVideo(streamKey, generation, video) {
+  const width = Number(video?.width) || 0;
+  const height = Number(video?.height) || 0;
+  if (!streamKey || width <= 0 || height <= 0) return false;
+  streamSourceVideo.set(String(streamKey), { width, height, generation });
+  return true;
+}
+// Fits a plan ladder to this broadcast's stored source size. Entries from an
+// earlier broadcast (different generation) are ignored.
+function fitRenditionsForStream(renditions, streamKey) {
+  const entry = streamKey ? streamSourceVideo.get(String(streamKey)) : null;
+  if (!entry) return renditions;
+  const currentGeneration = bitrateCapGeneration.get(String(streamKey));
+  if (currentGeneration && entry.generation !== currentGeneration) {
+    return renditions;
+  }
+  return fitRenditionsToSource(renditions, entry);
+}
+async function fetchSrsSourceVideo(streamKey) {
+  const response = await fetch(
+    `${SRS_API_URL.replace(/\/$/, "")}/api/v1/streams/?count=1000`,
+    { signal: AbortSignal.timeout(3000) },
+  );
+  if (!response.ok) return null;
+  const payload = await response.json();
+  const stream = (payload.streams || []).find(
+    (item) => item.name === streamKey && item.publish?.active,
+  );
+  return stream?.video?.width && stream?.video?.height ? stream.video : null;
+}
+// Reads the source size from SRS (a few short retries: SRS learns it from
+// the first keyframe) and stores it for this generation. Never throws.
+async function captureStreamSourceVideo(streamKey, generation) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const video = await fetchSrsSourceVideo(streamKey);
+      if (video && rememberStreamSourceVideo(streamKey, generation, video)) {
+        return video;
+      }
+    } catch {
+      // fall through to retry
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  console.warn(
+    `[ABR] Source size unknown for ${streamLogId(streamKey)}; using the full plan ladder.`,
+  );
+  return null;
+}
+async function getRenditionPlanForOrg(organizationId, streamKey = null) {
+  const renditions = await getPlanRenditionLadderForOrg(organizationId);
+  return streamKey ? fitRenditionsForStream(renditions, streamKey) : renditions;
+}
+async function getPlanRenditionLadderForOrg(organizationId) {
   const plan = await getOrgStreamingPlan(organizationId);
   const capKbps = await getOrgMaxBitrateKbps(organizationId);
 
@@ -12277,14 +12403,20 @@ async function reconcileAbrTranscoders() {
       const organizationId = channelResult.rows[0]?.organization_id;
       if (!organizationId) continue;
 
-      const renditions = await getRenditionPlanForOrg(organizationId);
-      if (!renditions.length) continue;
-
       let generation = bitrateCapGeneration.get(streamKey);
       if (!generation) {
         generation = 1;
         bitrateCapGeneration.set(streamKey, generation);
       }
+      const knownSource = streamSourceVideo.get(String(streamKey));
+      if (!knownSource || knownSource.generation !== generation) {
+        rememberStreamSourceVideo(streamKey, generation, raw.video);
+      }
+      const renditions = await getRenditionPlanForOrg(
+        organizationId,
+        streamKey,
+      );
+      if (!renditions.length) continue;
 
       for (const rendition of renditions) {
         const retryKey = `${streamKey}:${rendition.label}`;
@@ -14406,10 +14538,18 @@ app.post("/api/srs/on_publish", async (req, res) => {
     getRenditionPlanForOrg(channel.org_id)
       .then((renditions) => {
         if (!renditions.length) return;
-        const startupTimer = setTimeout(
-          () => spawnRenditionsForStream(streamKey, renditions, generation),
-          3000,
-        );
+        const startupTimer = setTimeout(async () => {
+          const source = await captureStreamSourceVideo(streamKey, generation);
+          const fitted = fitRenditionsForStream(renditions, streamKey);
+          if (source) {
+            console.log(
+              `[ABR] Source ${source.width}x${source.height} for ${streamLogId(streamKey)} — ladder: ${fitted
+                .map((r) => `${r.label} ${r.resolution}@${r.bitrateKbps}k`)
+                .join(", ")}`,
+            );
+          }
+          spawnRenditionsForStream(streamKey, fitted, generation);
+        }, 3000);
         startupTimer.unref?.();
       })
       .catch((err) =>
@@ -19988,8 +20128,10 @@ app.post(
         });
       }
 
-      const renditions = await getRenditionPlanForOrg(channel.organization_id);
-      if (!renditions.length) {
+      const planRenditions = await getRenditionPlanForOrg(
+        channel.organization_id,
+      );
+      if (!planRenditions.length) {
         return res.status(409).json({
           ok: false,
           message:
@@ -20010,7 +20152,11 @@ app.post(
         generation = 1;
         bitrateCapGeneration.set(stream, generation);
       }
-
+      const knownSource = streamSourceVideo.get(String(stream));
+      if (!knownSource || knownSource.generation !== generation) {
+        await captureStreamSourceVideo(stream, generation);
+      }
+      const renditions = fitRenditionsForStream(planRenditions, stream);
       const input = getInternalHlsSourceUrl(stream);
       const outputs = [];
       const started = [];
@@ -20298,7 +20444,10 @@ app.get("/api/abr/:stream/status", async (req, res) => {
     }
 
     if (channel.organization_id) {
-      renditionPlan = await getRenditionPlanForOrg(channel.organization_id);
+      renditionPlan = await getRenditionPlanForOrg(
+        channel.organization_id,
+        stream,
+      );
     }
 
     const readyRenditions = [];
@@ -20476,7 +20625,7 @@ app.get("/api/abr/:stream/master.m3u8", async (req, res) => {
     );
     const organizationId = channelResult.rows[0]?.organization_id;
     if (organizationId) {
-      renditionPlan = await getRenditionPlanForOrg(organizationId);
+      renditionPlan = await getRenditionPlanForOrg(organizationId, stream);
     }
   } catch (err) {
     console.error(
