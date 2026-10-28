@@ -1,4 +1,4 @@
-// server/server.js updated 10272026
+// server/server.js
 const express = require("express");
 const rateLimit = require("express-rate-limit");
 const cors = require("cors");
@@ -12245,6 +12245,27 @@ function getTranscodingProfile(profileId = DEFAULT_TRANSCODING_PROFILE_ID) {
   );
 }
 
+// Thread limits (2026-10-27 load test). With no -threads, every ABR process
+// let x264 and the H.264 decoder start ~1.5x the CPU count in threads
+// (~48 each on a 32-thread node), so 10 churches meant ~1,000 threads
+// contending for 32 CPUs; one 10-stream run saturated (load 102, dropped
+// frames) while a repeat run passed at 61% CPU. Real-time veryfast encoding
+// needs far fewer: ~1 core for 720p30. Set ABR_FFMPEG_THREADS=auto in .env
+// to restore the previous behaviour (no -threads options) without a deploy.
+const ABR_FFMPEG_THREADS_AUTO =
+  String(process.env.ABR_FFMPEG_THREADS || "")
+    .trim()
+    .toLowerCase() === "auto";
+function abrThreadFlags(resolution) {
+  if (ABR_FFMPEG_THREADS_AUTO) return { decoder: [], encoder: [] };
+  const height = Number(String(resolution || "").split("x")[1]) || 0;
+  const encoderThreads = height >= 1080 ? 6 : height >= 720 ? 4 : 2;
+  return {
+    decoder: ["-threads", "2"],
+    encoder: ["-threads", String(encoderThreads)],
+  };
+}
+
 function buildRenditionFfmpegArgs(
   streamKey,
   input,
@@ -12252,6 +12273,7 @@ function buildRenditionFfmpegArgs(
   { bitrateKbps, resolution, transcodingProfileId },
 ) {
   const profile = getTranscodingProfile(transcodingProfileId);
+  const threads = abrThreadFlags(resolution);
   const safeBitrateKbps = Math.max(1, Math.round(Number(bitrateKbps) || 1));
   const bufferKbps = Math.max(
     safeBitrateKbps,
@@ -12265,6 +12287,7 @@ function buildRenditionFfmpegArgs(
     "-loglevel",
     getFfmpegLogLevel(streamKey),
     ...inputResilienceFlags,
+    ...threads.decoder,
     "-i",
     input,
     "-map",
@@ -12273,6 +12296,7 @@ function buildRenditionFfmpegArgs(
     "0:a:0?",
     "-c:v",
     profile.encoder,
+    ...threads.encoder,
     "-preset",
     profile.preset,
     ...keyframeAlignmentFlags,
