@@ -1,18 +1,29 @@
 // facebook_graph_service.js
 //
-// Wraps the Meta Graph API calls needed to automate "Go Live" on Facebook Pages.
+// Wraps the Meta Graph API calls used by NLM Streaming's Facebook Live Studio.
 // No SDK dependency — plain fetch, matching the rest of this codebase's style.
 //
 // Docs this maps to:
-//   - OAuth dialog:            https://developers.facebook.com/docs/facebook-login/manually-build-a-login-flow
-//   - Long-lived tokens:       https://developers.facebook.com/docs/facebook-login/access-tokens/refreshing
-//   - Live Video API:          https://developers.facebook.com/docs/video-api/guides/live
+//   - Facebook Login for Business: https://developers.facebook.com/docs/facebook-login/facebook-login-for-business
+//   - Long-lived tokens:           https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived
+//   - Live Video API:              https://developers.facebook.com/docs/live-video-api
+//   - Page posts / videos:         https://developers.facebook.com/docs/pages-api
 //
-// Required permissions (submitted for App Review): pages_show_list,
-// pages_read_engagement, pages_manage_posts, publish_video
+// Permission -> where it is used (keep this in sync with the App Review notes):
+//   pages_show_list        listUserPages()            Page picker in Live Studio
+//   pages_read_engagement  getPageProfile(),          Page header (followers, category),
+//                          getPagePosts(),            "Recent posts" tab (reactions/comments),
+//                          getPageVideos(),           "Videos" tab,
+//                          getPageLiveVideos(),       "Live videos" tab,
+//                          getLiveVideoStatus()       live indicator + viewer count
+//   pages_manage_posts     createLiveVideo()          the live broadcast is published as a Page post
+//   publish_video          createLiveVideo(),         publishes the live video to the Page
+//                          endLiveVideo()
+//   Live Video API         createLiveVideo(), endLiveVideo(), getLiveVideoStatus()
 
-const GRAPH_VERSION = "v21.0";
+const GRAPH_VERSION = process.env.FACEBOOK_GRAPH_VERSION || "v21.0";
 const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
+const FACEBOOK_WEB = "https://www.facebook.com";
 
 const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || "";
 const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || "";
@@ -31,11 +42,14 @@ function isConfigured() {
   );
 }
 
+function getAppSecret() {
+  return FACEBOOK_APP_SECRET;
+}
+
 // Step 1: build the URL the browser popup is sent to.
-// Facebook Login for Business uses a saved configuration to define the
-// permissions requested during login. Meta recommends config_id instead of
-// passing the permission list through scope for a User access token config.
-function getAuthUrl(state) {
+// Facebook Login for Business uses a saved configuration (config_id) to define
+// the permissions requested during login.
+function getAuthUrl(state, { rerequest = false } = {}) {
   if (!FACEBOOK_CONFIG_ID) {
     throw new Error("Facebook Login for Business configuration is missing");
   }
@@ -47,8 +61,11 @@ function getAuthUrl(state) {
     config_id: FACEBOOK_CONFIG_ID,
     response_type: "code",
   });
+  // "rerequest" re-opens the Page/permission chooser so a person can add a
+  // Page they skipped the first time ("Edit Page access" in the studio).
+  if (rerequest) params.set("auth_type", "rerequest");
 
-  return `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
+  return `${FACEBOOK_WEB}/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
 }
 
 async function graphFetch(pathAndQuery, options = {}) {
@@ -62,9 +79,25 @@ async function graphFetch(pathAndQuery, options = {}) {
     const err = new Error(message);
     err.graphError = data.error;
     err.status = res.status;
+    err.code = data.error?.code;
     throw err;
   }
   return data;
+}
+
+// Graph returns some permalinks as relative paths ("/123/videos/456/").
+function absoluteFacebookUrl(url) {
+  if (!url) return null;
+  const value = String(url);
+  if (/^https?:\/\//i.test(value)) return value;
+  return `${FACEBOOK_WEB}${value.startsWith("/") ? "" : "/"}${value}`;
+}
+
+// Token errors that mean the person must reconnect (expired, revoked,
+// password changed, permission removed).
+function isReconnectError(error) {
+  const code = Number(error?.code || error?.graphError?.code);
+  return code === 190 || code === 102 || code === 10 || code === 200;
 }
 
 // Step 2: exchange the ?code= from the callback for a short-lived user token.
@@ -94,38 +127,204 @@ async function getLongLivedUserToken(shortLivedToken) {
   };
 }
 
-// Basic identity of the person who completed Meta OAuth. This does not
-// grant permission to publish to their personal timeline.
+// Identity of the person who completed Facebook Login. Used only to show
+// "Signed in as …" in the studio; it never publishes to a personal timeline.
 async function getCurrentUser(userAccessToken) {
   const params = new URLSearchParams({
-    fields: "id,name",
+    fields: "id,name,picture.type(small){url}",
     access_token: userAccessToken,
   });
   const user = await graphFetch(`/me?${params.toString()}`);
   if (!user.id || !user.name)
     throw new Error("Meta did not return an account identity");
-  return { id: String(user.id), name: String(user.name) };
+  return {
+    id: String(user.id),
+    name: String(user.name),
+    pictureUrl: user.picture?.data?.url || null,
+  };
 }
 
-// Step 4: list the Pages this user manages. Page tokens returned here are
-// already long-lived as long as the parent user token is long-lived.
-async function listUserPages(longLivedUserToken) {
-  const params = new URLSearchParams({
-    access_token: longLivedUserToken,
-    fields: "id,name,access_token,picture",
-  });
-  const data = await graphFetch(`/me/accounts?${params.toString()}`);
-  return (data.data || []).map((page) => ({
-    pageId: page.id,
+function mapPage(page) {
+  const tasks = Array.isArray(page.tasks) ? page.tasks : [];
+  return {
+    pageId: String(page.id),
     pageName: page.name,
     pageAccessToken: page.access_token,
+    category: page.category || null,
     pictureUrl: page.picture?.data?.url || null,
+    followers: Number.isFinite(Number(page.followers_count))
+      ? Number(page.followers_count)
+      : Number.isFinite(Number(page.fan_count))
+        ? Number(page.fan_count)
+        : null,
+    link: page.link || `${FACEBOOK_WEB}/${page.id}`,
+    tasks,
+    // Creating a live video on a Page requires the CREATE_CONTENT task.
+    // Older tokens may not return tasks; treat that as allowed and let the
+    // Graph API be the final judge when the broadcast is created.
+    canGoLive: tasks.length === 0 || tasks.includes("CREATE_CONTENT"),
+  };
+}
+
+// Step 4 (pages_show_list): list the Pages this person granted to the app.
+// Page tokens returned here are long-lived when the user token is long-lived.
+async function listUserPages(longLivedUserToken) {
+  const richFields =
+    "id,name,access_token,category,tasks,link,fan_count,followers_count,picture.type(large){url}";
+  const basicFields = "id,name,access_token,picture{url}";
+  const fetchAll = async (fields) => {
+    const pages = [];
+    let next = `/me/accounts?${new URLSearchParams({
+      access_token: longLivedUserToken,
+      fields,
+      limit: "100",
+    }).toString()}`;
+    // Follow paging so people who manage many Pages see all of them.
+    for (let i = 0; next && i < 10; i += 1) {
+      const data = await graphFetch(next);
+      pages.push(...(data.data || []));
+      const nextUrl = data.paging?.next;
+      next = nextUrl ? nextUrl.replace(GRAPH_BASE, "") : null;
+    }
+    return pages;
+  };
+
+  let raw;
+  try {
+    raw = await fetchAll(richFields);
+  } catch (error) {
+    if (isReconnectError(error) && Number(error.code) === 190) throw error;
+    // Some fields need pages_read_engagement; fall back so the picker still
+    // works while that permission is pending review.
+    raw = await fetchAll(basicFields);
+  }
+  return raw.map(mapPage);
+}
+
+// pages_read_engagement: Page identity shown at the top of Live Studio.
+async function getPageProfile({ pageId, pageAccessToken }) {
+  const params = new URLSearchParams({
+    access_token: pageAccessToken,
+    fields:
+      "id,name,category,link,about,fan_count,followers_count,picture.type(large){url},cover{source}",
+  });
+  const page = await graphFetch(`/${pageId}?${params.toString()}`);
+  return {
+    pageId: String(page.id),
+    name: page.name,
+    category: page.category || null,
+    about: page.about || null,
+    link: page.link || `${FACEBOOK_WEB}/${page.id}`,
+    followers: Number.isFinite(Number(page.followers_count))
+      ? Number(page.followers_count)
+      : Number.isFinite(Number(page.fan_count))
+        ? Number(page.fan_count)
+        : null,
+    pictureUrl: page.picture?.data?.url || null,
+    coverUrl: page.cover?.source || null,
+  };
+}
+
+// pages_read_engagement: the Page's own recent posts with engagement counts.
+async function getPagePosts({ pageId, pageAccessToken, limit = 6 }) {
+  const baseFields =
+    "id,message,story,created_time,permalink_url,full_picture,status_type";
+  const engagementFields =
+    "reactions.summary(total_count).limit(0),comments.summary(total_count).limit(0),shares";
+  const run = (fields) =>
+    graphFetch(
+      `/${pageId}/posts?${new URLSearchParams({
+        access_token: pageAccessToken,
+        fields,
+        limit: String(limit),
+      }).toString()}`,
+    );
+
+  let data;
+  try {
+    data = await run(`${baseFields},${engagementFields}`);
+  } catch (error) {
+    if (Number(error.code) === 190) throw error;
+    data = await run(baseFields);
+  }
+
+  return (data.data || []).map((post) => ({
+    id: post.id,
+    message: post.message || post.story || "",
+    createdTime: post.created_time,
+    permalinkUrl: absoluteFacebookUrl(post.permalink_url),
+    imageUrl: post.full_picture || null,
+    statusType: post.status_type || null,
+    reactions: post.reactions?.summary?.total_count ?? null,
+    comments: post.comments?.summary?.total_count ?? null,
+    shares: post.shares?.count ?? null,
   }));
 }
 
-// Creates a live video object on the Page and returns the RTMP ingest details.
-// This is the API call that replaces the client manually clicking "Go Live"
-// and copy-pasting a stream key into our app.
+// pages_read_engagement: videos published on the Page (ended lives land here).
+async function getPageVideos({ pageId, pageAccessToken, limit = 6 }) {
+  const data = await graphFetch(
+    `/${pageId}/videos?${new URLSearchParams({
+      access_token: pageAccessToken,
+      fields:
+        "id,title,description,created_time,permalink_url,picture,length,live_status",
+      limit: String(limit),
+    }).toString()}`,
+  );
+  return (data.data || []).map((video) => ({
+    id: video.id,
+    title: video.title || video.description || "Untitled video",
+    createdTime: video.created_time,
+    permalinkUrl: absoluteFacebookUrl(video.permalink_url),
+    thumbnailUrl: video.picture || null,
+    lengthSeconds: Number(video.length) || null,
+    liveStatus: video.live_status || null,
+  }));
+}
+
+// pages_read_engagement + Live Video API: live broadcasts on the Page.
+async function getPageLiveVideos({ pageId, pageAccessToken, limit = 6 }) {
+  const data = await graphFetch(
+    `/${pageId}/live_videos?${new URLSearchParams({
+      access_token: pageAccessToken,
+      fields:
+        "id,title,description,status,creation_time,permalink_url,live_views,video{id,picture}",
+      limit: String(limit),
+    }).toString()}`,
+  );
+  return (data.data || []).map(mapLiveVideo);
+}
+
+function mapLiveVideo(live) {
+  return {
+    id: live.id,
+    title: live.title || "Live video",
+    description: live.description || "",
+    status: live.status || null, // LIVE, LIVE_STOPPED, VOD, UNPUBLISHED, SCHEDULED_*, PROCESSING
+    createdTime: live.creation_time || null,
+    permalinkUrl: absoluteFacebookUrl(live.permalink_url),
+    liveViews: Number.isFinite(Number(live.live_views))
+      ? Number(live.live_views)
+      : null,
+    videoId: live.video?.id || null,
+    thumbnailUrl: live.video?.picture || null,
+  };
+}
+
+// Live Video API: status of one broadcast (drives the in-app live indicator).
+async function getLiveVideoStatus({ liveVideoId, pageAccessToken }) {
+  const live = await graphFetch(
+    `/${liveVideoId}?${new URLSearchParams({
+      access_token: pageAccessToken,
+      fields:
+        "id,title,description,status,creation_time,permalink_url,live_views,video{id,picture}",
+    }).toString()}`,
+  );
+  return mapLiveVideo(live);
+}
+
+// Creates a live video object on the Page and returns the RTMPS ingest URL.
+// Replaces the manual "open Live Producer and copy the stream key" step.
 async function createLiveVideo({
   pageId,
   pageAccessToken,
@@ -137,21 +336,21 @@ async function createLiveVideo({
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       access_token: pageAccessToken,
-      title: title || "Live Stream",
-      description: description || "",
+      title: String(title || "Live Stream").slice(0, 254),
+      description: String(description || "").slice(0, 5000),
       status: "LIVE_NOW",
     }),
   });
   // data: { id, stream_url, secure_stream_url }
-  // secure_stream_url is rtmps://...  and already contains the per-broadcast stream key.
+  // secure_stream_url is rtmps://… and already contains the per-broadcast key.
   return {
     liveVideoId: data.id,
     rtmpUrl: data.secure_stream_url || data.stream_url,
   };
 }
 
-// Ends the broadcast on Facebook's side (separate from killing our ffmpeg process —
-// both need to happen, since Facebook will otherwise leave the video "live" indefinitely).
+// Ends the broadcast on Facebook's side (separate from stopping our ffmpeg
+// worker — both need to happen, or Facebook keeps the video "live").
 async function endLiveVideo({ liveVideoId, pageAccessToken }) {
   return graphFetch(`/${liveVideoId}`, {
     method: "POST",
@@ -163,10 +362,7 @@ async function endLiveVideo({ liveVideoId, pageAccessToken }) {
   });
 }
 
-// Page tokens derived from a long-lived user token don't expire on their own
-// schedule the way user tokens do, but Meta can still invalidate them (password
-// change, permission revocation, app review changes). This is a cheap way to
-// check validity before relying on one during a scheduled stream.
+// Cheap validity check before relying on a token during a scheduled stream.
 async function debugToken(inputToken) {
   const appToken = `${FACEBOOK_APP_ID}|${FACEBOOK_APP_SECRET}`;
   const params = new URLSearchParams({
@@ -178,13 +374,22 @@ async function debugToken(inputToken) {
 }
 
 module.exports = {
+  GRAPH_VERSION,
   isConfigured,
+  getAppSecret,
   getAuthUrl,
   exchangeCodeForUserToken,
   getLongLivedUserToken,
   listUserPages,
   getCurrentUser,
+  getPageProfile,
+  getPagePosts,
+  getPageVideos,
+  getPageLiveVideos,
+  getLiveVideoStatus,
   createLiveVideo,
   endLiveVideo,
   debugToken,
+  isReconnectError,
+  absoluteFacebookUrl,
 };

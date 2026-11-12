@@ -52,15 +52,16 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     platform,
     accountId = null,
     identityOnly = false,
+    needsPageSelection = false,
   }) {
     return `<!DOCTYPE html>
 <html><body style="font-family: system-ui; padding: 2rem; text-align: center;">
-  <p>${ok ? "Connected!" : "Something went wrong"} ${message ? `— ${String(message).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch])}` : ""}</p>
-  <p>This window will close automatically.</p>
+  <p>${ok ? "Facebook connected." : "Facebook connection was not completed"} ${message ? `— ${String(message).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch])}` : ""}</p>
+  <p>${ok ? "Return to NLM Streaming to choose your Page. " : ""}This window closes automatically.</p>
   <script>
     if (window.opener) {
       window.opener.postMessage(
-        { type: "social-oauth-result", ok: ${JSON.stringify(!!ok)}, platform: ${JSON.stringify(platform || "")}, accountId: ${JSON.stringify(accountId)}, identityOnly: ${JSON.stringify(identityOnly)} },
+        { type: "social-oauth-result", ok: ${JSON.stringify(!!ok)}, platform: ${JSON.stringify(platform || "")}, accountId: ${JSON.stringify(accountId)}, identityOnly: ${JSON.stringify(identityOnly)}, needsPageSelection: ${JSON.stringify(!!needsPageSelection)} },
         "*"
       );
     }
@@ -270,7 +271,12 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           organizationId: req.organization.id,
           channelId: channel.id,
         });
-        res.json({ ok: true, authUrl: facebookGraph.getAuthUrl(state) });
+        res.json({
+          ok: true,
+          authUrl: facebookGraph.getAuthUrl(state, {
+            rerequest: Boolean(req.body?.rerequest || req.query?.rerequest),
+          }),
+        });
       } catch (error) {
         console.error("Facebook OAuth Init Error:", error);
         res
@@ -301,88 +307,25 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
       const { accessToken: longLivedUserToken, expiresInSeconds } =
         await facebookGraph.getLongLivedUserToken(shortLivedToken);
       const user = await facebookGraph.getCurrentUser(longLivedUserToken);
-      await upsertFacebookUser(
+      const facebookUser = await upsertFacebookUser(
         claims.organizationId,
         claims.adminId,
         user,
         longLivedUserToken,
         expiresInSeconds,
       );
-      const pages = await facebookGraph.listUserPages(longLivedUserToken);
-
-      if (pages.length === 0) {
-        return res.send(
-          closePopupHtml({
-            ok: true,
-            platform: "facebook",
-            message:
-              "Facebook account connected. No eligible Pages were returned; personal timeline auto-publishing is not available.",
-            identityOnly: true,
-          }),
-        );
-      }
-
-      if (pages.length === 1) {
-        const account = await upsertFacebookAccount(
-          claims.organizationId,
-          claims.adminId,
-          pages[0],
-        );
-        await ensureOAuthTargetForChannel({
-          channelId: claims.channelId,
-          organizationId: claims.organizationId,
-          account,
-        });
-        return res.send(
-          closePopupHtml({
-            ok: true,
-            platform: "facebook",
-            accountId: account.id,
-          }),
-        );
-      }
-
-      // Multiple Pages — ask which one before storing anything.
-      const pickerState = signState({
-        purpose: "fb_pick_page",
-        adminId: claims.adminId,
-        organizationId: claims.organizationId,
-        channelId: claims.channelId,
-        // JWT state is signed, not encrypted. Encrypt Page access tokens before
-        // round-tripping the page picker through the browser.
-        pages: pages.map((page) => ({
-          ...page,
-          pageAccessToken: encryptOAuthToken(page.pageAccessToken),
-        })),
-      });
-
-      const escapeHtml = (value) =>
-        String(value).replace(
-          /[&<>"']/g,
-          (ch) =>
-            ({
-              "&": "&amp;",
-              "<": "&lt;",
-              ">": "&gt;",
-              '"': "&quot;",
-              "'": "&#39;",
-            })[ch],
-        );
-      const optionsHtml = pages
-        .map(
-          (p, i) =>
-            `<button name="pageIndex" value="${i}" style="display:block;width:100%;margin:6px 0;padding:10px;">${escapeHtml(p.pageName)}</button>`,
-        )
-        .join("");
-
-      res.send(`<!DOCTYPE html>
-<html><body style="font-family: system-ui; padding: 2rem;">
-  <p>Which Page should this channel simulcast to?</p>
-  <form method="POST" action="/api/oauth/facebook/select-page">
-    <input type="hidden" name="state" value="${pickerState}" />
-    ${optionsHtml}
-  </form>
-</body></html>`);
+      // Page selection happens inside NLM Streaming (Live Studio), not in
+      // this popup. That keeps the step visible to the person (and to Meta
+      // App Review) and lets them switch Pages later without logging in again.
+      return res.send(
+        closePopupHtml({
+          ok: true,
+          platform: "facebook",
+          accountId: facebookUser?.id || null,
+          identityOnly: true,
+          needsPageSelection: true,
+        }),
+      );
     } catch (error) {
       console.error("Facebook OAuth Callback Error:", error);
       res.send(
@@ -503,6 +446,207 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     );
     return result.rows[0];
   }
+
+  // ────────────────────────────────────────────────────────────
+  // Facebook in-app Page picker (pages_show_list)
+  // The studio lists the Pages the signed-in person granted, then stores the
+  // chosen Page's token and links it to this channel's Facebook target.
+  // ────────────────────────────────────────────────────────────
+
+  async function loadFacebookUser(organizationId, adminId) {
+    const result = await pool.query(
+      `SELECT * FROM social_oauth_accounts
+       WHERE organization_id = $1 AND platform = 'facebook_user'
+       ORDER BY (connected_by_admin_id = $2) DESC, updated_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      [organizationId, adminId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return { ...row, access_token: decryptOAuthToken(row.access_token) };
+  }
+
+  async function markFacebookUserReconnect(accountId, error) {
+    await pool
+      .query(
+        `UPDATE social_oauth_accounts
+         SET connection_status = 'reconnect_required',
+             token_last_error = $1,
+             reconnect_required_at = COALESCE(reconnect_required_at, NOW()),
+             updated_at = NOW()
+         WHERE id = $2`,
+        [
+          String(error?.message || "Facebook token invalid").slice(0, 1000),
+          accountId,
+        ],
+      )
+      .catch(() => {});
+  }
+
+  app.get(
+    "/api/channels/:channelId/facebook/pages",
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    async (req, res) => {
+      try {
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+        if (!channel)
+          return res
+            .status(404)
+            .json({ ok: false, message: "Channel not found" });
+
+        const user = await loadFacebookUser(req.organization.id, req.admin.id);
+        if (!user) {
+          return res.status(409).json({
+            ok: false,
+            code: "facebook_not_connected",
+            message: "Continue with Facebook first.",
+          });
+        }
+
+        let pages;
+        try {
+          pages = await facebookGraph.listUserPages(user.access_token);
+        } catch (error) {
+          if (facebookGraph.isReconnectError(error)) {
+            await markFacebookUserReconnect(user.id, error);
+            return res.status(409).json({
+              ok: false,
+              code: "facebook_reconnect_required",
+              message:
+                "Your Facebook sign-in expired or access was removed. Continue with Facebook again.",
+            });
+          }
+          throw error;
+        }
+
+        const selected = await pool.query(
+          `SELECT a.external_account_id
+           FROM social_destinations sd
+           JOIN social_oauth_accounts a ON a.id = sd.oauth_account_id
+           WHERE sd.channel_id = $1 AND sd.platform = 'facebook'
+             AND sd.automation_mode = 'oauth'
+           LIMIT 1`,
+          [channel.id],
+        );
+        const selectedPageId = selected.rows[0]?.external_account_id || null;
+
+        res.json({
+          ok: true,
+          signedInAs: user.external_account_name,
+          selectedPageId,
+          // Never send Page tokens to the browser.
+          pages: pages.map(({ pageAccessToken, tasks, ...page }) => ({
+            ...page,
+            selected: String(page.pageId) === String(selectedPageId),
+          })),
+        });
+      } catch (error) {
+        console.error("List Facebook Pages Error:", error);
+        res
+          .status(502)
+          .json({ ok: false, message: "Could not load your Facebook Pages" });
+      }
+    },
+  );
+
+  app.post(
+    "/api/channels/:channelId/facebook/select-page",
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    requireRole("super_admin", "admin", "operator"),
+    requireOrganizationRole("owner", "admin"),
+    async (req, res) => {
+      try {
+        const pageId = String(req.body?.pageId || "").trim();
+        if (!pageId)
+          return res
+            .status(400)
+            .json({ ok: false, message: "Choose a Page first" });
+
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+        if (!channel)
+          return res
+            .status(404)
+            .json({ ok: false, message: "Channel not found" });
+
+        const live = await pool.query(
+          `SELECT id FROM social_destinations
+           WHERE channel_id = $1 AND platform = 'facebook'
+             AND (is_running = TRUE OR platform_broadcast_id IS NOT NULL)
+           LIMIT 1`,
+          [channel.id],
+        );
+        if (live.rows[0]) {
+          return res.status(409).json({
+            ok: false,
+            code: "facebook_live_active",
+            message: "End the current Facebook live before changing Page.",
+          });
+        }
+
+        const user = await loadFacebookUser(req.organization.id, req.admin.id);
+        if (!user)
+          return res.status(409).json({
+            ok: false,
+            code: "facebook_not_connected",
+            message: "Continue with Facebook first.",
+          });
+
+        const pages = await facebookGraph.listUserPages(user.access_token);
+        const chosen = pages.find((page) => String(page.pageId) === pageId);
+        if (!chosen) {
+          return res.status(404).json({
+            ok: false,
+            message:
+              "That Page was not shared with NLM Streaming. Use Edit Page access to add it.",
+          });
+        }
+        if (!chosen.canGoLive) {
+          return res.status(403).json({
+            ok: false,
+            message:
+              "Your role on this Page cannot create content. Ask a Page admin for full control or content access.",
+          });
+        }
+
+        const account = await upsertFacebookAccount(
+          req.organization.id,
+          req.admin.id,
+          chosen,
+        );
+        const target = await ensureOAuthTargetForChannel({
+          channelId: channel.id,
+          organizationId: req.organization.id,
+          account,
+        });
+
+        res.json({
+          ok: true,
+          message: `${chosen.pageName} selected`,
+          page: {
+            accountId: account.id,
+            pageId: chosen.pageId,
+            pageName: chosen.pageName,
+            pictureUrl: chosen.pictureUrl,
+            category: chosen.category,
+          },
+          targetId: target.id,
+        });
+      } catch (error) {
+        console.error("Select Facebook Page Error:", error);
+        res
+          .status(500)
+          .json({ ok: false, message: "Could not select that Page" });
+      }
+    },
+  );
 
   // ────────────────────────────────────────────────────────────
   // YouTube
@@ -706,13 +850,11 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
           .json({ ok: false, message: "Connected account not found" });
       }
       if (account.platform === "facebook_user") {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message:
-              "Personal Facebook accounts are identity-only and cannot be linked to OAuth livestream targets",
-          });
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Personal Facebook accounts are identity-only and cannot be linked to OAuth livestream targets",
+        });
       }
 
       const targetResult = await pool.query(
@@ -790,4 +932,13 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     requireOrganizationRole("owner", "admin"),
     linkOAuthTarget,
   );
+
+  // Facebook Live Studio: Page content, live status, go-live, data deletion.
+  require("./facebook_page_routes")(app, pool, {
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    requireRole,
+    requireOrganizationRole,
+    streamTargetManager,
+  });
 };

@@ -1136,11 +1136,27 @@ function createStreamTargetManager({
     }
 
     if (target.target_type === "facebook" || target.platform === "facebook") {
+      // Title/description come from Facebook Live Studio when set; otherwise
+      // auto-start (encoder connects) falls back to the channel name.
       const created = await facebookGraph.createLiveVideo({
         pageId: account.external_account_id,
         pageAccessToken: account.access_token,
-        title: channel.name,
+        title:
+          String(target.broadcast_title || "").trim() ||
+          channel.name ||
+          "Live Stream",
+        description: String(target.broadcast_description || "").trim(),
       });
+      // Remember the most recent broadcast so the studio can still link to
+      // it on Facebook after the live ends (platform_broadcast_id is cleared).
+      await pool
+        .query(
+          `UPDATE social_destinations
+           SET last_platform_broadcast_id = $1, updated_at = NOW()
+           WHERE id = $2`,
+          [created.liveVideoId, target.id],
+        )
+        .catch(() => {});
       await pool
         .query(
           `UPDATE social_oauth_accounts
