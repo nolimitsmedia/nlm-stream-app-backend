@@ -1141,11 +1141,15 @@ function createStreamTargetManager({
       const created = await facebookGraph.createLiveVideo({
         pageId: account.external_account_id,
         pageAccessToken: account.access_token,
-        title:
+        title: renderBroadcastText(
           String(target.broadcast_title || "").trim() ||
-          channel.name ||
-          "Live Stream",
-        description: String(target.broadcast_description || "").trim(),
+            `${channel.name || "Live Stream"} – {date}`,
+          channel,
+        ),
+        description: renderBroadcastText(
+          String(target.broadcast_description || "").trim(),
+          channel,
+        ),
       });
       // Remember the most recent broadcast so the studio can still link to
       // it on Facebook after the live ends (platform_broadcast_id is cleared).
@@ -3061,6 +3065,7 @@ function createStreamTargetManager({
 
   async function stopTarget(target, { endPlatform = true } = {}) {
     const destinationId = Number(target.id);
+    if (endPlatform) clearGraceTimer(destinationId);
     const state = processStates.get(destinationId);
     if (state) {
       state.intentionalStop = true;
@@ -3240,20 +3245,152 @@ function createStreamTargetManager({
     }
   }
 
+  // Placeholders for automatic broadcasts, so every Sunday's live gets its
+  // own title: "Sunday Service – {date}" -> "Sunday Service – Nov 15, 2026".
+  // Timezone: BROADCAST_TIMEZONE env (e.g. Asia/Manila), else server time.
+  function renderBroadcastText(text, channel) {
+    const now = new Date();
+    const timeZone = process.env.BROADCAST_TIMEZONE || undefined;
+    const fmt = (options) => {
+      try {
+        return now.toLocaleString("en-US", { ...options, timeZone });
+      } catch {
+        return now.toLocaleString("en-US", options);
+      }
+    };
+    return String(text || "")
+      .replace(
+        /\{date\}/gi,
+        fmt({ month: "short", day: "numeric", year: "numeric" }),
+      )
+      .replace(/\{time\}/gi, fmt({ hour: "numeric", minute: "2-digit" }))
+      .replace(/\{weekday\}/gi, fmt({ weekday: "long" }))
+      .replace(/\{channel\}/gi, channel?.name || "");
+  }
+
+  // ── Reconnect grace for platform (OAuth) broadcasts ─────────────
+  // When the encoder disconnects (OBS crash, Wi-Fi blip, venue internet
+  // drop), ending the Facebook/YouTube broadcast immediately means every
+  // reconnect creates a brand-new video. Instead, the worker is stopped but
+  // the platform broadcast is kept open for a grace period. If the encoder
+  // comes back, startAutoTargets() reuses the preserved session (same
+  // Facebook live video). If not, the broadcast is ended when grace expires.
+  // Grace only applies when the source went offline; an operator stop or a
+  // scheduled end (source still live) ends the broadcast immediately.
+  const OAUTH_RECONNECT_GRACE_MS =
+    Math.max(
+      0,
+      Number(process.env.OAUTH_TARGET_RECONNECT_GRACE_SECONDS ?? 90) || 0,
+    ) * 1000;
+  const graceTimers = new Map();
+
+  function clearGraceTimer(targetId) {
+    const timer = graceTimers.get(Number(targetId));
+    if (timer) clearTimeout(timer);
+    graceTimers.delete(Number(targetId));
+  }
+
+  function scheduleGraceEnd(target, attempt = 0) {
+    const targetId = Number(target.id);
+    clearGraceTimer(targetId);
+    const delay = attempt === 0 ? OAUTH_RECONNECT_GRACE_MS : 20000;
+    const timer = setTimeout(async () => {
+      graceTimers.delete(targetId);
+      try {
+        const fresh = (
+          await pool.query(`SELECT * FROM social_destinations WHERE id = $1`, [
+            targetId,
+          ])
+        ).rows[0];
+        // Already ended (operator clicked End live) or replaced by a new
+        // broadcast: nothing to do.
+        if (
+          !fresh ||
+          !fresh.platform_broadcast_id ||
+          String(fresh.platform_broadcast_id) !==
+            String(target.platform_broadcast_id)
+        )
+          return;
+
+        const runtimeState = processStates.get(targetId);
+        const workerBack =
+          fresh.is_running ||
+          (runtimeState?.proc && !runtimeState.proc.killed) ||
+          runtimeState?.remoteActive;
+        if (workerBack) {
+          console.log(
+            `[STREAM-TARGET-GRACE] #${targetId} reconnected; keeping platform broadcast ${fresh.platform_broadcast_id}.`,
+          );
+          return;
+        }
+
+        const channel = (
+          await pool.query(`SELECT is_live FROM channels WHERE id = $1`, [
+            fresh.channel_id,
+          ])
+        ).rows[0];
+        // Encoder is back but auto-start hasn't attached yet: look again
+        // shortly instead of ending a broadcast that is about to resume.
+        if (channel?.is_live && attempt < 3) {
+          scheduleGraceEnd(fresh, attempt + 1);
+          return;
+        }
+
+        console.log(
+          `[STREAM-TARGET-GRACE] #${targetId} source did not return; ending platform broadcast ${fresh.platform_broadcast_id}.`,
+        );
+        await stopTarget(fresh, { endPlatform: true });
+      } catch (error) {
+        console.error(
+          `[STREAM-TARGET-GRACE] Failed to finalize #${targetId}:`,
+          error.message,
+        );
+      }
+    }, delay);
+    timer.unref?.();
+    graceTimers.set(targetId, timer);
+  }
+
   async function stopChannelTargets(channelId) {
     const result = await pool.query(
-      `SELECT * FROM social_destinations WHERE channel_id = $1 AND is_running = true`,
+      `SELECT * FROM social_destinations
+       WHERE channel_id = $1
+         AND (is_running = true OR platform_broadcast_id IS NOT NULL)`,
       [channelId],
     );
+    const channel = (
+      await pool.query(`SELECT is_live FROM channels WHERE id = $1`, [
+        channelId,
+      ])
+    ).rows[0];
+    const sourceWentOffline = channel ? !channel.is_live : false;
+
     await Promise.all(
-      result.rows.map((target) =>
-        stopTarget(target).catch((error) => {
+      result.rows.map(async (target) => {
+        try {
+          const keepPlatformOpen =
+            sourceWentOffline &&
+            OAUTH_RECONNECT_GRACE_MS > 0 &&
+            target.automation_mode === "oauth" &&
+            Boolean(target.platform_broadcast_id);
+
+          if (keepPlatformOpen) {
+            await stopTarget(target, { endPlatform: false });
+            console.log(
+              `[STREAM-TARGET-GRACE] #${target.id} source offline; holding platform broadcast ${target.platform_broadcast_id} for ${OAUTH_RECONNECT_GRACE_MS / 1000}s.`,
+            );
+            scheduleGraceEnd(target);
+          } else if (target.is_running || target.platform_broadcast_id) {
+            clearGraceTimer(target.id);
+            await stopTarget(target);
+          }
+        } catch (error) {
           console.error(
             `[STREAM-TARGET] Auto-stop failed for #${target.id}:`,
             error.message,
           );
-        }),
-      ),
+        }
+      }),
     );
   }
 
