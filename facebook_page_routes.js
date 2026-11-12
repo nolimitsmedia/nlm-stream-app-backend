@@ -168,6 +168,8 @@ module.exports = function registerFacebookPageRoutes(app, pool, mw) {
           ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
           : 0,
       lastError: target.last_error || null,
+      lastErrorAt: target.last_error ? target.updated_at || null : null,
+      failed: (target.status || "") === "failed",
       broadcastTitle: target.broadcast_title || "",
       broadcastDescription: target.broadcast_description || "",
       liveVideoId: target.platform_broadcast_id || null,
@@ -411,7 +413,30 @@ module.exports = function registerFacebookPageRoutes(app, pool, mw) {
            WHERE id = $${values.length}`,
           values,
         );
-        res.json({ ok: true });
+
+        let started = null;
+        if (
+          body.autoStart === true &&
+          channel.is_live &&
+          target.automation_mode === "oauth" &&
+          target.oauth_account_id &&
+          !target.is_running &&
+          !target.platform_broadcast_id &&
+          streamTargetManager
+        ) {
+          const fresh = await loadFacebookTarget(channel.id);
+          sweepAttempts.delete(Number(fresh.id));
+          started = await startFacebookTargetNow(
+            fresh,
+            channel,
+            "Automatic mode switched on while encoder is live",
+          );
+        }
+        res.json({
+          ok: true,
+          started: started ? Boolean(started.ok) : undefined,
+          message: started && !started.ok ? started.message : undefined,
+        });
       } catch (error) {
         console.error("Facebook Settings Error:", error);
         res.status(500).json({ ok: false, message: "Failed to save settings" });
@@ -485,6 +510,7 @@ module.exports = function registerFacebookPageRoutes(app, pool, mw) {
         );
 
         target = await loadFacebookTarget(channel.id);
+        sweepAttempts.delete(Number(target.id));
         const result = await streamTargetManager.startTarget(
           target,
           channel,
@@ -575,6 +601,247 @@ module.exports = function registerFacebookPageRoutes(app, pool, mw) {
       }
     },
   );
+
+  // ── POST diagnostics: "Check Facebook setup" ───────────────
+  // Read-only checks plus one UNPUBLISHED live-video test that is deleted
+  // immediately, so nothing appears on the Page.
+  app.post(
+    "/api/channels/:channelId/facebook/diagnostics",
+    ...manageMw,
+    async (req, res) => {
+      const checks = [];
+      const add = (id, label, ok, detail) =>
+        checks.push({ id, label, ok, detail: detail || "" });
+      try {
+        const channel = await getOwnedChannel(
+          req.params.channelId,
+          req.organization.id,
+        );
+        if (!channel)
+          return res
+            .status(404)
+            .json({ ok: false, message: "Channel not found" });
+
+        add(
+          "config",
+          "Facebook app is configured on the server",
+          facebookGraph.isConfigured(),
+          facebookGraph.isConfigured()
+            ? ""
+            : "Set FACEBOOK_APP_ID, FACEBOOK_APP_SECRET and FACEBOOK_CONFIG_ID.",
+        );
+
+        const target = await loadFacebookTarget(channel.id);
+        const account = await loadAccount(
+          target?.oauth_account_id,
+          req.organization.id,
+        );
+        add(
+          "page",
+          "A Page is selected for this channel",
+          Boolean(account && account.platform === "facebook"),
+          account ? account.external_account_name : "Choose a Page first.",
+        );
+        if (!account || account.platform !== "facebook")
+          return res.json({ ok: true, checks });
+
+        // Token + granted permissions for this Page
+        const required = [
+          "pages_show_list",
+          "pages_read_engagement",
+          "pages_manage_posts",
+          "publish_video",
+        ];
+        try {
+          const info = await facebookGraph.debugToken(account.access_token);
+          add(
+            "token",
+            "Page access token is valid",
+            Boolean(info?.is_valid),
+            info?.is_valid
+              ? `Type: ${info.type || "PAGE"}`
+              : info?.error?.message || "Token invalid. Reconnect Facebook.",
+          );
+          const scopes = new Set(info?.scopes || []);
+          const granular = Array.isArray(info?.granular_scopes)
+            ? info.granular_scopes
+            : [];
+          for (const scope of required) {
+            const entry = granular.find((g) => g.scope === scope);
+            const coversPage =
+              !entry?.target_ids ||
+              entry.target_ids
+                .map(String)
+                .includes(String(account.external_account_id));
+            const ok = scopes.has(scope) && coversPage;
+            add(
+              `scope:${scope}`,
+              `Permission granted: ${scope}`,
+              ok,
+              ok
+                ? ""
+                : scopes.has(scope)
+                  ? "Granted, but not for this Page. Use Edit Page access and tick this Page."
+                  : "Not granted. Add it to the Facebook Login for Business configuration, then reconnect.",
+            );
+          }
+        } catch (error) {
+          add("token", "Page access token is valid", false, error.message);
+        }
+
+        // Page role (CREATE_CONTENT task) via the signed-in user's Page list
+        try {
+          const userRow = (
+            await pool.query(
+              `SELECT * FROM social_oauth_accounts
+               WHERE organization_id = $1 AND platform = 'facebook_user'
+               ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1`,
+              [req.organization.id],
+            )
+          ).rows[0];
+          const user = decryptOAuthAccount(userRow);
+          if (user) {
+            const pages = await facebookGraph.listUserPages(user.access_token);
+            const page = pages.find(
+              (p) => String(p.pageId) === String(account.external_account_id),
+            );
+            add(
+              "role",
+              "Your Page role can create content",
+              Boolean(page?.canGoLive),
+              page
+                ? `Tasks: ${page.tasks.join(", ") || "not reported"}`
+                : "Page not in your shared Pages list.",
+            );
+          }
+        } catch (error) {
+          add(
+            "role",
+            "Your Page role can create content",
+            false,
+            error.message,
+          );
+        }
+
+        // The real test: can this token create a live video on the Page?
+        try {
+          await facebookGraph.testCreateLiveVideo({
+            pageId: account.external_account_id,
+            pageAccessToken: account.access_token,
+          });
+          add(
+            "live",
+            "Facebook allows creating a live video on this Page",
+            true,
+            "Test video created unpublished and deleted.",
+          );
+        } catch (error) {
+          add(
+            "live",
+            "Facebook allows creating a live video on this Page",
+            false,
+            error.message,
+          );
+        }
+
+        res.json({ ok: true, checks });
+      } catch (error) {
+        console.error("Facebook Diagnostics Error:", error);
+        res
+          .status(500)
+          .json({ ok: false, message: "Diagnostics failed", checks });
+      }
+    },
+  );
+
+  // ── Automatic go-live safety net ───────────────────────────
+  // Auto-start normally fires from SRS on_publish (encoder connects). That
+  // single trigger is missed when: the Page was chosen or automatic mode was
+  // switched on while OBS was already streaming, the backend restarted
+  // mid-stream, or Facebook briefly refused the first attempt. This sweep
+  // starts any enabled auto-start Facebook target whose channel is live but
+  // which isn't running. Attempts are limited per encoder session so a Page
+  // that Facebook keeps refusing doesn't loop.
+  const SWEEP_MS = 30 * 1000;
+  const MIN_SESSION_AGE_MS = 30 * 1000;
+  const RETRY_GAP_MS = 2 * 60 * 1000;
+  const MAX_ATTEMPTS_PER_SESSION = 3;
+  const sweepAttempts = new Map(); // targetId -> { session, count, lastAt }
+
+  async function startFacebookTargetNow(target, channel, reason) {
+    const key = Number(target.id);
+    const session = String(channel.live_started_at || "unknown");
+    const entry = sweepAttempts.get(key);
+    const state =
+      entry && entry.session === session
+        ? entry
+        : { session, count: 0, lastAt: 0 };
+    if (state.count >= MAX_ATTEMPTS_PER_SESSION) return null;
+    if (Date.now() - state.lastAt < RETRY_GAP_MS) return null;
+    state.count += 1;
+    state.lastAt = Date.now();
+    sweepAttempts.set(key, state);
+
+    console.log(
+      `[FB-STUDIO] ${reason}: starting Facebook target #${target.id} for channel ${channel.id} (attempt ${state.count}/${MAX_ATTEMPTS_PER_SESSION}).`,
+    );
+    const result = await streamTargetManager.startTarget(
+      decryptTargetCredentials(target),
+      channel,
+      channel.organization_id,
+      { requestedBy: "facebook-auto-sweep" },
+    );
+    if (!result?.ok) {
+      console.log(
+        `[FB-STUDIO] Facebook target #${target.id} did not start: ${result?.message || "unknown error"}`,
+      );
+    }
+    return result;
+  }
+
+  async function sweepAutoFacebookTargets() {
+    if (!streamTargetManager) return;
+    const rows = await pool.query(
+      `SELECT sd.*, row_to_json(c.*) AS channel_row
+       FROM social_destinations sd
+       JOIN channels c ON c.id = sd.channel_id
+       WHERE sd.platform = 'facebook'
+         AND sd.automation_mode = 'oauth'
+         AND sd.oauth_account_id IS NOT NULL
+         AND sd.enabled = TRUE
+         AND sd.auto_start = TRUE
+         AND COALESCE(sd.is_running, FALSE) = FALSE
+         AND sd.platform_broadcast_id IS NULL
+         AND c.is_live = TRUE`,
+    );
+    for (const row of rows.rows) {
+      const { channel_row: channel, ...target } = row;
+      const startedAt = channel?.live_started_at
+        ? new Date(channel.live_started_at).getTime()
+        : 0;
+      // Leave the first ~30s to the normal on_publish auto-start.
+      if (startedAt && Date.now() - startedAt < MIN_SESSION_AGE_MS) continue;
+      const runtime = streamTargetManager.getRuntimeState?.(target.id);
+      if (runtime?.worker_running) continue;
+      await startFacebookTargetNow(
+        target,
+        channel,
+        "Auto go-live safety net",
+      ).catch((error) =>
+        console.error(
+          `[FB-STUDIO] safety-net start failed for #${target.id}:`,
+          error.message,
+        ),
+      );
+    }
+  }
+
+  const sweepTimer = setInterval(() => {
+    sweepAutoFacebookTargets().catch((error) =>
+      console.error("[FB-STUDIO] auto go-live sweep failed:", error.message),
+    );
+  }, SWEEP_MS);
+  sweepTimer.unref?.();
 
   // ────────────────────────────────────────────────────────────
   // Meta platform callbacks (set these URLs in App settings → Basic and

@@ -75,11 +75,24 @@ async function graphFetch(pathAndQuery, options = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) {
-    const message = data.error?.message || `Graph API error (${res.status})`;
+    const e = data.error || {};
+    // Keep Facebook's code/subcode and user-facing text: "Permissions error"
+    // alone doesn't say which permission or Page condition failed.
+    const codePart = e.code
+      ? ` (#${e.code}${e.error_subcode ? `/${e.error_subcode}` : ""})`
+      : "";
+    const detail = [e.error_user_title, e.error_user_msg]
+      .filter(Boolean)
+      .join(": ");
+    const message =
+      `${e.message || `Graph API error (${res.status})`}${codePart}` +
+      `${detail ? ` — ${detail}` : ""}` +
+      `${e.fbtrace_id ? ` [fbtrace ${e.fbtrace_id}]` : ""}`;
     const err = new Error(message);
     err.graphError = data.error;
     err.status = res.status;
-    err.code = data.error?.code;
+    err.code = e.code;
+    err.subcode = e.error_subcode;
     throw err;
   }
   return data;
@@ -362,6 +375,29 @@ async function endLiveVideo({ liveVideoId, pageAccessToken }) {
   });
 }
 
+// Permission test used by Live Studio's "Check Facebook setup". Creates an
+// UNPUBLISHED live video (never visible on the Page) and deletes it again.
+async function testCreateLiveVideo({ pageId, pageAccessToken }) {
+  const created = await graphFetch(`/${pageId}/live_videos`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      access_token: pageAccessToken,
+      title: "NLM setup check (not published)",
+      status: "UNPUBLISHED",
+    }),
+  });
+  try {
+    await graphFetch(
+      `/${created.id}?${new URLSearchParams({ access_token: pageAccessToken })}`,
+      { method: "DELETE" },
+    );
+  } catch {
+    // Unpublished test videos are harmless if deletion fails.
+  }
+  return { liveVideoId: created.id };
+}
+
 // Cheap validity check before relying on a token during a scheduled stream.
 async function debugToken(inputToken) {
   const appToken = `${FACEBOOK_APP_ID}|${FACEBOOK_APP_SECRET}`;
@@ -390,6 +426,7 @@ module.exports = {
   createLiveVideo,
   endLiveVideo,
   debugToken,
+  testCreateLiveVideo,
   isReconnectError,
   absoluteFacebookUrl,
 };
