@@ -941,4 +941,12 @@ module.exports = function registerOAuthRoutes(app, pool, jwt, mw) {
     requireOrganizationRole,
     streamTargetManager,
   });
+
+  // Stream health alerts, encoder pre-flight and outbound webhooks.
+  require("./platform_routes")(app, pool, {
+    authenticateAdmin,
+    resolveOrganizationForRequest,
+    requireRole,
+    requireOrganizationRole,
+  });
 };
