@@ -211,7 +211,77 @@ async function listUserPages(longLivedUserToken) {
     // works while that permission is pending review.
     raw = await fetchAll(basicFields);
   }
+
+  // Facebook Login for Business: Pages owned by a business portfolio (and
+  // reached through it) are often missing from /me/accounts even though the
+  // person ticked them in the login dialog. The Page IDs they ticked are on
+  // the token itself (granular_scopes.target_ids), so fetch those directly.
+  const seen = new Set(raw.map((page) => String(page.id)));
+  let grantedIds = [];
+  try {
+    grantedIds = await getGrantedPageIds(longLivedUserToken);
+  } catch (error) {
+    console.warn("[FB] Could not read granted Page IDs:", error.message);
+  }
+  for (const pageId of grantedIds) {
+    if (seen.has(String(pageId))) continue;
+    try {
+      const page = await fetchPageWithUserToken(pageId, longLivedUserToken);
+      if (page?.access_token) {
+        raw.push(page);
+        seen.add(String(page.id));
+      } else {
+        console.warn(
+          `[FB] Page ${pageId} was granted but Facebook returned no Page token; the person may lack a task on that Page.`,
+        );
+      }
+    } catch (error) {
+      console.warn(
+        `[FB] Could not load granted Page ${pageId}:`,
+        error.message,
+      );
+    }
+  }
+
+  console.log(
+    `[FB] listUserPages: ${raw.length} Page(s) available (granted IDs: ${grantedIds.length}).`,
+  );
   return raw.map(mapPage);
+}
+
+// Page IDs the person selected in the Facebook Login for Business dialog.
+async function getGrantedPageIds(userAccessToken) {
+  const info = await debugToken(userAccessToken);
+  const pageScopes = new Set([
+    "pages_show_list",
+    "pages_manage_posts",
+    "pages_read_engagement",
+    "pages_manage_metadata",
+  ]);
+  const ids = new Set();
+  for (const entry of info?.granular_scopes || []) {
+    if (!pageScopes.has(entry.scope)) continue;
+    for (const id of entry.target_ids || []) ids.add(String(id));
+  }
+  return [...ids];
+}
+
+async function fetchPageWithUserToken(pageId, userAccessToken) {
+  const run = (fields) =>
+    graphFetch(
+      `/${pageId}?${new URLSearchParams({
+        access_token: userAccessToken,
+        fields,
+      }).toString()}`,
+    );
+  try {
+    return await run(
+      "id,name,access_token,category,link,fan_count,followers_count,picture.type(large){url}",
+    );
+  } catch (error) {
+    if (Number(error.code) === 190) throw error;
+    return run("id,name,access_token,picture{url}");
+  }
 }
 
 // pages_read_engagement: Page identity shown at the top of Live Studio.
